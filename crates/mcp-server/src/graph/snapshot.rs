@@ -557,6 +557,10 @@ impl GraphState {
         let discard = &retired;
         let outcome = self.lease.publish_short(&mut prepared, move |prepared| {
             #[cfg(test)]
+            #[allow(
+                deprecated,
+                reason = "fetch_update is deprecated; its try_update replacement is not stabilized"
+            )]
             if REFUSE_SNAPSHOT_INSTALL.with(|refuse| refuse.replace(false))
                 || self
                     .refused_installs

@@ -275,7 +275,6 @@ fn merge_adjacent_hunks(hunks: &mut Vec<[u32; 2]>) {
 mod tests {
     use super::*;
     use crate::test_support::TestRepo;
-    use std::fs;
 
     fn five_lines(third: &str) -> String {
         format!("Перем А;\nПерем Б;\n{third}\nПерем Г;\nПерем Д;\n")
@@ -406,6 +405,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn mode_only_change_is_listed_without_hunks() {
+        use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
         let t = TestRepo::new();

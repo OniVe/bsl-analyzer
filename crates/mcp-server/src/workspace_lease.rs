@@ -663,6 +663,10 @@ impl WorkspaceLease {
                 }
             });
             #[cfg(test)]
+            #[allow(
+                deprecated,
+                reason = "fetch_update is deprecated; its try_update replacement is not stabilized"
+            )]
             if self.inner.fail_checkpoint_lock.swap(false, Ordering::SeqCst)
                 || self.inner.fail_checkpoint_lock_countdown.fetch_update(
                     Ordering::SeqCst,

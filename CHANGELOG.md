@@ -231,6 +231,13 @@ and this project adheres to [Date-based Versioning](docs/contributing/VERSIONING
 - `UnusedParameters`/`UnusedLocalMethod`: в модуле объекта внешнего отчёта (ERF)
   `ПриКомпоновкеРезультата`/`OnComposeResult` — платформенное событие, поэтому
   его параметры и метод больше не считаются неиспользуемыми (github#101).
+- Сборка на Rust 1.99: `async-trait` обновлён до 0.1.92 (развёртка трейтов
+  перестала ставить голый `#[must_use]`, на котором clippy падал с
+  `double_must_use`); `AtomicU64::fetch_update` в `bsl-search` заменён циклом
+  compare-exchange, а в тестовом коде `mcp-server` такие вызовы точечно
+  разрешены (`allow(deprecated)`) — замена (`try_update`) ещё не стабилизирована;
+  заодно в тестах `vcs` неиспользуемый на Windows `use std::fs` перенесён под
+  `cfg(unix)`.
 
 ### Changed
 

@@ -6,6 +6,21 @@ use std::sync::{
 
 static NEXT_PASS: AtomicU64 = AtomicU64::new(0);
 
+/// `AtomicU64::fetch_update(Relaxed, Relaxed, checked_add(1))`, spelled as a
+/// compare-exchange loop: the method is deprecated on 1.99+, its replacement
+/// (`try_update`) is not stabilized yet, and this loop needs neither — semantics are
+/// the same, including `None` on overflow.
+fn next_generation(sequence: &AtomicU64) -> Option<u64> {
+    let mut current = sequence.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(1)?;
+        match sequence.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Some(next),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexPassState {
     Waiting,
@@ -120,10 +135,7 @@ impl IndexProgress {
         // Formatting/process identity lookup occurs outside the bounded record lock.
         let prefix =
             blake3::hash(crate::lifecycle::process_id().as_bytes()).to_hex()[..32].to_owned();
-        let generation = sequence
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .ok()
-            .map(|n| n + 1);
+        let generation = next_generation(sequence);
         let pass_id = generation.map(|n| format!("{prefix}:{n}"));
         let mut record = self.record.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(generation) = generation {
@@ -281,6 +293,19 @@ impl Drop for ActivePass {
 #[cfg(test)]
 mod indexing_pass_lifecycle {
     use super::*;
+    /// The compare-exchange stand-in for the deprecated `fetch_update` keeps its
+    /// contract: a successful call reports the NEW value, overflow leaves the counter
+    /// alone and reports `None`.
+    #[test]
+    fn next_generation_advances_and_refuses_to_wrap() {
+        let sequence = AtomicU64::new(41);
+        assert_eq!(next_generation(&sequence), Some(42));
+        assert_eq!(next_generation(&sequence), Some(43));
+
+        let saturated = AtomicU64::new(u64::MAX);
+        assert_eq!(next_generation(&saturated), None);
+        assert_eq!(saturated.load(Ordering::Relaxed), u64::MAX, "overflow must not wrap");
+    }
     #[test]
     fn a_pause_restores_only_its_running_attempt() {
         let progress = IndexProgress::new();
