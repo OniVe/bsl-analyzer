@@ -3630,7 +3630,10 @@ impl SearchEngine {
             .workspace_overlay_cache
             .lock()
             .map_err(|e| SearchError::Index(format!("workspace overlay cache lock error: {e}")))?;
-        cache.enable_watcher_mode();
+        // The mark is recorded, the mode is NOT flipped: watcher mode doubles as "skip the full
+        // rescan", and a mark alone is not a feeder — a store nothing feeds would stop seeing
+        // the disk for good (github#186). The mode is enabled where the feed is: by the sink
+        // that consumes the hub, and by nothing else.
         cache.mark_dirty_path(key);
         Ok(())
     }
@@ -3688,7 +3691,12 @@ impl SearchEngine {
         if evicted_any {
             self.observe_live_index("live_index_evicted", Reason::FileDeleted, eviction_outcome);
         }
-        cache.enable_watcher_mode();
+        // The feed has just proved itself: this many keys arrived from it. Enabling the mode
+        // here — and not on a bare mark or removal — is what keeps "watcher mode" meaning "a
+        // feed is attached" (github#186). An empty slice says nothing about a feed.
+        if rows > 0 {
+            cache.enable_watcher_mode();
+        }
         for key in dirty_keys {
             cache.mark_dirty_path(key.clone());
         }
@@ -4163,7 +4171,9 @@ impl SearchEngine {
             let mut cache = self.workspace_overlay_cache.lock().map_err(|e| {
                 SearchError::Index(format!("workspace overlay cache lock error: {e}"))
             })?;
-            cache.enable_watcher_mode();
+            // The removal records its mark and its hiding; the MODE is not flipped here, for
+            // the same reason as in `mark_workspace_key_dirty` — a removal is not a feeder
+            // either, and the boot reconcile runs long before any sink exists (github#186).
             cache.mark_dirty_path(key.clone());
         }
         // Collected before the row goes, because the row is where they live.
@@ -8195,6 +8205,59 @@ mod tests {
         let hits = engine.text_search("ОбновленаЧерезWatcher", 10, Some("code")).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].symbol_name, "ОбновленаЧерезWatcher");
+    }
+
+    /// A dirty mark is not a feeder: on a store nothing feeds, marking a path must not flip the
+    /// overlay into watcher mode. The mode doubles as "skip the full rescan", so a mark alone
+    /// would stop the corpus from ever following the disk (github#186).
+    #[test]
+    fn a_dirty_mark_alone_does_not_enable_watcher_mode() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let file = workspace.join("A.bsl");
+        fs::write(&file, "Процедура П()\nКонецПроцедуры").unwrap();
+
+        let mut engine = SearchEngine::fts_only(&workspace.join("bsl-search.db")).unwrap();
+        let (roots, _) = crate::WorkspaceRoots::build(workspace, workspace, &[]);
+        engine.initialize_workspace_roots(roots).unwrap();
+        engine.initialize_workspace_overlay_clean().unwrap();
+
+        assert!(engine.mark_workspace_path_dirty(&file).unwrap());
+        assert!(
+            engine
+                .workspace_overlay_dirty_paths()
+                .unwrap()
+                .contains(&FileKey::configuration("A.bsl")),
+            "the mark itself is recorded",
+        );
+        assert!(
+            !engine.workspace_overlay_stats().unwrap().unwrap().watcher_mode,
+            "a mark is not a feeder and must not skip the full rescan",
+        );
+    }
+
+    /// The same rule for a removal: it records its mark and its hiding, but the mode stays off
+    /// until a feeder asks for it — the boot reconcile removes before any sink exists, and
+    /// flipping the mode there would leave a hub-less daemon following nothing (github#186).
+    #[test]
+    fn a_removal_alone_does_not_enable_watcher_mode() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let file = workspace.join("A.bsl");
+        fs::write(&file, "Процедура П()\nКонецПроцедуры").unwrap();
+
+        let mut engine = SearchEngine::fts_only(&workspace.join("bsl-search.db")).unwrap();
+        let (roots, _) = crate::WorkspaceRoots::build(workspace, workspace, &[]);
+        engine.initialize_workspace_roots(roots).unwrap();
+        engine.initialize_workspace_overlay_clean().unwrap();
+        engine.store().upsert_file(crate::CONFIGURATION_ROOT_ID, "A.bsl", b"h", "code").unwrap();
+
+        fs::remove_file(&file).unwrap();
+        assert!(engine.remove_workspace_path(&file).unwrap());
+        assert!(
+            !engine.workspace_overlay_stats().unwrap().unwrap().watcher_mode,
+            "a removal is not a feeder either",
+        );
     }
 
     #[test]

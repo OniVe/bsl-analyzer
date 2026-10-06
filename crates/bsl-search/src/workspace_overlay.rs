@@ -188,6 +188,12 @@ pub struct WorkspaceOverlayCache {
     /// whose fence is older than this may not publish at all: the entire state it planned
     /// against has been replaced.
     wholesale_seq: u64,
+    /// One-way, and doubles as "a feed is attached": the feeder that owns a change stream
+    /// enables it (a hub whose watch is up or whose own poll is running, or the first applied
+    /// drift batch that proves the feed), and every refresh allowed to skip the full tree
+    /// trusts it. A bare mark or removal records its trace and never flips this — a store
+    /// nothing feeds must keep taking full scans instead of freezing at its last publication
+    /// (github#186).
     watcher_mode: bool,
     initialized: bool,
     /// The last full publication ran over a scan that could not vouch for the whole tree, so its
@@ -4039,6 +4045,50 @@ mod tests {
             overlay.lexical_documents.iter().map(|doc| doc.symbol_name.clone()).collect();
         names.sort();
         assert_eq!(names, vec!["ИзменённаяА".to_owned(), "НоваяБ".to_owned()]);
+    }
+
+    /// With no feed attached (watcher_mode=false), a refresh allowed to cold-scan is FULL: it
+    /// has to see files no mark ever named, or a store nothing feeds would freeze at its last
+    /// publication — the very hazard the mode may not be flipped on a bare mark for
+    /// (github#186). This test pins the invariant rather than reproducing the defect: it is
+    /// expected to pass both before and after the fix.
+    #[test]
+    fn a_cold_refresh_without_a_feed_rescans_the_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        fs::write(workspace.join("A.bsl"), "Процедура А()\nКонецПроцедуры").unwrap();
+        let store = Store::open(&workspace.join("search.db")).unwrap();
+        let mut cache = WorkspaceOverlayCache::default();
+        cache
+            .refresh(
+                &store,
+                &single_root(workspace),
+                None,
+                32,
+                BaselineHashMode::RawFileBytes,
+                true,
+            )
+            .unwrap();
+        assert!(!cache.stats().watcher_mode, "nothing feeds this cache");
+        assert_eq!(cache.snapshot().lexical_documents.len(), 1);
+
+        // A file appears on disk and no mark names it.
+        fs::write(workspace.join("B.bsl"), "Процедура Б()\nКонецПроцедуры").unwrap();
+        cache
+            .refresh(
+                &store,
+                &single_root(workspace),
+                None,
+                32,
+                BaselineHashMode::RawFileBytes,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            cache.snapshot().lexical_documents.len(),
+            2,
+            "an unfed store keeps seeing the whole tree instead of freezing",
+        );
     }
 
     /// A directory symlink inside a root is part of the workspace universe: the
