@@ -554,7 +554,11 @@ pub(super) fn search_status_with_cap(
             let _ = writeln!(
                 out,
                 "  Watcher mode: {}",
-                if overlay.watcher_mode { "enabled" } else { "polling" }
+                if overlay.watcher_mode {
+                    "enabled"
+                } else {
+                    "absent (no change feed attached; the overlay is as of its last publication)"
+                }
             );
             let _ = writeln!(out, "  Pending dirty paths: {}", overlay.pending_dirty_paths);
         }
@@ -1287,6 +1291,11 @@ mod tests {
         assert!(text.contains("Resolved workspace view: ready"));
         assert!(text.contains("Baseline: snapshot local-workspace-baseline"));
         assert!(text.contains("Workspace overlay: enabled"));
+        assert!(
+            text.contains("Watcher mode: absent (no change feed attached"),
+            "no feed ever attached to this engine: {}",
+            text,
+        );
         assert!(text.contains("Files:    1"));
         assert!(text.contains("Chunks:   1"));
     }

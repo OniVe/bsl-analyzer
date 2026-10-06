@@ -1605,6 +1605,17 @@ impl HubInner {
         self.notify();
     }
 
+    /// Hand the hub to its poll thread and announce the failure in ONE order: the poll flag
+    /// first, the failure second. A waiter waking on `setup_failed` is being handed to the
+    /// poll, and an instant where the failure is visible while the poll is not reads as "no
+    /// watch and no poll" — which is the state a sink must never enable watcher mode over
+    /// (github#186, github#187). The one failure that truly has no poll behind it — a thread
+    /// the OS refused to start — keeps [`Self::mark_setup_failed`] alone.
+    fn mark_polling_setup_failed(&self) {
+        self.polling.store(true, Ordering::SeqCst);
+        self.mark_setup_failed();
+    }
+
     fn mark_watching(&self) {
         self.watching.store(true, Ordering::SeqCst);
         // Bump generation under the lock so `wait_until_watching` wakers re-check.
@@ -2720,9 +2731,10 @@ impl WorkspaceChangeHub {
     }
 
     /// Whether the watch is armed. False means setup is still in flight or failed.
-    /// Sinks gate on [`Self::wait_until_watching`] instead; this is the
-    /// point-in-time form for status reporting.
-    #[allow(dead_code)]
+    ///
+    /// Point-in-time, for the sink's admission gate (`hub_is_feeding`) and for status
+    /// reporting: a caller that has to WAIT for readiness uses [`Self::wait_until_watching`]
+    /// instead.
     pub(crate) fn is_watching(&self) -> bool {
         self.inner.watching.load(Ordering::SeqCst)
     }
@@ -4242,6 +4254,9 @@ fn run_polling(
     mut declared: Vec<WatchTarget>,
     rx: &std::sync::mpsc::Receiver<HubMsg>,
 ) {
+    // Raised by the fallback's callers too: `mark_polling_setup_failed` raises it BEFORE the
+    // failure is announced, so a waiter that sees `Failed` never reads "no watch and no poll"
+    // in the instant between the two. Idempotent, and kept here for any future direct caller.
     inner.polling.store(true, Ordering::SeqCst);
     inner.accept_declaration(&declared);
     // From here an observation is owed. Until the first walk lands, "never polled" must read
@@ -4373,7 +4388,7 @@ fn run_hub_thread(
             tracing::warn!("workspace change hub failed to create watcher: {error}");
             let targets = ResolvedTargets::here(targets);
             inner.set_scope(inner.scope_from(&targets));
-            inner.mark_setup_failed();
+            inner.mark_polling_setup_failed();
             run_polling(&inner, targets.into_inner(), &rx);
             return;
         }
@@ -4431,7 +4446,7 @@ fn run_hub_thread(
     }
     if armed.is_empty() {
         drop(watcher);
-        inner.mark_setup_failed();
+        inner.mark_polling_setup_failed();
         run_polling(&inner, declared, &rx);
         return;
     }

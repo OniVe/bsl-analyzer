@@ -240,6 +240,15 @@ fn owner_must_leave(
     stop.is_stopped() || hub.is_closing() || lease.is_superseded() || lease.is_released()
 }
 
+/// Whether a hub can actually feed its consumers: a watch that is up, or its own poll while
+/// the watch is refused. The sink asks this before flipping the one-way watcher mode — a hub
+/// whose thread never started has neither, and enabling the mode there would leave the overlay
+/// following a feed that is not there (github#186, github#187). A hub that arms later flips the
+/// mode where the feed proves itself: on the first applied drift batch.
+fn hub_is_feeding(hub: &WorkspaceChangeHub) -> bool {
+    hub.is_watching() || hub.is_polling()
+}
+
 impl SharedState {
     /// Wait for the watch to arm; `false` means it will not, or not within the budget.
     ///
@@ -267,7 +276,8 @@ impl SharedState {
                     // would put a warning in every clean shutdown.
                     if !stop.is_stopped() {
                         tracing::warn!(
-                            "workspace change hub could not be set up; search overlay stays in scan mode"
+                            "workspace change hub could not watch; the search overlay follows the \
+                             hub's feed when one is running and stays on full scans otherwise"
                         );
                     }
                     return false;
@@ -276,7 +286,9 @@ impl SharedState {
                     if std::time::Instant::now() >= deadline {
                         tracing::warn!(
                             budget_secs = policy.budget.as_secs(),
-                            "workspace change hub did not arm within the budget; search overlay stays in scan mode for this run of the daemon"
+                            "workspace change hub did not arm within the budget; the search overlay \
+                             proceeds on the boot baseline and follows the hub once it arms or \
+                             falls back to its own poll"
                         );
                         return false;
                     }
@@ -338,11 +350,18 @@ impl SharedState {
                 let mut enable_retry = RetryWindow::new(RetryOwner::ChangeHub);
                 let mut enable_rescan_debt = false;
                 // Watcher mode is one-way in the store and doubles as "skip the full
-                // rescan", so the only place it can be asked for safely is inside the
-                // consumer that feeds it: a running thread is a feeder that exists.
+                // rescan", so the admission asks for it only over a live feed
+                // ([`hub_is_feeding`]): a hub that is watching or polling is a feeder that
+                // exists.
                 loop {
                     match Self::apply_workspace_search(&engine, &stop, &lease, |engine| {
-                        engine.enable_workspace_watcher_mode();
+                        // The mode is one-way and doubles as "skip the full rescan", so it is
+                        // asked for only where a feed can really exist (see
+                        // [`hub_is_feeding`]). A hub that arms later enables the mode where the
+                        // feed proves itself — on the first applied batch.
+                        if hub_is_feeding(&hub) {
+                            engine.enable_workspace_watcher_mode();
+                        }
                         Ok(())
                     }) {
                         super::WorkspaceSearchApply::Applied(()) => break,
@@ -2032,6 +2051,125 @@ mod tests {
         assert!(seen, "the sink marked the path dirty and nobody read it back");
     }
 
+    /// #187, замер: a hub that cannot watch answers through its own POLLING fallback, and those
+    /// records are the feed — the sink consumes them, marks paths and the backlog applies them.
+    /// So SqliteLocal without an event-capable watch is kept fresh by the hub's poll, not by a
+    /// background cold scan; there is no silent staleness for a daemon that has a hub.
+    #[test]
+    fn a_polling_hub_still_keeps_the_search_overlay_fresh() {
+        use crate::change_hub::{
+            test_support::eventually, PollConfig, WatchTarget, WorkspaceChangeHub,
+        };
+        use std::time::Duration;
+
+        let _env_lock = env_lock();
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        let module = workspace.join("Module.bsl");
+        fs::write(&module, "Процедура Предыдущая() Экспорт КонецПроцедуры\n").unwrap();
+
+        let mut engine = SearchEngine::fts_only(&workspace.join("search.db")).unwrap();
+        engine.set_workspace_root(workspace.clone());
+        engine.index_directory_fts(&workspace).unwrap();
+        engine.enable_workspace_watcher_mode();
+        engine.initialize_workspace_overlay_clean().unwrap();
+        let shared: super::super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
+        let graph = crate::graph::GraphState::disabled();
+        // The hub refuses every watch, so it never arms: its fallback is the poll below, and
+        // the records it makes reach the accumulator like any event batch.
+        crate::change_hub::POLL_INSTEAD_OF_WATCHING.with(|poll| {
+            poll.set(Some(PollConfig {
+                period: Duration::from_millis(50),
+                verify_bytes: 1024 * 1024,
+            }))
+        });
+        let hub =
+            WorkspaceChangeHub::start_targets(vec![WatchTarget::recursive(workspace.clone())]);
+        crate::change_hub::POLL_INSTEAD_OF_WATCHING.with(|poll| poll.set(None));
+        assert!(
+            !hub.wait_until_watching(Duration::from_secs(5)),
+            "the fixture stands on a hub that cannot watch",
+        );
+        assert!(
+            hub.is_polling(),
+            "and the hub's fallback is the poll this test measures — not some other feed",
+        );
+        let lease = crate::workspace_lease::WorkspaceLease::claim(&workspace);
+        let owners = crate::state::OwnerStop::default();
+        let backlog = crate::state::overlay_backlog::OverlayBacklog::default();
+        assert!(backlog.start(Arc::clone(&shared), lease.clone(), None, owners.clone()));
+        assert!(SharedState::spawn_search_sink(
+            hub.clone(),
+            hub.subscribe(),
+            Arc::clone(&shared),
+            graph,
+            None,
+            Arc::new(AtomicU64::new(0)),
+            lease.clone(),
+            owners.clone(),
+            backlog.clone(),
+            Arc::new(Mutex::new(crate::state::ConsumerPhase::Pending)),
+        ));
+
+        fs::write(&module, "Процедура Новая() Экспорт КонецПроцедуры\n").unwrap();
+
+        let seen = eventually(Duration::from_secs(30), || {
+            let Ok(guard) = shared.lock() else { return false };
+            let Some(engine) = guard.as_ref() else { return false };
+            engine
+                .text_search_read_only("Новая", 10, Some("code"))
+                .map(|hits| !hits.is_empty())
+                .unwrap_or(false)
+        });
+
+        lease.release();
+        owners.stop();
+        backlog.stop();
+        assert!(seen, "the polling hub's records never reached the search overlay");
+    }
+
+    /// The gate the sink asks before flipping the one-way watcher mode: only a hub that can
+    /// actually feed qualifies — a watch that is up or the poll that replaces it. A hub whose
+    /// thread never started has neither, and that is exactly the state the mode must not be
+    /// flipped in (github#186, github#187).
+    #[test]
+    fn the_sink_enables_watcher_mode_only_over_a_live_feed() {
+        use crate::change_hub::{PollConfig, WatchTarget, WorkspaceChangeHub};
+        use std::time::Duration;
+
+        let _env_lock = env_lock();
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        fs::write(workspace.join("Module.bsl"), "Процедура П() КонецПроцедуры\n").unwrap();
+
+        // No thread at all: neither a watch nor a poll exists to feed anything.
+        let unstartable =
+            WorkspaceChangeHub::start_with_unstartable_thread(vec![WatchTarget::recursive(
+                workspace.clone(),
+            )]);
+        assert!(!super::hub_is_feeding(&unstartable), "a hub with no thread feeds nothing");
+
+        // A running watcher feeds.
+        let watching = WorkspaceChangeHub::start(vec![workspace.clone()]);
+        assert!(watching.wait_until_watching(Duration::from_secs(5)));
+        assert!(super::hub_is_feeding(&watching));
+        watching.shutdown();
+
+        // A hub that cannot watch polls instead, and that poll is a feed too.
+        crate::change_hub::POLL_INSTEAD_OF_WATCHING.with(|poll| {
+            poll.set(Some(PollConfig {
+                period: Duration::from_millis(50),
+                verify_bytes: 1024 * 1024,
+            }))
+        });
+        let polling = WorkspaceChangeHub::start(vec![workspace.clone()]);
+        crate::change_hub::POLL_INSTEAD_OF_WATCHING.with(|poll| poll.set(None));
+        assert!(!polling.wait_until_watching(Duration::from_secs(5)));
+        assert!(polling.is_polling(), "the fallback is the poll this gate accepts");
+        assert!(super::hub_is_feeding(&polling));
+        polling.shutdown();
+    }
+
     /// A consumer that cannot yet apply what it reads — its first fenced step is refused while
     /// someone else holds the lease lock — says so: it is not watching for the index until
     /// facts reach it. Once the fence lets it through, it is.
@@ -2868,7 +3006,8 @@ mod tests {
 
     /// A workspace whose initial walk outlasts one slice of patience is an ordinary large
     /// configuration, not a failure — and a boot that gave up on it would leave the search
-    /// overlay in scan mode for the whole life of the daemon.
+    /// overlay on its boot baseline until the hub arms or falls back to its own poll
+    /// (github#187).
     #[test]
     fn the_boot_keeps_waiting_while_the_hub_is_still_starting() {
         use crate::change_hub::{WatchTarget, WorkspaceChangeHub};
