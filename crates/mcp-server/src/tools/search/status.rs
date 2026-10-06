@@ -557,7 +557,10 @@ pub(super) fn search_status_with_cap(
                 if overlay.watcher_mode {
                     "enabled"
                 } else {
-                    "absent (no change feed attached; the overlay is as of its last publication)"
+                    // False until a feed proves itself, so a hub that armed late over a quiet
+                    // tree reads as "not yet proven", never as "no hub at all".
+                    "off (no change feed has proved itself to the overlay yet; the overlay is as \
+                     of its last publication)"
                 }
             );
             let _ = writeln!(out, "  Pending dirty paths: {}", overlay.pending_dirty_paths);
@@ -1292,7 +1295,7 @@ mod tests {
         assert!(text.contains("Baseline: snapshot local-workspace-baseline"));
         assert!(text.contains("Workspace overlay: enabled"));
         assert!(
-            text.contains("Watcher mode: absent (no change feed attached"),
+            text.contains("Watcher mode: off (no change feed has proved itself"),
             "no feed ever attached to this engine: {}",
             text,
         );
