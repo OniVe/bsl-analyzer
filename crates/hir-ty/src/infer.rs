@@ -2673,7 +2673,14 @@ impl<'db> InferenceContext<'db> {
                                 )
                                 .unwrap_or(base_ty),
                             ));
-                    if !field.is_missing() && closed_receiver {
+                    // `Метаданные.Справочники` is closed on the same grounds as the manager
+                    // collection, but only where the configuration is visible: an external
+                    // processor or a loose module names objects of a configuration this
+                    // file cannot see, and there a miss proves nothing.
+                    let closed_metadata_collection =
+                        matches!(base_kind, TypeKind::MetadataObjectCollection(_))
+                            && self.db.file_has_visible_config(self.context_file_id);
+                    if !field.is_missing() && (closed_receiver || closed_metadata_collection) {
                         self.push_inference_diagnostic(InferenceDiagnostic::UnresolvedField {
                             expr: expr_id,
                             receiver_ty: base_ty,
