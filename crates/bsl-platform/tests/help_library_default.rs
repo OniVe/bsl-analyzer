@@ -37,19 +37,18 @@ fn library_default_is_fixed_on_first_access_and_never_discovers_an_installation(
                 .unwrap()
                 .description
                 .contains("appends one element"));
-        } else if matches!(mode.as_str(), "url" | "malformed" | "blank_then_url") {
+        } else if matches!(mode.as_str(), "url" | "http" | "malformed" | "blank_then_url") {
             // A URL is the application's input; the library neither reads a file
             // of that name nor serves something else in its place.
             assert_eq!(data.help_status_for_target(None), PlatformHelpStatus::Missing);
             let reason = data.help_missing_reason().unwrap();
             assert!(reason.contains("supported only by the bsl-analyzer application"), "{reason}");
-            assert!(mode != "url" || reason.contains("host.invalid/m.json"), "{reason}");
+            assert!(
+                !matches!(mode.as_str(), "url" | "http") || reason.contains("host.invalid/m.json"),
+                "{reason}"
+            );
             assert!(!reason.contains("secret") && !reason.contains("token"), "{reason}");
             assert!(data.all_types().is_empty() && data.all_methods().is_empty());
-        } else if mode == "http" {
-            let reason = data.help_missing_reason().unwrap();
-            assert!(reason.contains("use `https` or a path"), "{reason}");
-            assert!(!reason.contains("secret") && !reason.contains("token"), "{reason}");
         } else if mode == "absent" {
             // An explicitly named corpus that cannot load is an error to report,
             // not a reason to serve something else.

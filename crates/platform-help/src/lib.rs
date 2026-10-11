@@ -34,8 +34,8 @@ enum SourceOrigin {
     EnvironmentIgnored,
 }
 
-/// The variable's value: `None` when unset, empty or blank; a URL for `https`,
-/// an error for `http`, otherwise a path.
+/// The variable's value: `None` when unset, empty or blank; a URL for `http`
+/// and `https`, otherwise a path.
 fn corpus_from_environment() -> Result<Option<PlatformHelpRequest>, String> {
     match std::env::var_os(bsl_platform::CORPUS_ENV) {
         Some(value) => parse_corpus_value(value),
@@ -54,19 +54,13 @@ fn parse_corpus_value(value: std::ffi::OsString) -> Result<Option<PlatformHelpRe
     let has_scheme = |scheme: &str| {
         text.get(..scheme.len()).is_some_and(|head| head.eq_ignore_ascii_case(scheme))
     };
-    if has_scheme("https://") {
+    if has_scheme("https://") || has_scheme("http://") {
         Ok(Some(PlatformHelpRequest::ExternalUrl(text.to_owned())))
-    } else if has_scheme("http://") {
-        Err(format!(
-            "{}: `http` is not accepted ({}); use an `https` URL, or `[platform_help]` with `url`",
-            bsl_platform::CORPUS_ENV,
-            bsl_platform::redact_url(text)
-        ))
     } else if bsl_platform::is_url_like(text) {
         // Printed as a path it would reach the log with whatever secrets it holds.
         Err(format!(
             "{}: the value looks like a URL but was not parsed (it is not shown); use an \
-             `https://` URL, or a path, or `[platform_help]` with `path`",
+             `http://` or `https://` URL, or a path, or `[platform_help]` with `path`",
             bsl_platform::CORPUS_ENV
         ))
     } else {
@@ -578,13 +572,17 @@ mod tests {
             Some(PlatformHelpRequest::ExternalPath("./https://x".into()))
         );
 
-        let refused = parse("http://user:secret@example.invalid/m.json?token=abc").unwrap_err();
-        assert!(
-            refused.contains("`http` is not accepted") && refused.contains("https"),
-            "{refused}"
-        );
-        assert!(refused.contains("example.invalid/m.json"), "{refused}");
-        assert!(!refused.contains("secret") && !refused.contains("token"), "{refused}");
+        // `http` is a URL like `https`, and the scheme's case does not matter.
+        for url in ["http://example.invalid/m.json", "HTTP://example.invalid/m.json"] {
+            assert_eq!(
+                parse(url).unwrap(),
+                Some(PlatformHelpRequest::ExternalUrl(url.to_owned())),
+                "{url}"
+            );
+        }
+        let request =
+            parse("http://user:secret@example.invalid/m.json?token=abc").unwrap().unwrap();
+        assert_eq!(request.to_string(), "external (http://example.invalid/m.json)");
     }
 
     #[test]
@@ -600,6 +598,7 @@ mod tests {
             shown("https://host.invalid/@scope/m.json"),
             "https://host.invalid/@scope/m.json"
         );
+        assert_eq!(shown("http://user:pw@host.invalid/m.json?a=1#f"), "http://host.invalid/m.json");
         assert_eq!(shown("https://[::1]:8443/m.json?a=1"), "https://[::1]:8443/m.json");
         // Without a literal `://` nothing is shown, whatever it holds.
         let single_slash = shown("https:/user:secret@host.invalid/m.json?token=abc");

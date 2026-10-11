@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/) in the `0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-11
+
+### Fixed
+
+- platform-help: переменная `BSL_PLATFORM_HELP_CORPUS` принимает `http://`-адрес
+  так же, как `https://`: тот же загрузчик, лимиты, SHA-256, кэш и откат; в
+  журнале адрес показывается без `user:password@` и строки запроса. Прежде
+  `http://` отвергался ошибкой конфигурации.
+
 ## [0.3.1] - 2026-10-11
 
 ### Added
