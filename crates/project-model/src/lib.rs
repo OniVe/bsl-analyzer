@@ -2409,7 +2409,7 @@ pub enum PlatformHelpConfig {
         url: Option<String>,
     },
     /// The snapshot saved for `auto`, else an installed platform, else the
-    /// pinned corpus download, else no help.
+    /// built-in interface facts.
     Auto {},
     /// No platform help; nothing is searched, extracted or downloaded.
     None {},
