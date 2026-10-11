@@ -21,7 +21,7 @@ fn partitioned_project() -> tempfile::TempDir {
         dir.path().join("bsl-analyzer.toml"),
         r#"[source]
 root = "src/cf"
-extensions = [{ name = "A", path = "src/cfe/A" }, { name = "B", path = "src/cfe/B" }]
+extensions = [{ name = "A", path = "src/cfe/A", scope = "InfoBase" }, { name = "B", path = "src/cfe/B", scope = "InfoBase" }]
 
 [diagnostics.baseline]
 directory = "baselines"

@@ -33,7 +33,7 @@ fn setup() -> TempDir {
         temp.path().join("bsl-analyzer.toml"),
         r#"[source]
 root = "src/cf"
-extensions = [{ name = "Ext", path = "src/cfe/ext" }]
+extensions = [{ name = "Ext", path = "src/cfe/ext", scope = "InfoBase" }]
 
 [diagnostics.baseline]
 path = ".bsl-diagnostics-baseline.json"
@@ -103,7 +103,11 @@ fn diagnostics_baseline_cli() {
 #[test]
 fn create_without_configuration_fails_before_analysis() {
     let temp = setup();
-    fs::write(temp.path().join("bsl-analyzer.toml"), "[source]\nroot = \"src/cf\"\n").unwrap();
+    fs::write(
+        temp.path().join("bsl-analyzer.toml"),
+        "[source]\nroot = \"src/cf\"\nextensions = []\n",
+    )
+    .unwrap();
 
     let output = run(temp.path(), &["diagnostics", "baseline", "create", "-s", "."]);
 

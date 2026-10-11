@@ -37,7 +37,7 @@ fn setup(directory: bool) -> TempDir {
         format!(
             r#"[source]
 root = "src/cf"
-extensions = [{{ name = "Ext", path = "src/cfe/Ext" }}]
+extensions = [{{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }}]
 
 [diagnostics.baseline]
 {baseline}
@@ -186,8 +186,8 @@ fn operations_all_and_selected_are_atomic_and_scoped() {
     let config = fs::read_to_string(root.join("bsl-analyzer.toml"))
         .unwrap()
         .replace(
-            "extensions = [{ name = \"Ext\", path = \"src/cfe/Ext\" }]",
-            "extensions = [{ name = \"Ext\", path = \"src/cfe/Ext\" }, { name = \"NewExt\", path = \"src/cfe/NewExt\" }]",
+            "extensions = [{ name = \"Ext\", path = \"src/cfe/Ext\", scope = \"InfoBase\" }]",
+            "extensions = [{ name = \"Ext\", path = \"src/cfe/Ext\", scope = \"InfoBase\" }, { name = \"NewExt\", path = \"src/cfe/NewExt\", scope = \"InfoBase\" }]",
         );
     fs::write(root.join("bsl-analyzer.toml"), config).unwrap();
     let full_update = run(root, &["diagnostics", "baseline", "update", "-s", "."]);

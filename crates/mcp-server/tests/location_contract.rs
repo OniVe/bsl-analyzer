@@ -207,7 +207,7 @@ async fn the_resident_and_the_graph_name_the_same_topology() {
     copy_fixture_into(&ext);
     std::fs::write(
         ws.path().join("bsl-analyzer.toml"),
-        format!("[source]\nroot = \".\"\nextensions = [{{ name = \"a\", path = {ext:?} }}]\n"),
+        format!("[source]\nroot = \".\"\nextensions = [{{ name = \"a\", path = {ext:?}, scope = \"InfoBase\" }}]\n"),
     )
     .expect("declare an extension in the same workspace");
 
@@ -325,7 +325,7 @@ fn stage_two_roots_sharing_a_path() -> (TempDir, TempDir) {
     let path = ext.path();
     std::fs::write(
         ws.path().join("bsl-analyzer.toml"),
-        format!("[source]\nroot = \".\"\nextensions = [{{ name = \"расш\", path = {path:?} }}]\n"),
+        format!("[source]\nroot = \".\"\nextensions = [{{ name = \"расш\", path = {path:?}, scope = \"InfoBase\" }}]\n"),
     )
     .expect("declare the extension");
     (ws, ext)

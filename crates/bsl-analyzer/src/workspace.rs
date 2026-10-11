@@ -1192,7 +1192,7 @@ mod metadata_warmup_tests {
             extension_at(root, "src/cfe/Feature");
             std::fs::write(
                 root.join("bsl-analyzer.toml"),
-                "[source]\nroot = \"src/cf\"\nextensions = [\"src/cfe/Feature\"]\n",
+                "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"Feature\", path = \"src/cfe/Feature\", scope = \"InfoBase\" }]\n",
             )
             .unwrap();
         });
@@ -1207,7 +1207,7 @@ mod metadata_warmup_tests {
             extension_at(root, "Расширения/Feature");
             std::fs::write(
                 root.join("bsl-analyzer.toml"),
-                "[source]\nextensions = [\"Расширения/Feature\"]\n",
+                "[source]\nextensions = [{ name = \"Feature\", path = \"Расширения/Feature\", scope = \"InfoBase\" }]\n",
             )
             .unwrap();
         });
@@ -1283,7 +1283,7 @@ mod diagnostics_baseline_tests {
             format!(
                 r#"[source]
 root = "src/cf"
-extensions = [{{ name = "Ext", path = "src/cfe/Ext" }}, {{ name = "Dormant", path = "src/cfe/Dormant" }}]
+extensions = [{{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }}, {{ name = "Dormant", path = "src/cfe/Dormant", scope = "InfoBase" }}]
 [diagnostics.baseline]
 directory = "baselines"
 {include}

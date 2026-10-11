@@ -26,7 +26,7 @@ fn config(root: &Path, include: &[&str]) {
         &format!(
             r#"[source]
 root = "src/cf"
-extensions = [{{ name = "Ext", path = "src/cfe/Ext" }}]
+extensions = [{{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }}]
 [diagnostics.baseline]
 directory = "baselines"
 include = [{include}]
