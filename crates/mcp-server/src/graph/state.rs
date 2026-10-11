@@ -9397,6 +9397,7 @@ mod tests {
         let graph = GraphState::for_workspace(root.to_path_buf());
         graph.ensure_loading();
         wait_ready(&graph);
+        wait_until(&graph, "the initial build to leave its slot", || !graph.facts().in_flight);
         let generation =
             lock_recover(&graph.inner).published.as_ref().expect("the build published").generation;
         let first_interval = lock_recover(&graph.debt).probe_interval().expect("a probe is owed");
