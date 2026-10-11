@@ -31,7 +31,7 @@ fn build_db_with_configs(
     db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
     db.set_file_source_root(file_id, SourceRootId(0));
     db.set_file_text(file_id, text);
-    db.set_all_config_paths(config_paths);
+    db.set_all_config_paths(config_paths, Some(bsl_metadata::ExtensionScope::InfoBase));
 
     (db, file_id)
 }
@@ -146,7 +146,7 @@ fn common_module_assign_emits_for_cfe_only_module() {
     db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
     db.set_file_source_root(file_id, SourceRootId(0));
     db.set_file_text(file_id, text);
-    db.set_all_config_paths(config_paths);
+    db.set_all_config_paths(config_paths, Some(bsl_metadata::ExtensionScope::InfoBase));
     let config = DiagnosticsConfig::all_enabled();
     let provider = SalsaProvider::new(&db, None);
     let ctx = DiagnosticsContext::new(&config, file_id, &provider);

@@ -3961,7 +3961,7 @@ mod tests {
 
         {
             let db = state.analysis_host.raw_database_mut();
-            db.set_all_config_paths(vec![(None, tmp.path().to_path_buf())]);
+            db.set_all_config_paths(vec![(None, tmp.path().to_path_buf())], None);
             db.set_metadata_listing(
                 &tmp.path().to_string_lossy(),
                 ide_db::metadata::MetadataListingData {

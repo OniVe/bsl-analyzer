@@ -63,7 +63,7 @@ fn stand() -> RootDatabaseImpl {
         db.set_file_source_root(file_id, SourceRootId(0));
         db.set_file_text(file_id, text);
     }
-    db.set_all_config_paths(vec![(None, std::path::PathBuf::from(CONFIG_ROOT))]);
+    db.set_all_config_paths(vec![(None, std::path::PathBuf::from(CONFIG_ROOT))], None);
     db.set_metadata_listing(
         CONFIG_ROOT,
         MetadataListingData {

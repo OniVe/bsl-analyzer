@@ -157,6 +157,12 @@ pub struct Register {
     #[serde(rename = "uuid")]
     uuid: Uuid,
 
+    #[serde(rename = "objectBelonging", default)]
+    object_belonging: ObjectBelonging,
+
+    #[serde(rename = "extendedConfigurationObject", default)]
+    extended_configuration_object: Option<Uuid>,
+
     #[serde(rename = "name")]
     name: String,
 
@@ -186,6 +192,15 @@ pub struct Register {
 
     #[serde(rename = "enableTotalsSliceLast", default)]
     enable_totals_slice_last: bool,
+
+    /// Fields contributed by common attributes whose composition includes this register; a
+    /// separator among them acts as a dimension. Kept apart from the declared members for the
+    /// reason given on [`crate::MetadataObject::common_attributes`].
+    #[serde(rename = "commonAttributes", default)]
+    common_attributes: Vec<crate::common_attribute::CommonAttributeField>,
+
+    #[serde(rename = "commonAttributesOpen", default)]
+    common_attributes_open: bool,
 }
 
 impl Register {
@@ -195,6 +210,19 @@ impl Register {
 
     pub fn uuid(&self) -> &Uuid {
         &self.uuid
+    }
+
+    /// Whether this declaration adopts the identified register.
+    pub fn adopts(&self, base: &Register) -> bool {
+        self.object_belonging == ObjectBelonging::Adopted
+            && self.mdo_type == base.mdo_type
+            && stdx::case::eq_ignore_case(&self.name, &base.name)
+            && self.extended_configuration_object == Some(base.uuid)
+    }
+
+    /// The ownership declared by the metadata export.
+    pub fn object_belonging(&self) -> ObjectBelonging {
+        self.object_belonging
     }
 
     pub fn name(&self) -> &str {
@@ -253,6 +281,26 @@ impl Register {
         self.enable_totals_slice_last
     }
 
+    /// Fields contributed by common attributes (see [`Self::set_common_attributes`]).
+    pub fn common_attributes(&self) -> &[crate::common_attribute::CommonAttributeField] {
+        &self.common_attributes
+    }
+
+    /// Whether a common attribute may apply to this register without being listed in
+    /// [`Self::common_attributes`], so its field set is not known to be exhaustive.
+    pub fn common_attributes_open(&self) -> bool {
+        self.common_attributes_open
+    }
+
+    /// Record which common attributes apply to this register.
+    pub fn set_common_attributes(
+        &mut self,
+        applied: crate::common_attribute::ObjectCommonAttributes,
+    ) {
+        self.common_attributes = applied.fields;
+        self.common_attributes_open = applied.open;
+    }
+
     /// Overlay an extension's adopted copy of this register onto the base: merge
     /// dimensions, resources, and attributes by name (1C lets an extension add new
     /// measurements/resources/attributes to a borrowed register, or replace a
@@ -281,6 +329,11 @@ impl Register {
         if overlay.register_type.is_some() {
             self.register_type = overlay.register_type;
         }
+        crate::common_attribute::merge_common_attribute_fields(
+            &mut self.common_attributes,
+            &overlay.common_attributes,
+        );
+        self.common_attributes_open |= overlay.common_attributes_open;
     }
 
     pub fn virtual_tables(&self) -> Vec<&'static str> {
@@ -327,6 +380,14 @@ impl Register {
             + self.resources.iter().map(RegisterResource::estimated_heap_size).sum::<usize>()
             + stdx::heap::vec_bytes::<RegisterAttribute>(self.attributes.len())
             + self.attributes.iter().map(RegisterAttribute::estimated_heap_size).sum::<usize>()
+            + stdx::heap::vec_bytes::<crate::common_attribute::CommonAttributeField>(
+                self.common_attributes.len(),
+            )
+            + self
+                .common_attributes
+                .iter()
+                .map(crate::common_attribute::CommonAttributeField::estimated_heap_size)
+                .sum::<usize>()
     }
 }
 
@@ -344,7 +405,7 @@ impl MdObject for Register {
     }
 
     fn object_belonging(&self) -> ObjectBelonging {
-        ObjectBelonging::Own
+        self.object_belonging
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -355,6 +416,8 @@ impl MdObject for Register {
 #[derive(Debug, Default)]
 pub struct RegisterBuilder {
     uuid: Option<Uuid>,
+    object_belonging: ObjectBelonging,
+    extended_configuration_object: Option<Uuid>,
     name: Option<String>,
     mdo_type: Option<MdoType>,
     dimensions: Vec<Dimension>,
@@ -368,6 +431,13 @@ pub struct RegisterBuilder {
 }
 
 impl RegisterBuilder {
+    /// Set the ownership and confirmed target of an extension declaration.
+    pub fn extension_ownership(mut self, belonging: ObjectBelonging, target: Option<Uuid>) -> Self {
+        self.object_belonging = belonging;
+        self.extended_configuration_object = target;
+        self
+    }
+
     pub fn uuid(mut self, uuid: Uuid) -> Self {
         self.uuid = Some(uuid);
         self
@@ -441,6 +511,8 @@ impl RegisterBuilder {
     pub fn build(self) -> Register {
         Register {
             uuid: self.uuid.unwrap_or_else(Uuid::new_v4),
+            object_belonging: self.object_belonging,
+            extended_configuration_object: self.extended_configuration_object,
             name: self.name.unwrap_or_default(),
             mdo_type: self.mdo_type.unwrap_or(MdoType::InformationRegister),
             dimensions: self.dimensions,
@@ -451,6 +523,8 @@ impl RegisterBuilder {
             recorder_subordinate: self.recorder_subordinate,
             enable_totals_slice_first: self.enable_totals_slice_first,
             enable_totals_slice_last: self.enable_totals_slice_last,
+            common_attributes: Vec::new(),
+            common_attributes_open: false,
         }
     }
 }

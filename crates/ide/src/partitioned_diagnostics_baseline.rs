@@ -1487,6 +1487,8 @@ mod tests {
         let extension = DiagnosticsBaselinePartitionIdentity::Extension {
             name: "Ext".to_owned(),
             path: "src/cfe/Ext".to_owned(),
+            scope: Some(bsl_metadata::ExtensionScope::InfoBase),
+            dependency_scopes: vec![],
             depends_on: vec![],
         };
         DiagnosticsBaselinePartitionPlan {
@@ -1495,6 +1497,8 @@ mod tests {
                 extensions: vec![project_model::DiagnosticsBaselineProjectExtension {
                     name: "Ext".to_owned(),
                     path: "src/cfe/Ext".to_owned(),
+                    scope: Some(bsl_metadata::ExtensionScope::InfoBase),
+                    dependency_scopes: vec![],
                     depends_on: vec![],
                 }],
                 externals: vec![],
@@ -1860,6 +1864,8 @@ mod tests {
         changed.partitions[1].identity = DiagnosticsBaselinePartitionIdentity::Extension {
             name: "Ext".to_owned(),
             path: "src/cfe/Renamed".to_owned(),
+            scope: Some(bsl_metadata::ExtensionScope::InfoBase),
+            dependency_scopes: vec![],
             depends_on: vec![],
         };
         let snapshot = load_diagnostics_baseline_set(&directory, &changed).unwrap();

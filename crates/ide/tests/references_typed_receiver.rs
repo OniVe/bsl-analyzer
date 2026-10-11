@@ -60,7 +60,7 @@ fn db_over_designer(
         db.set_file_text(*id, text);
     }
 
-    db.set_all_config_paths(vec![(None, root.clone())]);
+    db.set_all_config_paths(vec![(None, root.clone())], None);
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
@@ -492,7 +492,7 @@ fn a_body_outside_every_configured_root_is_still_a_candidate() {
         db.set_file_text(file_id, text);
     }
 
-    db.set_all_config_paths(vec![(None, root.clone())]);
+    db.set_all_config_paths(vec![(None, root.clone())], None);
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {

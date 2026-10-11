@@ -1070,7 +1070,10 @@ mod tests {
         db.set_file_source_root(app, SourceRootId(0));
         db.set_file_text(caller, "Процедура Тест()\nКонецПроцедуры");
         db.set_file_text(app, app_source);
-        db.set_all_config_paths(fixture.config_paths());
+        db.set_all_config_paths(
+            fixture.config_paths(),
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+        );
 
         let (items, _) = complete_global_module_exports(
             &db,

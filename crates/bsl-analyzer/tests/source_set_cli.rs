@@ -306,6 +306,60 @@ fn workspace() -> tempfile::TempDir {
     tempfile::tempdir().unwrap()
 }
 
+fn write_scoped_extensions(root: &Path, extensions: &[(&str, &str, &[&str])]) {
+    let config_path = root.join("bsl-analyzer.toml");
+    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let preserved = existing.split("[source]").next().unwrap_or(&existing).trim_end();
+    let entries = extensions
+        .iter()
+        .map(|(name, path, dependencies)| {
+            let dependencies = dependencies
+                .iter()
+                .map(|dependency| format!("{dependency:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{{ name = {name:?}, path = {path:?}, dependsOn = [{dependencies}], scope = \"InfoBase\" }}"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n  ");
+    std::fs::write(config_path, format!("{preserved}\n[source]\nextensions = [\n  {entries}\n]\n"))
+        .unwrap();
+}
+
+fn scoped_fixture_config(
+    root: &Path,
+    source_root: &str,
+    extensions: &[(&str, &str, &[&str])],
+) -> tempfile::TempDir {
+    let config_dir = tempfile::tempdir().unwrap();
+    let entries = extensions
+        .iter()
+        .map(|(name, path, dependencies)| {
+            let dependencies = dependencies
+                .iter()
+                .map(|dependency| format!("{dependency:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{{ name = {name:?}, path = {:?}, dependsOn = [{dependencies}], scope = \"InfoBase\" }}",
+                root.join(path).to_string_lossy()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n  ");
+    std::fs::write(
+        config_dir.path().join("bsl-analyzer.toml"),
+        format!(
+            "[source]\nroot = {:?}\nextensions = [\n  {entries}\n]\n",
+            root.join(source_root).to_string_lossy()
+        ),
+    )
+    .unwrap();
+    config_dir
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct TreeEntry {
     kind: &'static str,
@@ -661,6 +715,7 @@ fn source_composition(root: &Path) {
             true,
         );
     }
+    write_scoped_extensions(root, &[("EXT_A", "a/b/ext-a", &[])]);
     std::fs::create_dir_all(root.join(".build")).unwrap();
     for (name, bytes) in [
         ("bsl-graph.db", b"legacy graph canary".as_slice()),
@@ -672,14 +727,10 @@ fn source_composition(root: &Path) {
     }
 }
 
-fn composition_flags(extension: &str) -> [String; 4] {
+fn composition_flags(root: &Path, extension: &str) -> [String; 2] {
     let path = if extension == "EXT_A" { "a/b/ext-a" } else { "a/b/ext-b" };
-    [
-        "--configuration-root".into(),
-        MAIN.into(),
-        "--extension".into(),
-        format!("{extension}={path}"),
-    ]
+    write_scoped_extensions(root, &[(extension, path, &[])]);
+    ["--configuration-root".into(), MAIN.into()]
 }
 
 fn cache_layout(
@@ -696,6 +747,7 @@ fn cache_layout(
             name: extension.to_owned(),
             path: extension_path.into(),
             depends_on: Vec::new(),
+            scope: bsl_metadata::ExtensionScope::InfoBase,
         })]),
         externals: None,
     }
@@ -1280,7 +1332,7 @@ fn start_scope(
     state: &Path,
     embedding_url: &str,
 ) -> McpSession {
-    let flags = composition_flags(extension);
+    let flags = composition_flags(root, extension);
     let flags: Vec<_> = flags.iter().map(String::as_str).collect();
     McpSession::start_with_cache(root, &flags, Some(cache), Some(state), Some(embedding_url))
 }
@@ -1351,8 +1403,13 @@ fn assert_vector_artifacts(layout: &mcp_server::WorkspaceCacheLayout) {
 fn workspace_cache_scope_two_compositions_isolate_native_stores_and_warm_restarts() {
     let root = workspace();
     source_composition(root.path());
+    let root_b = workspace();
+    source_composition(root_b.path());
+    composition_flags(root_b.path(), "EXT_B");
     let initial = tree_snapshot(root.path());
+    let initial_b = tree_snapshot(root_b.path());
     let legacy = tree_snapshot(&root.path().join(".build"));
+    let legacy_b = tree_snapshot(&root_b.path().join(".build"));
     let cache = tempfile::tempdir().unwrap();
     let state_a = tempfile::tempdir().unwrap();
     let state_b = tempfile::tempdir().unwrap();
@@ -1361,7 +1418,7 @@ fn workspace_cache_scope_two_compositions_isolate_native_stores_and_warm_restart
     let state_a_final = tempfile::tempdir().unwrap();
     let embedder = EmbeddingStub::start();
     let layout_a = cache_layout(root.path(), "EXT_A", Some(cache.path()));
-    let layout_b = cache_layout(root.path(), "EXT_B", Some(cache.path()));
+    let layout_b = cache_layout(root_b.path(), "EXT_B", Some(cache.path()));
     assert_ne!(
         layout_a.root(),
         layout_b.root(),
@@ -1369,7 +1426,9 @@ fn workspace_cache_scope_two_compositions_isolate_native_stores_and_warm_restart
     );
     assert!(layout_a.root().starts_with(cache.path().join("workspaces/v1")));
     assert!(layout_b.root().starts_with(cache.path().join("workspaces/v1")));
-    assert!(!layout_a.root().starts_with(root.path()) && !layout_b.root().starts_with(root.path()));
+    assert!(
+        !layout_a.root().starts_with(root.path()) && !layout_b.root().starts_with(root_b.path())
+    );
 
     let mut a = start_scope(root.path(), "EXT_A", cache.path(), state_a.path(), &embedder.url);
     let graph_a = graph_overview(&mut a);
@@ -1387,7 +1446,7 @@ fn workspace_cache_scope_two_compositions_isolate_native_stores_and_warm_restart
         "legacy flat cache remains byte-for-byte unchanged"
     );
 
-    let mut b = start_scope(root.path(), "EXT_B", cache.path(), state_b.path(), &embedder.url);
+    let mut b = start_scope(root_b.path(), "EXT_B", cache.path(), state_b.path(), &embedder.url);
     let graph_b = graph_overview(&mut b);
     assert_eq!(graph_b["nodes"], 2, "B graph contains main plus its extension: {graph_b}");
     let marker_b = wait_for_marker(&mut b, "CACHE_LEXICAL_B_235");
@@ -1417,6 +1476,11 @@ fn workspace_cache_scope_two_compositions_isolate_native_stores_and_warm_restart
     assert_tree_unchanged(
         &initial,
         root.path(),
+        "while both composition stores and leases are open",
+    );
+    assert_tree_unchanged(
+        &initial_b,
+        root_b.path(),
         "while both composition stores and leases are open",
     );
 
@@ -1501,7 +1565,7 @@ fn workspace_cache_scope_two_compositions_isolate_native_stores_and_warm_restart
     let cache_a_before_b_restart = durable_cache_snapshot(&layout_a);
 
     let mut b_restart =
-        start_scope(root.path(), "EXT_B", cache.path(), state_b_restart.path(), &embedder.url);
+        start_scope(root_b.path(), "EXT_B", cache.path(), state_b_restart.path(), &embedder.url);
     assert_eq!(
         graph_overview(&mut b_restart)["nodes"],
         graph_b["nodes"],
@@ -1588,6 +1652,12 @@ fn workspace_cache_scope_two_compositions_isolate_native_stores_and_warm_restart
         legacy,
         "legacy flat cache canaries remain untouched"
     );
+    assert_eq!(
+        tree_snapshot(&root_b.path().join(".build")),
+        legacy_b,
+        "B legacy flat cache canaries remain untouched"
+    );
+    assert_tree_unchanged(&initial_b, root_b.path(), "after both composition sessions shut down");
 
     let report = serde_json::json!({
         "case": "workspace_cache_scope_two_compositions",
@@ -1646,7 +1716,7 @@ fn workspace_cache_scope_linux_default_stdio_and_read_only_cli_stay_outside_sour
     assert_private_test_dir(&restart_state);
     let expected_base = cache_home.join("bsl-analyzer");
     let layout = cache_layout(root.path(), "EXT_A", Some(&expected_base));
-    let flags_owned = composition_flags("EXT_A");
+    let flags_owned = composition_flags(root.path(), "EXT_A");
     let flags: Vec<_> = flags_owned.iter().map(String::as_str).collect();
 
     let mut session = McpSession::start_transport(
@@ -1832,7 +1902,7 @@ fn workspace_cache_scope_explicit_workspace_build_namespace_preserves_flat_canar
     let cache_base = root.path().join(".build");
     let layout = cache_layout(root.path(), "EXT_A", Some(&cache_base));
     assert!(!layout.root().exists(), "explicit .build composition starts cold");
-    let mut flags = composition_flags("EXT_A").to_vec();
+    let mut flags = composition_flags(root.path(), "EXT_A").to_vec();
     flags.extend(["--cache-dir".to_owned(), cache_base.to_string_lossy().into_owned()]);
     let flags: Vec<_> = flags.iter().map(String::as_str).collect();
     let embedder = EmbeddingStub::start();
@@ -2123,7 +2193,7 @@ fn workspace_cache_scope_http_cold_and_warm_runs_keep_sources_clean() {
     assert_private_test_dir(&state_warm.join("runtime"));
     let cache_base = cache_home.join("bsl-analyzer");
     let layout = cache_layout(root.path(), "EXT_A", Some(&cache_base));
-    let flags_owned = composition_flags("EXT_A");
+    let flags_owned = composition_flags(root.path(), "EXT_A");
     let flags: Vec<_> = flags_owned.iter().map(String::as_str).collect();
     let cold = exercise(root.path(), &flags, &cache_home, &state_cold, false);
     let warm = exercise(root.path(), &flags, &cache_home, &state_warm, true);
@@ -2198,6 +2268,7 @@ fn workspace_cache_scope_optional_journal_overlap_keeps_source_clean() {
     );
     let cache = tempfile::tempdir().unwrap();
     assert_private_test_dir(cache.path());
+    write_scoped_extensions(root.path(), &[("EXT_A", journal_root.to_str().unwrap(), &[])]);
     let before = tree_snapshot(root.path());
     let legacy = tree_snapshot(&root.path().join(".build"));
     let journal_before = tree_snapshot(&journal_root);
@@ -2209,6 +2280,7 @@ fn workspace_cache_scope_optional_journal_overlap_keeps_source_clean() {
                 name: "EXT_A".into(),
                 path: journal_root.to_string_lossy().into_owned(),
                 depends_on: Vec::new(),
+                scope: bsl_metadata::ExtensionScope::InfoBase,
             },
         )]),
         externals: None,
@@ -2222,8 +2294,7 @@ fn workspace_cache_scope_optional_journal_overlap_keeps_source_clean() {
         None,
     )
     .unwrap();
-    let extension_arg = format!("EXT_A={}", journal_root.display());
-    let flags = ["--configuration-root", MAIN, "--extension", &extension_arg];
+    let flags = ["--configuration-root", MAIN];
 
     let mut session = McpSession::start_transport(
         root.path(),
@@ -2315,14 +2386,14 @@ fn workspace_cache_scope_live_topology_drift_stops_stdio_and_http() {
     for mode in ["stdio", "http"] {
         let root = workspace();
         source_composition(root.path());
+        let flags_owned = composition_flags(root.path(), "EXT_A");
+        let flags: Vec<_> = flags_owned.iter().map(String::as_str).collect();
         let source_before = tree_snapshot(root.path());
         let legacy = tree_snapshot(&root.path().join(".build"));
         let config_path = root.path().join("bsl-analyzer.toml");
         let original_config = std::fs::read(&config_path).unwrap();
-        let changed_config = format!(
-            "{}\n[source]\nexclude = [\"a/b/ext-a\"]\n",
-            String::from_utf8_lossy(&original_config)
-        );
+        let changed_config = String::from_utf8_lossy(&original_config)
+            .replace("[source]\n", "[source]\nexclude = [\"a/b/ext-a\"]\n");
         let paths = tempfile::tempdir().unwrap();
         let cache = paths.path().join("cache");
         let old_state = paths.path().join("old-state");
@@ -2332,8 +2403,6 @@ fn workspace_cache_scope_live_topology_drift_stops_stdio_and_http() {
         assert_private_test_dir(&restart_state);
         assert_private_test_dir(&old_state.join("runtime"));
         assert_private_test_dir(&restart_state.join("runtime"));
-        let flags_owned = composition_flags("EXT_A");
-        let flags: Vec<_> = flags_owned.iter().map(String::as_str).collect();
         let old_layout = cache_layout(root.path(), "EXT_A", Some(&cache));
         let old_scope = old_layout.scope_stamp();
 
@@ -2595,7 +2664,7 @@ fn workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf()
     assert_private_test_dir(&state);
     assert_private_test_dir(&runtime);
     let layout = cache_layout(root.path(), "EXT_A", Some(&cache_base));
-    let flags_owned = composition_flags("EXT_A");
+    let flags_owned = composition_flags(root.path(), "EXT_A");
     let flags: Vec<_> = flags_owned.iter().map(String::as_str).collect();
 
     let mut daemon_command = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"));
@@ -2928,7 +2997,7 @@ fn s12_proxy_scope_mismatch_driver() {
         .arg(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
         .args(["mcp", "serve", "--profile", "workspace", "--mode", "daemon", "-s"])
         .arg(root.path())
-        .args(composition_flags("EXT_A"))
+        .args(composition_flags(root.path(), "EXT_A"))
         .arg("--cache-dir")
         .arg(&cache)
         .env(mcp_server::WORKSPACE_CACHE_SCOPE_ENV, &parent_stamp)
@@ -2961,7 +3030,7 @@ fn s12_proxy_scope_mismatch_driver() {
                 .unwrap_or_default();
             if count > 0 || Instant::now() >= deadline {
                 let drifted = format!(
-                    "{}\n[source]\nexclude = [\"a/b/ext-a\"]\n",
+                    "{}\nexclude = [\"a/b/ext-a\"]\n",
                     String::from_utf8_lossy(&original_for_gate)
                 );
                 std::fs::write(&config_for_gate, drifted).unwrap();
@@ -3053,7 +3122,7 @@ fn workspace_cache_scope_windows_source_delete_default_and_explicit() {
             "native child working directory stays outside the source tree"
         );
         let layout = cache_layout(root.path(), "EXT_A", Some(cache_base.unwrap_or(default_base)));
-        let flags_owned = composition_flags("EXT_A");
+        let flags_owned = composition_flags(root.path(), "EXT_A");
         let mut flags: Vec<String> = flags_owned.to_vec();
         if let Some(base) = cache_base {
             flags.extend(["--cache-dir".into(), base.to_string_lossy().into_owned()]);
@@ -3191,17 +3260,10 @@ fn assert_extension_metadata_fields(run: &Run, tail: &str, extension_visible: bo
 #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn extension_metadata_cli_covers_document_fields_common_module_and_external() {
     let root = extension_metadata_fixture();
-    let run = analyze(
-        &root,
-        &[
-            "--configuration-root",
-            "base",
-            "--extension",
-            "Расширение=extension",
-            "--external",
-            "АРМ=external",
-        ],
-    );
+    let config = scoped_fixture_config(&root, "base", &[("Расширение", "extension", &[])]);
+    let config_path = config.path().join("bsl-analyzer.toml");
+    let run =
+        analyze(&root, &["--config", config_path.to_str().unwrap(), "--external", "АРМ=external"]);
 
     assert_extension_metadata_fields(&run, "base/Documents/Заказ/Ext/ObjectModule.bsl", false);
     assert_extension_metadata_fields(&run, "extension/Documents/Заказ/Ext/ObjectModule.bsl", true);
@@ -3348,13 +3410,13 @@ fn extension_metadata_cli_no_extensions_keeps_base_and_rejects_extension_fields(
 #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn extension_metadata_cli_external_depends_on_empty_excludes_only_extension_metadata() {
     let root = extension_metadata_fixture();
+    let config = scoped_fixture_config(&root, "base", &[("Расширение", "extension", &[])]);
+    let config_path = config.path().join("bsl-analyzer.toml");
     let run = analyze(
         &root,
         &[
-            "--configuration-root",
-            "base",
-            "--extension",
-            "Расширение=extension",
+            "--config",
+            config_path.to_str().unwrap(),
             "--external",
             "АРМ=external",
             "--external-depends-on",
@@ -3370,23 +3432,18 @@ fn extension_metadata_cli_external_depends_on_empty_excludes_only_extension_meta
 #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn extension_metadata_cli_external_dependency_excludes_other_selected_extension() {
     let root = extension_metadata_fixture();
-    let run = analyze(
+    let config = scoped_fixture_config(
         &root,
-        &[
-            "--configuration-root",
-            "base",
-            "--extension",
-            "Расширение=extension",
-            "--extension",
-            "Зависимое=dependent",
-            "--extension-depends-on",
-            "Зависимое=Расширение",
-            "--external",
-            "АРМ=external",
-            "--external-depends-on",
-            "АРМ=Расширение",
-        ],
+        "base",
+        &[("Расширение", "extension", &[]), ("Зависимое", "dependent", &["Расширение"])],
     );
+    let config_path = config.path().join("bsl-analyzer.toml");
+    let source_config = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(&config_path, format!(
+        "{source_config}externals = [{{ name = \"АРМ\", path = {:?}, dependsOn = [\"Расширение\"] }}]\n",
+        root.join("external").to_string_lossy()
+    )).unwrap();
+    let run = analyze(&root, &["--config", config_path.to_str().unwrap()]);
 
     assert_extension_metadata_fields(&run, "external/АРМ/Ext/ObjectModule.bsl", true);
     for code in ["UnresolvedField", "UnknownFieldInQuery"] {
@@ -3426,7 +3483,7 @@ fn shared_configuration_dependency_resolves_from_project_dotenv() {
     std::fs::write(
         project.join("bsl-analyzer.toml"),
         r#"[source]
-extensions = ["Расширения/EXT"]
+extensions = [{ name = "EXT", path = "Расширения/EXT", scope = "InfoBase" }]
 
 [source.configuration]
 id = "UT11"
@@ -3452,18 +3509,18 @@ version = "11.5.22.129"
 fn binding_the_main_configuration_resolves_calls_into_it() {
     let dir = workspace();
     workspace_calling_main_configuration(dir.path());
+    write_scoped_extensions(dir.path(), &[("EXT", EXT, &[])]);
 
     // Positive control. Without a main configuration the call cannot resolve,
     // and this assertion is what makes the paired one below mean anything.
-    let standalone = analyze(dir.path(), &["--extension", &format!("EXT={EXT}")]);
+    let standalone = analyze(dir.path(), &[]);
     assert_eq!(
         standalone.unresolved_modules(EXT_MODULE),
         vec![MAIN_MODULE.to_string(), MISSING_MODULE.to_string()],
         "alone, neither the main configuration's module nor the missing one resolves"
     );
 
-    let bound =
-        analyze(dir.path(), &["--configuration-root", MAIN, "--extension", &format!("EXT={EXT}")]);
+    let bound = analyze(dir.path(), &["--configuration-root", MAIN]);
     assert_eq!(
         bound.unresolved_modules(EXT_MODULE),
         vec![MISSING_MODULE.to_string()],
@@ -3490,28 +3547,18 @@ fn a_declared_dependency_resolves_calls_between_extensions() {
         ),
     )
     .unwrap();
-
-    let declared: Vec<String> = vec![
-        "--configuration-root".into(),
-        MAIN.into(),
-        "--extension".into(),
-        format!("DEP={DEP}"),
-        "--extension".into(),
-        format!("EXT={EXT}"),
-    ];
-    let refs: Vec<&str> = declared.iter().map(String::as_str).collect();
+    write_scoped_extensions(dir.path(), &[("EXT", EXT, &[]), ("DEP", DEP, &[])]);
 
     // Independent extensions do not see each other, so this is the control.
-    let unrelated = analyze(dir.path(), &refs);
+    let unrelated = analyze(dir.path(), &["--configuration-root", MAIN]);
     assert_eq!(
         unrelated.unresolved_modules(EXT_MODULE),
         vec![MISSING_MODULE.to_string(), DEP_MODULE.to_string()],
         "without a declared edge the other extension's module must stay invisible"
     );
 
-    let mut with_edge = refs.clone();
-    with_edge.extend(["--extension-depends-on", "EXT=DEP"]);
-    let dependent = analyze(dir.path(), &with_edge);
+    write_scoped_extensions(dir.path(), &[("EXT", EXT, &["DEP"]), ("DEP", DEP, &[])]);
+    let dependent = analyze(dir.path(), &["--configuration-root", MAIN]);
     assert_eq!(
         dependent.unresolved_modules(EXT_MODULE),
         vec![MISSING_MODULE.to_string()],
@@ -3525,7 +3572,7 @@ fn no_extensions_drops_the_configured_list() {
     workspace_calling_main_configuration(dir.path());
     std::fs::write(
         dir.path().join("bsl-analyzer.toml"),
-        format!("[source]\nroot = \"{MAIN}\"\nextensions = [\"{EXT}\"]\n"),
+        format!("[source]\nroot = \"{MAIN}\"\nextensions = [{{ name = \"EXT\", path = \"{EXT}\", scope = \"InfoBase\" }}]\n"),
     )
     .unwrap();
 
@@ -3544,6 +3591,64 @@ fn no_extensions_drops_the_configured_list() {
     // that cleared every source root would satisfy the assertion above by
     // analyzing nothing at all.
     opted_out.analyzed(MAIN_MODULE);
+}
+
+#[test]
+fn cli_extension_override_cannot_inherit_scope_from_the_replaced_config() {
+    let dir = workspace();
+    workspace_calling_main_configuration(dir.path());
+    write_scoped_extensions(dir.path(), &[("EXT", EXT, &[])]);
+
+    let error =
+        analyze_refuses(dir.path(), &["--configuration-root", MAIN, "--extension", "EXT=a/b/ext"]);
+    assert!(error.contains("Scope is required"), "expected missing scope: {error}");
+    assert!(
+        error.contains("structured [source].extensions TOML"),
+        "error gives the migration path: {error}"
+    );
+    assert!(error.contains("EXT"), "the error names the extension root: {error}");
+}
+
+#[test]
+fn check_config_requires_explicit_scope_and_reports_the_resolved_owner() {
+    let dir = workspace();
+    workspace_calling_main_configuration(dir.path());
+    let config_path = dir.path().join("bsl-analyzer.toml");
+    let check = |flags: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
+            .current_dir(dir.path())
+            .args(["check-config", "--config", "bsl-analyzer.toml"])
+            .args(flags)
+            .output()
+            .unwrap()
+    };
+    for scope in ["InfoBase", "DataSeparation"] {
+        std::fs::write(&config_path, format!(
+            "[source]\nroot = \"{MAIN}\"\nextensions = [{{ name = \"EXT\", path = \"{EXT}\", scope = \"{scope}\" }}]\n"
+        )).unwrap();
+        let valid = check(&[]);
+        assert!(valid.status.success(), "{}", String::from_utf8_lossy(&valid.stderr));
+        let report = String::from_utf8_lossy(&valid.stdout);
+        let topology = report.split("Extension topology:").nth(1).unwrap();
+        assert!(topology.contains(&format!("scope: {scope}")), "{report}");
+        assert!(topology.contains("EXT"), "{report}");
+        let replaced = check(&["--extension", EXT]);
+        assert!(!replaced.status.success(), "an override must not reuse TOML Scope");
+        assert!(String::from_utf8_lossy(&replaced.stderr).contains("has no scope"));
+    }
+    for scope in [
+        "",
+        ", scope = \"Invalid\"",
+        ", scope = 1",
+        ", scope = \"InfoBase\", scope = \"DataSeparation\"",
+    ] {
+        std::fs::write(&config_path, format!(
+            "[source]\nroot = \"{MAIN}\"\nextensions = [{{ name = \"EXT\", path = \"{EXT}\"{scope} }}]\n"
+        )).unwrap();
+        let invalid = check(&[]);
+        assert!(!invalid.status.success(), "invalid Scope must fail before analysis: {scope}");
+        assert!(String::from_utf8_lossy(&invalid.stderr).contains("failed to parse configuration"));
+    }
 }
 
 /// How many times the notice appears — the invariant is exactly one message per
@@ -3576,6 +3681,7 @@ fn an_extension_taken_as_the_main_root_is_reported() {
         "Функция ИзЗависимости() Экспорт\n\tВозврат 2;\nКонецФункции\n",
         true,
     );
+    write_scoped_extensions(dir.path(), &[("DEP", DEP, &[])]);
 
     // The case that needs no flag at all, and the one an integrator actually
     // hits: point `-s` straight at an extension. The notice is tied to the
@@ -3592,26 +3698,19 @@ fn an_extension_taken_as_the_main_root_is_reported() {
         "a main configuration given directly must stay silent"
     );
 
-    // Only `--configuration-root` moves between the runs of each pair. Varying
-    // the extension flags at the same time would let an implementation keyed on
-    // `--no-extensions`, or on the list being empty, pass without ever asking
-    // what the resolved root actually is.
-    for extensions in [vec!["--no-extensions"], vec!["--extension", "DEP=a/b/dep"]] {
-        let with_root = |root: &str| {
-            let mut flags = vec!["--configuration-root", root];
-            flags.extend(extensions.iter().copied());
-            notices(&analyze(dir.path(), &flags))
-        };
-
+    // `--no-extensions` is the only CLI source-set switch that does not need a
+    // per-extension scope declaration. The configured DEP entry carries one.
+    for flags in [
+        vec!["--configuration-root", EXT],
+        vec!["--configuration-root", EXT, "--no-extensions"],
+        vec!["--configuration-root", MAIN],
+        vec!["--configuration-root", MAIN, "--no-extensions"],
+    ] {
+        let expected = usize::from(flags[1] == EXT);
         assert_eq!(
-            with_root(EXT),
-            1,
-            "an extension used as the main root must be called out once (extensions: {extensions:?})"
-        );
-        assert_eq!(
-            with_root(MAIN),
-            0,
-            "a real main configuration must stay silent (extensions: {extensions:?})"
+            notices(&analyze(dir.path(), &flags)),
+            expected,
+            "configuration extension notice for flags {flags:?}"
         );
     }
 }
@@ -4001,6 +4100,7 @@ fn mcp_graph_overview(workspace: &Path, flags: &[&str]) -> Value {
 fn the_source_set_reaches_the_graph() {
     let dir = workspace();
     workspace_calling_main_configuration(dir.path());
+    write_scoped_extensions(dir.path(), &[("EXT", EXT, &[])]);
 
     // Both runs bind the main configuration, so the only thing moving is whether
     // the extension is part of the set — which is exactly what the graph passes
@@ -4010,10 +4110,7 @@ fn the_source_set_reaches_the_graph() {
     assert_eq!(base_only["nodes"], 1, "only the main configuration's method: {base_only}");
     assert_eq!(base_only["edges"], 0, "nothing calls it: {base_only}");
 
-    let with_extension = mcp_graph_overview(
-        dir.path(),
-        &["--configuration-root", MAIN, "--extension", "EXT=a/b/ext"],
-    );
+    let with_extension = mcp_graph_overview(dir.path(), &["--configuration-root", MAIN]);
     assert_eq!(with_extension["nodes"], 2, "both methods: {with_extension}");
     assert_eq!(
         with_extension["edge_provenance"]["resolved"], 1,
@@ -4044,6 +4141,7 @@ fn nested_configurations_under_a_bare_workspace_still_build_a_graph() {
 fn the_mcp_status_reports_a_standalone_extension() {
     let dir = workspace();
     workspace_calling_main_configuration(dir.path());
+    write_scoped_extensions(dir.path(), &[("EXT", EXT, &[])]);
     let module =
         path(dir.path(), EXT).join("CommonModules").join(EXT_MODULE).join("Ext").join("Module.bsl");
 
@@ -4058,11 +4156,7 @@ fn the_mcp_status_reports_a_standalone_extension() {
         "status must carry the notice: {standalone}"
     );
 
-    let (_, bound) = mcp_probe(
-        dir.path(),
-        &module,
-        &["--configuration-root", MAIN, "--extension", "EXT=a/b/ext"],
-    );
+    let (_, bound) = mcp_probe(dir.path(), &module, &["--configuration-root", MAIN]);
     assert!(
         bound.get("standalone_extension").is_none(),
         "a bound main configuration must leave the field out: {bound}"
@@ -4073,6 +4167,7 @@ fn the_mcp_status_reports_a_standalone_extension() {
 fn the_source_set_reaches_the_mcp_server() {
     let dir = workspace();
     workspace_calling_main_configuration(dir.path());
+    write_scoped_extensions(dir.path(), &[("EXT", EXT, &[])]);
     let module =
         path(dir.path(), EXT).join("CommonModules").join(EXT_MODULE).join("Ext").join("Module.bsl");
 
@@ -4082,12 +4177,7 @@ fn the_source_set_reaches_the_mcp_server() {
         "without a source set the main configuration's module cannot resolve"
     );
     assert_eq!(
-        mcp_probe(
-            dir.path(),
-            &module,
-            &["--configuration-root", MAIN, "--extension", "EXT=a/b/ext"]
-        )
-        .0,
+        mcp_probe(dir.path(), &module, &["--configuration-root", MAIN]).0,
         vec![MISSING_MODULE.to_string()],
         "the source set must resolve the main configuration's module here too"
     );
@@ -4288,12 +4378,12 @@ fn adopted_document_base_attribute_drift_reaches_resident_diagnostics_and_query_
     std::fs::write(
         dir.path().join("bsl-analyzer.toml"),
         format!(
-            "[source]\nroot = \"{MAIN}\"\nextensions = [{{ name = \"EXT\", path = \"{EXT}\" }}]\n"
+            "[source]\nroot = \"{MAIN}\"\nextensions = [{{ name = \"EXT\", path = \"{EXT}\", scope = \"InfoBase\" }}]\n"
         ),
     )
     .unwrap();
 
-    let flags = ["--configuration-root", MAIN, "--extension", "EXT=a/b/ext"];
+    let flags = ["--configuration-root", MAIN];
     let mut session = McpSession::start(dir.path(), &flags);
     session.wait_ready("diagnostics");
 
@@ -4633,6 +4723,7 @@ fn binding_the_main_configuration_resolves_calls_from_an_external_object() {
             "&НаСервере\nПроцедура ПриСозданииНаСервере(Отказ, СтандартнаяОбработка)\n\t{MAIN_MODULE}.Экспортируемая();\n\t{MISSING_CALL}\nКонецПроцедуры\n"
         ),
     );
+    write_scoped_extensions(dir.path(), &[("EXT", EXT, &[])]);
     let external = format!("{EPF_NAME}={EPF}");
 
     // Positive control: alone, the owning configuration's module is unresolved
@@ -4685,10 +4776,8 @@ fn an_external_object_sees_every_extension_while_the_base_sees_none() {
     let external = format!("{EPF_NAME}={EPF}");
     // No dependency is declared anywhere: the external object sees the
     // extension by construction, not by an edge.
-    let run = analyze(
-        dir.path(),
-        &["--configuration-root", MAIN, "--extension", "EXT=a/b/ext", "--external", &external],
-    );
+    write_scoped_extensions(dir.path(), &[("EXT", EXT, &[])]);
+    let run = analyze(dir.path(), &["--configuration-root", MAIN, "--external", &external]);
 
     assert_eq!(
         run.unresolved_modules(MAIN_MODULE),
@@ -4727,35 +4816,19 @@ fn an_external_depends_on_narrows_what_it_sees_to_the_named_extensions() {
             "&НаСервере\nПроцедура ПриСозданииНаСервере(Отказ, СтандартнаяОбработка)\n\t{MAIN_MODULE}.Экспортируемая();\n\t{EXT_MODULE}.ИзРасширения();\n\t{DEP_MODULE}.ИзЗависимости();\n\t{MISSING_CALL}\nКонецПроцедуры\n"
         ),
     );
+    write_scoped_extensions(dir.path(), &[("EXT", EXT, &[]), ("DEP", DEP, &[])]);
     let external = format!("{EPF_NAME}={EPF}");
-    let flags = |extra: &[&str]| -> Vec<String> {
-        [
-            "--configuration-root",
-            MAIN,
-            "--extension",
-            "EXT=a/b/ext",
-            "--extension",
-            "DEP=a/b/dep",
-            "--external",
-            &external,
-        ]
-        .into_iter()
-        .chain(extra.iter().copied())
-        .map(str::to_owned)
-        .collect()
-    };
-    fn as_str(flags: &[String]) -> Vec<&str> {
-        flags.iter().map(String::as_str).collect()
-    }
-
-    let every = analyze(dir.path(), &as_str(&flags(&[])));
+    let every = analyze(dir.path(), &["--configuration-root", MAIN, "--external", &external]);
     assert_eq!(
         every.unresolved_modules_at(EPF_FORM_MODULE),
         vec![MISSING_MODULE.to_string()],
         "control: without dependsOn both extensions are visible"
     );
 
-    let narrowed = analyze(dir.path(), &as_str(&flags(&["--external-depends-on", "АРМ=EXT"])));
+    std::fs::write(dir.path().join("bsl-analyzer.toml"), format!(
+        "[source]\nroot = \"{MAIN}\"\nextensions = [{{ name = \"EXT\", path = \"{EXT}\", scope = \"InfoBase\" }}, {{ name = \"DEP\", path = \"{DEP}\", scope = \"InfoBase\" }}]\nexternals = [{{ name = \"{EPF_NAME}\", path = \"{EPF}\", dependsOn = [\"EXT\"] }}]\n"
+    )).unwrap();
+    let narrowed = analyze(dir.path(), &[]);
     assert_eq!(
         narrowed.unresolved_modules_at(EPF_FORM_MODULE),
         vec![MISSING_MODULE.to_string(), DEP_MODULE.to_string()],
@@ -4766,7 +4839,7 @@ fn an_external_depends_on_narrows_what_it_sees_to_the_named_extensions() {
     std::fs::write(
         dir.path().join("bsl-analyzer.toml"),
         format!(
-            "[source]\nroot = \"{MAIN}\"\nextensions = [\n  {{ name = \"EXT\", path = \"{EXT}\" }},\n  {{ name = \"DEP\", path = \"{DEP}\" }},\n]\nexternals = [{{ name = \"{EPF_NAME}\", path = \"{EPF}\", dependsOn = [] }}]\n"
+            "[source]\nroot = \"{MAIN}\"\nextensions = [\n  {{ name = \"EXT\", path = \"{EXT}\", scope = \"InfoBase\" }},\n  {{ name = \"DEP\", path = \"{DEP}\", scope = \"InfoBase\" }},\n]\nexternals = [{{ name = \"{EPF_NAME}\", path = \"{EPF}\", dependsOn = [] }}]\n"
         ),
     )
     .unwrap();
@@ -4810,11 +4883,15 @@ fn a_root_declared_under_the_wrong_key_is_refused_by_name() {
     let dir = workspace();
     workspace_calling_main_configuration(dir.path());
     write_external(dir.path(), EPF, EPF_NAME, "Процедура П()\nКонецПроцедуры\n");
+    std::fs::write(
+        dir.path().join("bsl-analyzer.toml"),
+        format!(
+            "[source]\nroot = \"{MAIN}\"\nextensions = [{{ name = \"{EPF_NAME}\", path = \"{EPF}\", scope = \"InfoBase\" }}]\n"
+        ),
+    )
+    .unwrap();
 
-    let as_extension = analyze_refuses(
-        dir.path(),
-        &["--configuration-root", MAIN, "--extension", &format!("{EPF_NAME}={EPF}")],
-    );
+    let as_extension = analyze_refuses(dir.path(), &["--configuration-root", MAIN]);
     // The CLI renders a project error in its Debug form, so the variant name is
     // what reaches the operator; matching on it keeps the check honest either way.
     assert!(
@@ -4822,6 +4899,7 @@ fn a_root_declared_under_the_wrong_key_is_refused_by_name() {
         "an export named as an extension: {as_extension}"
     );
 
+    write_scoped_extensions(dir.path(), &[]);
     let as_external = analyze_refuses(
         dir.path(),
         &["--configuration-root", MAIN, "--external", &format!("EXT={EXT}")],

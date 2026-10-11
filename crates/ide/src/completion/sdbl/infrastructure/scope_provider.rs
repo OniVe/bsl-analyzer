@@ -15,12 +15,13 @@ impl<'a> DbScopeProvider<'a> {
 }
 
 impl ScopeProvider for DbScopeProvider<'_> {
-    fn get_scope(
+    fn get_scope<'a>(
         &self,
         file_id: FileId,
         bsl_literal_range: syntax::TextRange,
         sdbl_offset: TextSize,
-    ) -> Option<Scope<'static>> {
+        resolver: &'a dyn bsl_metadata::QueryMetadataResolver,
+    ) -> Option<Scope<'a>> {
         let _span = tracing::info_span!(
             "DbScopeProvider::get_scope",
             ?file_id,
@@ -109,8 +110,7 @@ impl ScopeProvider for DbScopeProvider<'_> {
             "found target query for completion"
         );
 
-        let metadata = self.db.get_configuration(file_id);
-        let mut scope = Scope::new_with_metadata(metadata);
+        let mut scope = Scope::new_with_resolver(resolver);
 
         let all_queries = sdbl_package.queries();
         tracing::info!(

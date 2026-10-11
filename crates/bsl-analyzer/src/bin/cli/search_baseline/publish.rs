@@ -460,6 +460,10 @@ mod tests {
             std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o755)).unwrap();
             return None;
         }
+        write(
+            &root.join("bsl-analyzer.toml"),
+            "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"Расширение\", path = \"src/cfe/Расширение\", scope = \"InfoBase\" }]\n",
+        );
         Some(root)
     }
 
@@ -601,7 +605,10 @@ mod tests {
         }
         write(
             &root.join("bsl-analyzer.toml"),
-            "[search.baseline.postgres]\n\
+            "[source]\n\
+             root = \"src/cf\"\n\
+             extensions = [{ name = \"Расширение\", path = \"src/cfe/Расширение\", scope = \"InfoBase\" }]\n\
+             [search.baseline.postgres]\n\
              host = \"127.0.0.1\"\n\
              port = 1\n\
              dbname = \"unreachable\"\n\

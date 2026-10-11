@@ -54,7 +54,7 @@ pub(super) fn setup_with_designer_config(
         db.set_file_source_root(*file_id, SourceRootId(0));
         db.set_file_text(*file_id, &file.content);
     }
-    db.set_all_config_paths(vec![(None, designer)]);
+    db.set_all_config_paths(vec![(None, designer)], None);
     let target_file = mapped
         .iter()
         .find(|(_, path)| path.as_path().to_string_lossy().ends_with(target_path))

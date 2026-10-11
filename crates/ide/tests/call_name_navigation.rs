@@ -44,7 +44,7 @@ fn setup(caller_text: &str) -> Analysis {
         db.set_file_source_root(id, SourceRootId(0));
         db.set_file_text(id, text);
     }
-    db.set_all_config_paths(vec![(None, designer_path())]);
+    db.set_all_config_paths(vec![(None, designer_path())], None);
     Analysis::from_database(db)
 }
 

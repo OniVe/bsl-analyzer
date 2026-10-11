@@ -11,8 +11,8 @@ use crate::types::SdblType;
 ///
 /// `Config` owns an `Arc<Configuration>` so a scope built for completion can be
 /// returned by value (no borrow escapes). `Resolver` borrows a db-backed
-/// per-MDO resolver used transiently during query lowering — that scope is never
-/// returned, so the borrow stays local.
+/// per-MDO resolver used during query lowering or completion; the caller keeps
+/// the resolver alive while using the scope.
 #[derive(Debug)]
 enum MetaSource<'a> {
     Config(Arc<bsl_metadata::Configuration>),
@@ -501,6 +501,15 @@ impl<'a> Scope<'a> {
                 attr.name_en.clone(),
                 SdblType::from_attribute_type(&attr.attr_type),
                 is_standard,
+            ));
+        }
+
+        for common in &mdo_object.common_attributes {
+            fields.push(FieldDef::new_with_names(
+                common.name.clone(),
+                None,
+                SdblType::from_attribute_type(&common.attr_type),
+                false,
             ));
         }
 

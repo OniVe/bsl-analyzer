@@ -2,11 +2,9 @@
 //! the extensions analyzed alongside it and the external objects analyzed
 //! against it.
 //!
-//! These mirror the `[source]` section of the config file one-to-one, so that a
-//! caller who cannot drop a config file into someone else's tree can still say
-//! "this directory is an extension of that configuration". Mapping is
-//! deliberately identical to the two shapes the config already accepts, so no
-//! new project semantics enter through the command line.
+//! These mirror the `[source]` section of the config file where the CLI can
+//! express the same information. A named extension also needs an installation
+//! scope, which has no CLI flag; use structured TOML or the library API for it.
 //!
 //! Where the CLI *is* stricter than the file: anything typed explicitly must
 //! either work or fail loudly. A mistyped path in a config file may be a stale
@@ -20,7 +18,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use clap::Args;
-use project_model::{ExtensionDecl, ExternalDecl, SourceSetOverride, StructuredExtensionDecl};
+use project_model::{ExtensionDecl, ExternalDecl, SourceSetOverride};
 use stdx::case::fold_lower_per_char;
 
 /// Source-set flags shared by every command that builds a project from argv.
@@ -32,9 +30,10 @@ pub struct SourceSetArgs {
     pub configuration_root: Option<String>,
 
     /// Extension to analyze alongside the main configuration. Repeat per
-    /// extension. `NAME=PATH` declares a named extension that dependencies may
-    /// refer to; a bare `PATH` behaves like a plain string entry in the config
-    /// and may use a `*` glob in its final segment.
+    /// extension. A bare `PATH` behaves like a plain string entry in the config
+    /// and may use a `*` glob in its final segment. `NAME=PATH` is parsed for
+    /// useful validation but rejected because the CLI cannot supply required
+    /// Scope; use structured TOML or the library API.
     #[arg(long = "extension", value_name = "NAME=PATH|PATH")]
     pub extensions: Vec<String>,
 
@@ -74,6 +73,8 @@ pub enum SourceSetArgsError {
     ConfigurationRootNotFound { value: String, expected: PathBuf },
     EmptyExtensionName { value: String },
     EmptyExtensionPath { value: String },
+    DuplicateExtensionName { first: String, second: String },
+    MissingExtensionScope { name: String },
     DuplicateExtensionPath { first: String, second: String, path: PathBuf },
     MalformedDependsOn { value: String },
     UnknownDependsOnOwner { name: String },
@@ -101,15 +102,22 @@ impl fmt::Display for SourceSetArgsError {
             Self::EmptyExtensionPath { value } => {
                 write!(f, "--extension {value}: the path is empty")
             }
+            Self::DuplicateExtensionName { first, second } => write!(
+                f,
+                "--extension {first} and --extension {second} use the same extension name (names are case-insensitive)"
+            ),
+            Self::MissingExtensionScope { name } => write!(
+                f,
+                "--extension {name}=PATH: extension Scope is required; declare it in structured [source].extensions TOML or the project-model API as InfoBase or DataSeparation"
+            ),
             Self::DuplicateExtensionPath { first, second, path } => write!(
                 f,
                 "--extension {first} and --extension {second} name the same directory {}",
                 path.display()
             ),
-            Self::MalformedDependsOn { value } => write!(
-                f,
-                "--extension-depends-on {value}: expected NAME=DEP[,DEP...]"
-            ),
+            Self::MalformedDependsOn { value } => {
+                write!(f, "--extension-depends-on {value}: expected NAME=DEP[,DEP...]")
+            }
             Self::UnknownDependsOnOwner { name } => write!(
                 f,
                 "--extension-depends-on {name}=...: {name} is not declared by any --extension NAME=PATH"
@@ -228,8 +236,8 @@ impl SourceSetArgs {
     /// against — the same base the config file's own paths use.
     pub fn resolve(&self, root: &Path) -> Result<SourceSetOverride, SourceSetArgsError> {
         let configuration_root = self.resolve_configuration_root(root)?;
-        let extensions = self.resolve_extensions(root)?;
         let externals = self.resolve_externals(root)?;
+        let extensions = self.resolve_extensions(root)?;
         Ok(SourceSetOverride { configuration_root, extensions, externals })
     }
 
@@ -398,15 +406,24 @@ impl SourceSetArgs {
         }
 
         let mut decls: Vec<ExtensionDecl> = Vec::with_capacity(self.extensions.len());
-        // Folded name → index, matching how the topology compares names.
-        let mut named: HashMap<String, usize> = HashMap::new();
+        // Folded name → original spelling, matching how the topology compares names.
+        let mut named: HashMap<String, String> = HashMap::new();
+        let mut named_in_order = Vec::new();
         // Canonical path → the spelling that claimed it, for the duplicate check.
         let mut claimed: HashMap<PathBuf, String> = HashMap::new();
 
         for value in &self.extensions {
             let (name, path) = split_extension_value(value, root)?;
             if let Some(ref name) = name {
-                named.insert(fold_lower_per_char(name), decls.len());
+                let key = fold_lower_per_char(name);
+                if let Some(first) = named.get(&key) {
+                    return Err(SourceSetArgsError::DuplicateExtensionName {
+                        first: first.clone(),
+                        second: name.clone(),
+                    });
+                }
+                named.insert(key, name.clone());
+                named_in_order.push(name.clone());
             }
 
             // Globs describe a set, so overlapping one with an explicit entry is
@@ -425,41 +442,33 @@ impl SourceSetArgs {
                 claimed.insert(canonical, value.clone());
             }
 
-            decls.push(match name {
-                Some(name) => ExtensionDecl::Structured(StructuredExtensionDecl {
-                    name,
-                    path,
-                    depends_on: Vec::new(),
-                }),
-                None => ExtensionDecl::Path(path),
-            });
+            if name.is_none() {
+                decls.push(ExtensionDecl::Path(path));
+            }
         }
 
-        for (owner, targets) in self.parse_dependencies()? {
-            let Some(&index) = named.get(&fold_lower_per_char(&owner)) else {
-                return Err(SourceSetArgsError::UnknownDependsOnOwner { name: owner });
-            };
+        let dependencies = self.parse_dependencies()?;
+        for (owner, targets) in &dependencies {
+            if !named.contains_key(&fold_lower_per_char(owner)) {
+                return Err(SourceSetArgsError::UnknownDependsOnOwner { name: owner.clone() });
+            }
             // Targets are checked too, not just the owner. The topology would
             // happily resolve a target against the name a bare entry derives
             // from its directory, which is exactly the binding this flag must
             // not create: that name is incidental and collides with any other
             // directory spelled the same.
-            for target in &targets {
+            for target in targets {
                 if !named.contains_key(&fold_lower_per_char(target)) {
                     return Err(SourceSetArgsError::UnknownDependsOnTarget {
-                        owner,
+                        owner: owner.clone(),
                         name: target.clone(),
                     });
                 }
             }
-            match &mut decls[index] {
-                ExtensionDecl::Structured(decl) => decl.depends_on.extend(targets),
-                // Unreachable: `named` only ever holds indices of structured
-                // entries, and nothing removes or reorders `decls`.
-                ExtensionDecl::Path(_) => {
-                    return Err(SourceSetArgsError::UnknownDependsOnOwner { name: owner })
-                }
-            }
+        }
+
+        if let Some(name) = named_in_order.first() {
+            return Err(SourceSetArgsError::MissingExtensionScope { name: name.clone() });
         }
 
         Ok(Some(decls))
@@ -716,18 +725,42 @@ mod tests {
             resolve(&flags)
         };
 
-        let deps = |resolved: SourceSetOverride| resolved.externals.unwrap().remove(0).depends_on;
-        assert_eq!(deps(with(&[]).unwrap()), None, "no flag: every extension");
+        let valid = with(&[]);
+        assert!(matches!(
+            valid.unwrap_err(),
+            SourceSetArgsError::MissingExtensionScope { name } if name == "A"
+        ));
+        let repeated = args(&[
+            "--extension",
+            "A=a",
+            "--extension",
+            "B=b",
+            "--external",
+            "E=e",
+            "--external-depends-on",
+            "e=A",
+            "--external-depends-on",
+            "E=b",
+        ]);
         assert_eq!(
-            deps(with(&["--external-depends-on", "e=A", "--external-depends-on", "E=b"]).unwrap()),
-            Some(vec!["A".to_owned(), "b".to_owned()]),
-            "repeats accumulate, the owner matches case-insensitively"
+            repeated.parse_external_dependencies().unwrap(),
+            vec![("e".to_owned(), vec!["A".to_owned(), "b".to_owned()])],
+            "repeats accumulate and the owner matches case-insensitively"
         );
+        assert!(matches!(
+            repeated.resolve(dir.path()).unwrap_err(),
+            SourceSetArgsError::MissingExtensionScope { .. }
+        ));
+        let base_only =
+            args(&["--extension", "A=a", "--external", "E=e", "--external-depends-on", "E="]);
         assert_eq!(
-            deps(with(&["--external-depends-on", "E="]).unwrap()),
-            Some(vec![]),
-            "the base alone"
+            base_only.parse_external_dependencies().unwrap(),
+            vec![("E".to_owned(), vec![])]
         );
+        assert!(matches!(
+            base_only.resolve(dir.path()).unwrap_err(),
+            SourceSetArgsError::MissingExtensionScope { .. }
+        ));
 
         let err = with(&["--external-depends-on", "E=C"]).unwrap_err();
         assert!(matches!(err, SourceSetArgsError::UnknownExternalDependsOnTarget { .. }), "{err}");
@@ -809,32 +842,40 @@ mod tests {
             .collect()
     }
 
-    fn depends_on(decls: &[ExtensionDecl], name: &str) -> Vec<String> {
-        decls
-            .iter()
-            .find_map(|decl| match decl {
-                ExtensionDecl::Structured(entry) if entry.name == name => {
-                    Some(entry.depends_on.clone())
-                }
-                _ => None,
-            })
-            .unwrap_or_default()
-    }
-
     #[test]
-    fn named_and_bare_forms_map_to_the_two_config_shapes() {
+    fn cli_named_extensions_require_scope_while_bare_paths_remain_candidates() {
         let dir = tempdir().unwrap();
         extension_dir(dir.path(), "ext");
         extension_dir(dir.path(), "vendor/flag");
 
-        let resolved = args(&["--extension", "Flag=vendor/flag", "--extension", "ext"])
-            .resolve(dir.path())
-            .unwrap();
+        assert_eq!(
+            super::split_extension_value("Flag=vendor/flag", dir.path()).unwrap(),
+            (Some("Flag".to_owned()), "vendor/flag".to_owned())
+        );
+        assert_eq!(
+            super::split_extension_value("ext", dir.path()).unwrap(),
+            (None, "ext".to_owned())
+        );
+        let bare = args(&["--extension", "ext"]).resolve(dir.path()).unwrap();
+        assert_eq!(names(&bare.extensions.unwrap()), vec!["ext"]);
+        let named = args(&["--extension", "Flag=vendor/flag"]).resolve(dir.path()).unwrap_err();
+        assert!(matches!(
+            &named,
+            SourceSetArgsError::MissingExtensionScope { name } if name == "Flag"
+        ));
+        let message = named.to_string();
+        assert!(message.contains("scope") || message.contains("Scope"), "{message}");
+        assert!(message.contains("InfoBase") && message.contains("DataSeparation"), "{message}");
 
-        let decls = resolved.extensions.unwrap();
-        assert!(matches!(decls[0], ExtensionDecl::Structured(_)), "NAME=PATH is the strict shape");
-        assert!(matches!(decls[1], ExtensionDecl::Path(_)), "a bare path is the lenient shape");
-        assert_eq!(names(&decls), vec!["Flag", "ext"]);
+        let malformed_external =
+            args(&["--extension", "Flag=vendor/flag", "--external", "not-a-name-path"])
+                .resolve(dir.path())
+                .unwrap_err();
+        assert!(matches!(malformed_external, SourceSetArgsError::MalformedExternal { .. }));
+        let duplicate_name = args(&["--extension", "Flag=vendor/flag", "--extension", "fLaG=ext"])
+            .resolve(dir.path())
+            .unwrap_err();
+        assert!(matches!(duplicate_name, SourceSetArgsError::DuplicateExtensionName { .. }));
     }
 
     #[test]
@@ -886,20 +927,22 @@ mod tests {
 
         // The topology compares folded names on both sides, so the CLI barrier
         // must not reject spellings the same model accepts from a config file.
-        let resolved = args(&[
+        let cli = args(&[
             "--extension",
             "Base=b",
             "--extension",
             "Target=t",
             "--extension-depends-on",
             "TARGET=BASE",
-        ])
-        .resolve(dir.path())
-        .unwrap();
-
-        // Spelled differently from both the declaration and its folded form, so
-        // a lookup that merely compares against the folded key still misses.
-        assert_eq!(depends_on(&resolved.extensions.unwrap(), "Target"), vec!["BASE"]);
+        ]);
+        assert_eq!(
+            cli.parse_dependencies().unwrap(),
+            vec![("TARGET".to_owned(), vec!["BASE".to_owned()])]
+        );
+        assert!(matches!(
+            cli.resolve(dir.path()).unwrap_err(),
+            SourceSetArgsError::MissingExtensionScope { name } if name == "Base"
+        ));
     }
 
     #[test]
@@ -910,22 +953,23 @@ mod tests {
         }
         let decl = ["--extension", "A=a", "--extension", "B=b", "--extension", "T=t"];
 
-        let inline = args(&[&decl[..], &["--extension-depends-on", "T=A,B"]].concat())
-            .resolve(dir.path())
-            .unwrap();
+        let inline = args(&[&decl[..], &["--extension-depends-on", "T=A,B"]].concat());
         let repeated = args(
             &[&decl[..], &["--extension-depends-on", "T=A", "--extension-depends-on", "T=B"]]
                 .concat(),
-        )
-        .resolve(dir.path())
-        .unwrap();
+        );
 
-        assert_eq!(depends_on(&inline.extensions.unwrap(), "T"), vec!["A", "B"]);
+        let expected = vec![("T".to_owned(), vec!["A".to_owned(), "B".to_owned()])];
+        assert_eq!(inline.parse_dependencies().unwrap(), expected);
         assert_eq!(
-            depends_on(&repeated.extensions.unwrap(), "T"),
-            vec!["A", "B"],
+            repeated.parse_dependencies().unwrap(),
+            expected,
             "repeats must accumulate rather than the last flag winning"
         );
+        assert!(matches!(
+            inline.resolve(dir.path()).unwrap_err(),
+            SourceSetArgsError::MissingExtensionScope { .. }
+        ));
     }
 
     #[test]
@@ -965,34 +1009,36 @@ mod tests {
     }
 
     #[test]
-    fn the_escape_the_error_advertises_actually_works() {
+    fn named_values_split_at_the_first_equals() {
         let dir = tempdir().unwrap();
         extension_dir(dir.path(), "wanted=real");
         extension_dir(dir.path(), "real");
 
-        // The message tells the user to name it explicitly. Splitting on the
-        // *first* `=` is what makes that work, so this pins the advice to the
-        // parser rather than to the sentence.
-        let resolved = args(&["--extension", "W=wanted=real"]).resolve(dir.path()).unwrap();
-
+        // Preserve the established first-equals syntax while refusing to
+        // invent the required Scope for the resulting named override.
         assert_eq!(
-            resolved.extensions.unwrap(),
-            vec![ExtensionDecl::Structured(StructuredExtensionDecl {
-                name: "W".to_string(),
-                path: "wanted=real".to_string(),
-                depends_on: Vec::new(),
-            })]
+            super::split_extension_value("W=wanted=real", dir.path()).unwrap(),
+            (Some("W".to_owned()), "wanted=real".to_owned())
         );
+        assert!(matches!(
+            args(&["--extension", "W=wanted=real"]).resolve(dir.path()).unwrap_err(),
+            SourceSetArgsError::MissingExtensionScope { name } if name == "W"
+        ));
     }
 
     #[test]
-    fn only_one_live_reading_needs_no_refusal() {
+    fn only_one_live_reading_is_still_parsed_as_a_named_override() {
         let dir = tempdir().unwrap();
         extension_dir(dir.path(), "real");
 
-        let resolved = args(&["--extension", "wanted=real"]).resolve(dir.path()).unwrap();
-
-        assert_eq!(names(&resolved.extensions.unwrap()), vec!["wanted"]);
+        assert_eq!(
+            super::split_extension_value("wanted=real", dir.path()).unwrap(),
+            (Some("wanted".to_owned()), "real".to_owned())
+        );
+        assert!(matches!(
+            args(&["--extension", "wanted=real"]).resolve(dir.path()).unwrap_err(),
+            SourceSetArgsError::MissingExtensionScope { name } if name == "wanted"
+        ));
     }
 
     #[test]
@@ -1008,24 +1054,20 @@ mod tests {
     }
 
     #[test]
-    fn a_named_entry_with_a_glob_stays_the_strict_shape() {
+    fn a_named_glob_is_not_reinterpreted_as_a_bare_path() {
         let dir = tempdir().unwrap();
         extension_dir(dir.path(), "cfe/E");
 
-        // The model refuses globs in a named entry, loudly. Re-reading the value
-        // as a bare path to dodge that would produce a pattern matching nothing
-        // and drop the extension in silence.
-        let resolved = args(&["--extension", "Named=cfe/*"]).resolve(dir.path()).unwrap();
-
+        // Re-reading this value as a bare path would change its meaning and
+        // could silently drop the extension. The CLI reports its missing Scope.
         assert_eq!(
-            resolved.extensions.unwrap(),
-            vec![ExtensionDecl::Structured(StructuredExtensionDecl {
-                name: "Named".to_string(),
-                path: "cfe/*".to_string(),
-                depends_on: Vec::new(),
-            })],
-            "must reach the model as a named entry, which then rejects the glob"
+            super::split_extension_value("Named=cfe/*", dir.path()).unwrap(),
+            (Some("Named".to_owned()), "cfe/*".to_owned())
         );
+        assert!(matches!(
+            args(&["--extension", "Named=cfe/*"]).resolve(dir.path()).unwrap_err(),
+            SourceSetArgsError::MissingExtensionScope { name } if name == "Named"
+        ));
     }
 
     #[test]
@@ -1130,7 +1172,7 @@ mod tests {
         let resolved =
             args(&["--extension", "cfe/*", "--extension", "cfe/base"]).resolve(dir.path()).unwrap();
 
-        assert_eq!(resolved.extensions.unwrap().len(), 2, "both entries reach the model");
+        assert_eq!(resolved.extensions.unwrap().len(), 2, "both path entries reach the model");
     }
 
     #[test]

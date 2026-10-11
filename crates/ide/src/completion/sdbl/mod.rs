@@ -38,11 +38,8 @@ pub(super) fn sdbl_completions(
 
     let context = detect_context(&query_info.query_text, query_info.offset_in_query);
 
-    // Build the table Scope only for contexts that consume it. The Scope is built
-    // from the file's whole configuration (`get_scope` -> `get_configuration`), so
-    // deferring it keeps the per-MDO contexts (object / value / type completion,
-    // which dispatch straight to `resolve_metadata_object` / `resolve_register`)
-    // off that broad per-keystroke dependency.
+    // Only alias/nested completion needs a table Scope; its reference navigation
+    // shares the file-scoped per-MDO resolver used by SDBL lowering.
     let needs_scope = matches!(
         context,
         SdblCompletionContext::AfterTableAlias { .. }
@@ -50,12 +47,14 @@ pub(super) fn sdbl_completions(
             | SdblCompletionContext::AfterOnKeyword { .. }
             | SdblCompletionContext::AfterCastExpression { .. }
     );
+    let resolver = hir::DbSdblResolver::new(db, file_id);
     let scope = needs_scope
         .then(|| {
             scope_provider.get_scope(
                 file_id,
                 query_info.bsl_literal_range,
                 query_info.offset_in_query,
+                &resolver,
             )
         })
         .flatten();

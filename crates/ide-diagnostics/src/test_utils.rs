@@ -921,7 +921,7 @@ pub fn check_with_config_xml(
     let registered_modules = project.registered_modules();
 
     let mut db = RootDatabaseImpl::new();
-    db.set_all_config_paths(vec![(None, project.root().to_path_buf())]);
+    db.set_all_config_paths(vec![(None, project.root().to_path_buf())], None);
 
     let mut file_set = FileSet::default();
     let caller_file_id = FileId(0);
@@ -1026,7 +1026,7 @@ fn check_form_module_impl(
     std::fs::write(form_ext_dir.join("Form.xml"), form_xml).expect("write Ext/Form.xml");
 
     let mut db = RootDatabaseImpl::new();
-    db.set_all_config_paths(vec![(None, root.clone())]);
+    db.set_all_config_paths(vec![(None, root.clone())], None);
 
     let mut file_set = FileSet::default();
     let caller_file_id = FileId(0);
@@ -1231,7 +1231,7 @@ pub(crate) fn check_cfe_at_with_db_setup(
 
     let mut db = RootDatabaseImpl::new();
     db_setup(&mut db);
-    db.set_all_config_paths(fixture.config_paths());
+    db.set_all_config_paths(fixture.config_paths(), Some(bsl_metadata::ExtensionScope::InfoBase));
 
     let mut file_set = FileSet::default();
     let caller_file_id = FileId(0);

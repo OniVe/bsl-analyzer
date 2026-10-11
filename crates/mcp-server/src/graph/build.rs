@@ -4623,6 +4623,16 @@ mod tests {
         build_graph_database(&project, &universe, out, BatchBudget::files(batch_size), meta)
     }
 
+    fn declare_scoped_extension(root: &Path, name: &str, relative_path: &str) {
+        fs::write(
+            root.join("bsl-analyzer.toml"),
+            format!(
+                "[source]\nroot = \".\"\nextensions = [{{ name = {name:?}, path = {relative_path:?}, scope = \"InfoBase\" }}]\n"
+            ),
+        )
+        .unwrap();
+    }
+
     /// The straddle verdict is more than a fingerprint comparison: either
     /// bracketing scan failing to cover the whole tree loses the coherence claim
     /// even when the fingerprints match exactly.
@@ -6618,19 +6628,21 @@ mod tests {
         assert_ne!(base.topology, after.topology, "the dependency edge changed the topology");
     }
 
-    /// An extension appearing through zero-config auto-discovery (no analyzer config
-    /// file exists at all) must flow into the topology component too — visibility
-    /// re-shapes without a single config-file stat to observe.
+    /// Adding a valid, explicitly scoped extension must change the topology component.
     #[test]
-    fn an_auto_discovered_extension_changes_the_topology_component() {
+    fn a_scoped_extension_changes_the_topology_component() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         sample_workspace(root);
+        write(root, "Configuration.xml", "<Configuration/>");
+        fs::write(root.join("bsl-analyzer.toml"), "[source]\nroot = \".\"\nextensions = []\n")
+            .unwrap();
         let base = workspace_fingerprint(root);
 
         write(root, "src/cfe/NewExt/Configuration.xml", "<Configuration/>");
+        declare_scoped_extension(root, "NewExt", "src/cfe/NewExt");
         let after = workspace_fingerprint(root);
-        assert_ne!(base.topology, after.topology, "discovery must reshape the topology");
+        assert_ne!(base.topology, after.topology, "the scoped extension must reshape topology");
     }
 
     /// The offline-edit warm start (daemon down while `dependsOn` changed): the
@@ -8617,6 +8629,7 @@ mod tests {
             let ext = root.join("cfe/Расш");
             std::fs::create_dir_all(&ext).unwrap();
             std::fs::write(ext.join("Configuration.xml"), "<Configuration/>").unwrap();
+            declare_scoped_extension(root, "Расш", "cfe/Расш");
             write_common_module(
                 &ext,
                 "Сервер",
@@ -8681,6 +8694,7 @@ mod tests {
         let ext = root.join("cfe/Расш");
         std::fs::create_dir_all(&ext).unwrap();
         std::fs::write(ext.join("Configuration.xml"), "<Configuration/>").unwrap();
+        declare_scoped_extension(root, "Расш", "cfe/Расш");
         write_common_module(
             &ext,
             "Сервер",
@@ -8757,6 +8771,7 @@ mod tests {
         let ext = root.join("cfe/Расш");
         std::fs::create_dir_all(&ext).unwrap();
         std::fs::write(ext.join("Configuration.xml"), "<Configuration/>").unwrap();
+        declare_scoped_extension(root, "Расш", "cfe/Расш");
         write_common_module(
             &ext,
             "Сервер",

@@ -1446,8 +1446,8 @@ mod tests {
         let config = |deps: &str| {
             format!(
                 "[source]\nroot = \".\"\nextensions = [\n  \
-                 {{ name = \"a\", path = \"ext/a\" }},\n  \
-                 {{ name = \"b\", path = \"ext/b\"{deps} }},\n]\n"
+                 {{ name = \"a\", path = \"ext/a\", scope = \"InfoBase\" }},\n  \
+                 {{ name = \"b\", path = \"ext/b\", scope = \"InfoBase\"{deps} }},\n]\n"
             )
         };
         fs::write(root.join("bsl-analyzer.toml"), config("")).unwrap();
@@ -1461,21 +1461,45 @@ mod tests {
         );
     }
 
-    /// With NO analyzer config file at all, an extension appearing through
-    /// auto-discovery must still change the config identity: there is no
-    /// config-file stat to observe, only the re-derived topology.
+    /// With no analyzer config-file stat to observe, a scoped extension added
+    /// to the project snapshot must still change identity through topology.
     #[test]
-    fn config_identity_sees_an_auto_discovered_extension_without_any_config_file() {
+    fn config_identity_sees_a_scoped_extension_without_a_config_file_stat() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         sample_workspace(root);
-        let before = config_identity_now(root);
+        let project_configs = |include_extension: bool| {
+            let extensions = if include_extension {
+                vec![project_model::ExtensionDecl::Structured(
+                    project_model::StructuredExtensionDecl {
+                        name: "NewExt".to_owned(),
+                        path: "src/cfe/NewExt".to_owned(),
+                        depends_on: Vec::new(),
+                        scope: bsl_metadata::ExtensionScope::InfoBase,
+                    },
+                )]
+            } else {
+                Vec::new()
+            };
+            let project = project_model::Project::with_config(
+                root,
+                project_model::ProjectConfig {
+                    configuration_root: Some(".".to_owned()),
+                    extensions: Some(extensions),
+                    ..project_model::ProjectConfig::default()
+                },
+            )
+            .unwrap();
+            ide::WorkspaceConfigsSnapshot::from_project(&project)
+        };
+        let config_files_fp = config_files_fingerprint(root);
+        let before = config_identity(config_files_fp, &project_configs(false));
 
         write(root, "src/cfe/NewExt/Configuration.xml", "<Configuration/>");
+        let after = config_identity(config_files_fp, &project_configs(true));
         assert_ne!(
-            before,
-            config_identity_now(root),
-            "discovery must reshape the config identity with zero config files"
+            before, after,
+            "the scoped topology must reshape identity without changing config-file stats"
         );
     }
 
@@ -1786,6 +1810,11 @@ mod tests {
             true,
             "&НаСервере\nФункция Р() Экспорт КонецФункции",
         );
+        fs::write(
+            root.join("bsl-analyzer.toml"),
+            "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"Расш\", path = \"src/cfe/Расш\", scope = \"InfoBase\" }]\n",
+        )
+        .unwrap();
 
         let mut state = DiagnosticsState::for_workspace(root.to_path_buf());
         state.drift_interval = Duration::from_millis(0);
@@ -4012,8 +4041,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        // Nested layout: config source under `src/cf`, an extension auto-discovered under
-        // `src/cfe/*` (both need a `Configuration.xml` to be recognised).
+        // Nested layout: config source under `src/cf`, with an explicitly-scoped extension
+        // beside it so the test exercises the drain path with a validated Project.
         let cf = root.join("src/cf");
         fs::create_dir_all(&cf).unwrap();
         fs::write(cf.join("Configuration.xml"), "<Configuration/>").unwrap();
@@ -4027,6 +4056,11 @@ mod tests {
             true,
             "&НаСервере\nФункция Р() Экспорт КонецФункции",
         );
+        fs::write(
+            root.join("bsl-analyzer.toml"),
+            "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"Расш\", path = \"src/cfe/Расш\", scope = \"InfoBase\" }]\n",
+        )
+        .unwrap();
 
         // Build the hub over the SAME targets production arms (source + extensions,
         // plus the workspace root non-recursively) — a narrower boot set would be
@@ -4034,7 +4068,7 @@ mod tests {
         // debt is exactly what this zero-scan assertion must not see.
         let project = project_model::Project::new(root).expect("valid test project");
         let roots = project.source_roots();
-        assert!(roots.len() >= 2, "the extension root must be discovered: {roots:?}");
+        assert!(roots.len() >= 2, "the scoped extension root must be declared: {roots:?}");
         let hub =
             WorkspaceChangeHub::start_targets(crate::change_hub::watch_targets_for(root, &roots));
         assert!(hub.wait_until_watching(Duration::from_secs(5)), "the hub must arm");
@@ -4963,32 +4997,37 @@ mod tests {
         }
     }
 
-    /// The watch reaches the scan roots and the workspace root itself, and nothing in
-    /// between: `watch_targets_for` arms each scan root recursively plus the workspace
-    /// root non-recursively. A scan root that is a GRANDCHILD therefore leaves its parent
-    /// directory watched by nobody, and a whole new root appearing there raises no event
-    /// at all — while the hub stays healthy, because a piece of tree nobody declared
-    /// cannot be counted blind. This is where the forced re-scan is the only thing
-    /// standing between the caller and a final-looking miss for a name that exists.
-    ///
-    /// The control that makes the negative observation readable is on the same stand: a
-    /// module written INSIDE the scan root must arrive by the event path, with no scan at
-    /// all. Without it, "not delivered" and "harness sees nothing" look the same.
+    /// The project declares a scoped extension, but this test deliberately arms a healthy
+    /// hub without that extension root. A file added beneath the omitted root is not delivered
+    /// by events; the forced rescan must find it. The control verifies that files under the
+    /// watched configuration root still arrive through the event path.
     #[test]
-    fn a_forced_rescan_finds_a_root_the_healthy_hub_never_watched() {
+    fn a_forced_rescan_finds_files_in_a_scoped_root_the_hub_does_not_watch() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        // The only scan root is `src/cf`, a grandchild of the workspace root.
+        // The main scan root is a grandchild; the scoped extension is intentionally left
+        // out of this test hub's watch set.
         let cf = root.join("src/cf");
         fs::create_dir_all(&cf).unwrap();
         fs::write(cf.join("Configuration.xml"), "<Configuration/>").unwrap();
         write_common_module(&cf, "Сервер", true, "&НаСервере\nФункция Ч() Экспорт КонецФункции");
-        fs::write(root.join("bsl-analyzer.toml"), "[source]\nroot = \"src/cf\"\n").unwrap();
+        let ext = root.join("src/cfe/Расш");
+        fs::create_dir_all(&ext).unwrap();
+        fs::write(ext.join("Configuration.xml"), "<Configuration/>").unwrap();
+        fs::write(
+            root.join("bsl-analyzer.toml"),
+            "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"Расш\", path = \"src/cfe/Расш\", scope = \"InfoBase\" }]\n",
+        )
+        .unwrap();
 
         let project = project_model::Project::new(root).expect("valid test project");
-        let targets = crate::change_hub::watch_targets_for(root, &project.source_roots());
-        // An hour between coverage ticks: no re-arm can happen mid-test.
+        assert!(
+            project.source_roots().contains(&ext),
+            "the scoped extension belongs to the Project even though this hub omits it",
+        );
+        let targets = crate::change_hub::watch_targets_for(root, std::slice::from_ref(&cf));
+        // The long interval keeps the test hub healthy without changing its explicit targets.
         let hub = crate::change_hub::WorkspaceChangeHub::start_targets_with_period(
             targets,
             Duration::from_secs(3600),
@@ -5000,6 +5039,17 @@ mod tests {
         state.drift_interval = Duration::from_millis(0);
         state.ensure_loading();
         wait_ready(&state);
+        assert!(
+            hub.rearm(
+                crate::change_hub::watch_targets_for(root, std::slice::from_ref(&cf)),
+                Duration::from_secs(5),
+            ),
+            "the fixture hub stays healthy while omitting the scoped extension root",
+        );
+        // Rearming changes coverage and marks this cursor for reconciliation. Consume that
+        // setup-only mark before measuring the event and forced-rescan paths below.
+        state.drain_and_discard_cursor();
+        let scans_before_changes = state.scan_count();
 
         // Positive control, same stand: a new module INSIDE the recursive scan root must
         // arrive without any force, and through the event path (no scan).
@@ -5009,13 +5059,13 @@ mod tests {
             resident_gains_file(&state, &watched, Duration::from_secs(30)),
             "control: a change inside the watch must arrive with no force at all"
         );
-        assert_eq!(state.scan_count(), 0, "control: it arrived by the event path, not by a scan");
+        assert_eq!(
+            state.scan_count(),
+            scans_before_changes,
+            "control: it arrived by the event path without an additional scan"
+        );
 
-        // The change: a whole new auto-discovered extension root under `src`, which
-        // nothing watches — the root's own watch is not recursive.
-        let ext = root.join("src/cfe/Расш");
-        fs::create_dir_all(&ext).unwrap();
-        fs::write(ext.join("Configuration.xml"), "<Configuration/>").unwrap();
+        // New files in the scoped extension root are outside this hub's watch coverage.
         write_common_module(
             &ext,
             "РасшМодуль",
@@ -5033,15 +5083,21 @@ mod tests {
         let cursor = *lock_recover(&state.hub_cursor);
         assert_eq!(hub.health_for(cursor), Health::Healthy, "the hub is healthy and right");
         assert!(!resident_has_file(&state, &ext_module), "the ordinary read must not see it");
-        assert_eq!(state.scan_count(), 0, "and the healthy path still walks nothing");
+        assert_eq!(
+            state.scan_count(),
+            scans_before_changes,
+            "the healthy path still walks nothing before the explicit force"
+        );
 
         state.force_rescan();
-        // A new root is a change of configuration identity, so the scan behind the force
-        // starts a rebuild instead of applying anything in place: the name appears on one
-        // of the reads after it, not on the read that consumed the flag.
+        // The forced scan surfaces files from the declared extension root.
         assert!(
             resident_gains_file(&state, &ext_module, Duration::from_secs(30)),
-            "the forced re-scan must surface a root the watch never reached"
+            "the forced re-scan must surface files under the root the hub omitted"
+        );
+        assert!(
+            state.scan_count() > scans_before_changes,
+            "only the explicit force may add a scan for the omitted root"
         );
         assert_eq!(
             catalog_resolves_from(&state, &ext_module, "Товары"),

@@ -270,11 +270,12 @@ fn build_check_config_report(
                     project_model::ExtensionDecl::Path(path) => path.clone(),
                     project_model::ExtensionDecl::Structured(entry)
                         if entry.depends_on.is_empty() =>
-                        format!("{} ({})", entry.name, entry.path),
+                        format!("{} ({}, scope: {:?})", entry.name, entry.path, entry.scope),
                     project_model::ExtensionDecl::Structured(entry) => format!(
-                        "{} ({}, dependsOn: {})",
+                        "{} ({}, scope: {:?}, dependsOn: {})",
                         entry.name,
                         entry.path,
+                        entry.scope,
                         entry.depends_on.join(", ")
                     ),
                 })
@@ -352,7 +353,14 @@ fn build_check_config_report(
                                 .join(", ")
                         )
                     };
-                    let _ = writeln!(out, "  {} — {} ({deps})", node.name(), node.path().display());
+                    let scope =
+                        node.scope().map(|scope| format!(", scope: {scope:?}")).unwrap_or_default();
+                    let _ = writeln!(
+                        out,
+                        "  {} — {} ({deps}{scope})",
+                        node.name(),
+                        node.path().display()
+                    );
                 }
                 let _ = writeln!(
                     out,

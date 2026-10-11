@@ -763,10 +763,11 @@ mod tests {
         db.set_file_text(subsystem_file, &subsystem_xml("МояПодсистема"));
         db.set_file_text(consumer_file, "Процедура Т() КонецПроцедуры");
 
-        db.set_all_config_paths(vec![(None, root.clone())]);
+        db.set_all_config_paths(vec![(None, root.clone())], None);
         db.set_metadata_listing(
             &root.to_string_lossy(),
             MetadataListingData {
+                common_attributes: Vec::new(),
                 entries: Vec::new(),
                 defined_types: Vec::new(),
                 common_modules: Vec::new(),

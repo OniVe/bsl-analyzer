@@ -66,7 +66,7 @@ fn db() -> (RootDatabaseImpl, Vec<FileId>) {
         db.set_file_source_root(*id, SourceRootId(0));
         db.set_file_text(*id, text);
     }
-    db.set_all_config_paths(vec![(None, root.clone())]);
+    db.set_all_config_paths(vec![(None, root.clone())], None);
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {

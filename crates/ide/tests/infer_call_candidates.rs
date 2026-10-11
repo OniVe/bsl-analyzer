@@ -192,10 +192,16 @@ fn platform_manager_call_attaches_complete_candidate_resolution() {
 КонецПроцедуры
 "#,
     );
-    db.set_all_config_paths(vec![(
+    db.set_all_config_paths(
+        vec![(
+            None,
+            PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../bsl-metadata/fixtures/designer"
+            )),
+        )],
         None,
-        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../bsl-metadata/fixtures/designer")),
-    )]);
+    );
 
     let inference = db.infer(file_id);
     let binding = inference
@@ -229,10 +235,16 @@ fn constant_refinement_updates_candidate_truth_before_resolution() {
 КонецПроцедуры
 "#,
     );
-    db.set_all_config_paths(vec![(
+    db.set_all_config_paths(
+        vec![(
+            None,
+            PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../bsl-metadata/fixtures/designer"
+            )),
+        )],
         None,
-        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../bsl-metadata/fixtures/designer")),
-    )]);
+    );
 
     let inference = db.infer(file_id);
     let candidate_bindings = inference.call_arg_bindings.iter().collect::<Vec<_>>();

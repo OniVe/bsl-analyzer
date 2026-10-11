@@ -1023,7 +1023,7 @@ mod tests {
             r#"
 [source]
 root = "src/cf"
-extensions = [{ name = "Ext", path = "src/cfe/Ext" }]
+extensions = [{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }]
 
 [diagnostics.baseline]
 directory = "baselines"
@@ -1438,7 +1438,7 @@ include = ["main"]
             r#"
 [source]
 root = "src/cf"
-extensions = [{ name = "Ext", path = "src/cfe/Ext" }]
+extensions = [{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }]
 
 [diagnostics.baseline]
 directory = "baselines-moved"

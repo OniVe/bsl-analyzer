@@ -628,7 +628,7 @@ fn moved_graph_keeps_nested_roots_for_same_relative_paths() {
     super::test_support::write(
         &old_root,
         "bsl-analyzer.toml",
-        "[source]\nroot = \"src/cf\"\nextensions = [\"src/cfe/Расш\"]\n",
+        "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"Расш\", path = \"src/cfe/Расш\", scope = \"InfoBase\" }]\n",
     );
     super::test_support::write(&old_root, "src/cf/Configuration.xml", "<Configuration/>");
     super::test_support::write(&old_root, "src/cfe/Расш/Configuration.xml", "<Configuration/>");

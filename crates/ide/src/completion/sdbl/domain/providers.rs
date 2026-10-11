@@ -29,10 +29,11 @@ pub trait MetadataProvider {
 }
 
 pub trait ScopeProvider {
-    fn get_scope(
+    fn get_scope<'a>(
         &self,
         file_id: FileId,
         bsl_literal_range: syntax::TextRange,
         sdbl_offset: TextSize,
-    ) -> Option<Scope<'static>>;
+        resolver: &'a dyn bsl_metadata::QueryMetadataResolver,
+    ) -> Option<Scope<'a>>;
 }

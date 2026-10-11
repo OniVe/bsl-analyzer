@@ -68,7 +68,23 @@ pub struct DiagnosticsBaselineProjectScope {
 pub struct DiagnosticsBaselineProjectExtension {
     pub name: String,
     pub path: String,
+    /// Absent only when loading a baseline created before extension scopes were
+    /// part of its identity. Newly resolved projects always write `Some`; the
+    /// old value must remain distinguishable so it produces a scope mismatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<bsl_metadata::ExtensionScope>,
+    /// Effective scopes of every transitive extension dependency. A name-only
+    /// `depends_on` edge is not enough to identify the analysis composition.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependency_scopes: Vec<DiagnosticsBaselineDependencyScope>,
     pub depends_on: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiagnosticsBaselineDependencyScope {
+    pub name: String,
+    pub scope: bsl_metadata::ExtensionScope,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +122,12 @@ pub enum DiagnosticsBaselinePartitionIdentity {
     Extension {
         name: String,
         path: String,
+        /// Legacy baseline identities deserialize as `None` and cannot match a
+        /// freshly resolved extension with an explicit scope.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<bsl_metadata::ExtensionScope>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dependency_scopes: Vec<DiagnosticsBaselineDependencyScope>,
         depends_on: Vec<String>,
     },
     Group {
@@ -334,6 +356,17 @@ impl Project {
         if nodes_cut {
             topology = topology.retain(&canonical_base, |node| !node_excluded(node));
         }
+        if let Some(node) = topology
+            .nodes()
+            .iter()
+            .find(|node| !node.kind().is_external() && node.scope().is_none())
+        {
+            return Err(TopologyError::MissingScope {
+                name: node.name().to_owned(),
+                path: node.path().to_path_buf(),
+            }
+            .into());
+        }
         let paths_of_kind = |external: bool| -> Vec<(String, PathBuf)> {
             topology
                 .nodes()
@@ -521,17 +554,17 @@ impl Project {
             (Some(_), Some(_)) => {
                 return Err(DiagnosticsBaselineProjectError::InvalidConfig(
                     "path and directory are mutually exclusive".to_owned(),
-                ))
+                ));
             }
             (Some(_), None) => {
                 return Err(DiagnosticsBaselineProjectError::InvalidConfig(
                     "path cannot be combined with groups or include".to_owned(),
-                ))
+                ));
             }
             (None, None) => {
                 return Err(DiagnosticsBaselineProjectError::InvalidConfig(
                     "either path or directory is required".to_owned(),
-                ))
+                ));
             }
         };
         let project_root = canonicalize_baseline_path(&self.root)?;
@@ -579,9 +612,28 @@ impl Project {
                 });
                 continue;
             }
+            let mut dependency_scopes: Vec<_> = node
+                .closure()
+                .iter()
+                .map(|id| {
+                    let dependency = self.topology.node(*id);
+                    DiagnosticsBaselineDependencyScope {
+                        name: dependency.name().to_owned(),
+                        scope: dependency
+                            .scope()
+                            .expect("included extension dependencies have a scope"),
+                    }
+                })
+                .collect();
+            dependency_scopes.sort_by(|left, right| {
+                stdx::case::fold_lower_per_char(&left.name)
+                    .cmp(&stdx::case::fold_lower_per_char(&right.name))
+            });
             extensions.push(DiagnosticsBaselineProjectExtension {
                 name: node.name().to_owned(),
                 path,
+                scope: Some(node.scope().expect("included extension roots have a scope")),
+                dependency_scopes,
                 depends_on,
             });
         }
@@ -752,6 +804,8 @@ impl Project {
                 DiagnosticsBaselinePartitionIdentity::Extension {
                     name: extension.name.clone(),
                     path: extension.path.clone(),
+                    scope: extension.scope,
+                    dependency_scopes: extension.dependency_scopes.clone(),
                     depends_on: extension.depends_on.clone(),
                 },
             ));
@@ -1036,6 +1090,7 @@ impl Project {
                         canonical_path: canonical,
                         depends_on: None,
                         structured: false,
+                        scope: None,
                     });
                 }
                 Candidate::Structured(structured, path) => {
@@ -1072,6 +1127,7 @@ impl Project {
                         canonical_path: canonical,
                         depends_on: Some(structured.depends_on),
                         structured: true,
+                        scope: Some(structured.scope),
                     });
                 }
             }
@@ -1137,6 +1193,7 @@ impl Project {
                 canonical_path: canonical,
                 depends_on: decl.depends_on.clone(),
                 structured: true,
+                scope: None,
             });
         }
         Ok(())
@@ -1221,6 +1278,7 @@ impl Project {
                 canonical_path: canonical,
                 depends_on: None,
                 structured: true,
+                scope: None,
             });
         }
     }
@@ -1392,6 +1450,10 @@ fn canonical_scope(scope: &DiagnosticsBaselineProjectScope) -> DiagnosticsBaseli
     let mut scope = scope.clone();
     for extension in &mut scope.extensions {
         extension.depends_on.sort();
+        extension.dependency_scopes.sort_by(|left, right| {
+            stdx::case::fold_lower_per_char(&left.name)
+                .cmp(&stdx::case::fold_lower_per_char(&right.name))
+        });
     }
     for external in &mut scope.externals {
         if let Some(depends_on) = &mut external.depends_on {
@@ -1412,13 +1474,25 @@ fn canonical_identity(
     match &mut identity {
         DiagnosticsBaselinePartitionIdentity::Main { .. }
         | DiagnosticsBaselinePartitionIdentity::External { depends_on: None, .. } => {}
-        DiagnosticsBaselinePartitionIdentity::Extension { depends_on, .. }
-        | DiagnosticsBaselinePartitionIdentity::External { depends_on: Some(depends_on), .. } => {
+        DiagnosticsBaselinePartitionIdentity::Extension {
+            depends_on, dependency_scopes, ..
+        } => {
+            depends_on.sort();
+            dependency_scopes.sort_by(|left, right| {
+                stdx::case::fold_lower_per_char(&left.name)
+                    .cmp(&stdx::case::fold_lower_per_char(&right.name))
+            });
+        }
+        DiagnosticsBaselinePartitionIdentity::External { depends_on: Some(depends_on), .. } => {
             depends_on.sort()
         }
         DiagnosticsBaselinePartitionIdentity::Group { members, .. } => {
             for member in members.iter_mut() {
                 member.depends_on.sort();
+                member.dependency_scopes.sort_by(|left, right| {
+                    stdx::case::fold_lower_per_char(&left.name)
+                        .cmp(&stdx::case::fold_lower_per_char(&right.name))
+                });
             }
             members.sort_by(|left, right| left.name.cmp(&right.name));
         }
@@ -2065,6 +2139,7 @@ pub struct StructuredExtensionDecl {
     pub name: String,
     pub path: String,
     pub depends_on: Vec<String>,
+    pub scope: bsl_metadata::ExtensionScope,
 }
 
 /// One entry of `[source] externals`: an external data processor or report
@@ -2154,13 +2229,15 @@ impl<'de> Deserialize<'de> for ExtensionDecl {
     {
         struct DeclVisitor;
 
-        const FIELDS: &[&str] = &["name", "path", "dependsOn", "depends_on"];
+        const FIELDS: &[&str] = &["name", "path", "dependsOn", "depends_on", "scope"];
 
         impl<'de> serde::de::Visitor<'de> for DeclVisitor {
             type Value = ExtensionDecl;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("an extension path string or a table { name, path, dependsOn = [...] }")
+                f.write_str(
+                    "an extension path string or a table { name, path, scope, dependsOn = [...] }",
+                )
             }
 
             fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
@@ -2179,6 +2256,7 @@ impl<'de> Deserialize<'de> for ExtensionDecl {
                 let mut name: Option<String> = None;
                 let mut path: Option<String> = None;
                 let mut depends_on: Option<Vec<String>> = None;
+                let mut scope: Option<bsl_metadata::ExtensionScope> = None;
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "name" => {
@@ -2199,6 +2277,12 @@ impl<'de> Deserialize<'de> for ExtensionDecl {
                             }
                             depends_on = Some(map.next_value()?);
                         }
+                        "scope" => {
+                            if scope.is_some() {
+                                return Err(A::Error::duplicate_field("scope"));
+                            }
+                            scope = Some(map.next_value()?);
+                        }
                         other => return Err(A::Error::unknown_field(other, FIELDS)),
                     }
                 }
@@ -2206,6 +2290,7 @@ impl<'de> Deserialize<'de> for ExtensionDecl {
                     name: name.ok_or_else(|| A::Error::missing_field("name"))?,
                     path: path.ok_or_else(|| A::Error::missing_field("path"))?,
                     depends_on: depends_on.unwrap_or_default(),
+                    scope: scope.ok_or_else(|| A::Error::missing_field("scope"))?,
                 }))
             }
         }
@@ -3232,7 +3317,9 @@ pub fn evaluate_workspace_baseline_support(
             )
         }
         (Some(workspace_branch), _) => {
-            format!("workspace branch '{workspace_branch}' uses a shared baseline published {age_days} days ago")
+            format!(
+                "workspace branch '{workspace_branch}' uses a shared baseline published {age_days} days ago"
+            )
         }
         (None, Some(selected_branch)) => {
             format!("shared baseline branch '{selected_branch}' was published {age_days} days ago")
@@ -3544,7 +3631,9 @@ impl ResolvePostgresUrlError {
 impl std::fmt::Display for ResolvePostgresUrlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MissingField(field) => write!(f, "missing required PostgreSQL config field: {field}"),
+            Self::MissingField(field) => {
+                write!(f, "missing required PostgreSQL config field: {field}")
+            }
             Self::MissingCredentialHelper => write!(
                 f,
                 "missing required PostgreSQL credential helper config: search.baseline.postgres.credential_helper.program"
@@ -3552,11 +3641,9 @@ impl std::fmt::Display for ResolvePostgresUrlError {
             Self::HelperSpawn { program, message } => {
                 write!(f, "failed to spawn credential helper '{program}': {message}")
             }
-            Self::HelperTimeout { program, timeout } => write!(
-                f,
-                "credential helper '{program}' timed out after {}s",
-                timeout.as_secs()
-            ),
+            Self::HelperTimeout { program, timeout } => {
+                write!(f, "credential helper '{program}' timed out after {}s", timeout.as_secs())
+            }
             Self::HelperProtocol { program, message, .. } => {
                 write!(f, "credential helper '{program}' returned an invalid response: {message}")
             }
@@ -3564,9 +3651,7 @@ impl std::fmt::Display for ResolvePostgresUrlError {
                 write!(
                     f,
                     "credential helper '{program}' rejected the request{}: {}: {}",
-                    exit_code
-                        .map(|code| format!(" (exit {code})"))
-                        .unwrap_or_default(),
+                    exit_code.map(|code| format!(" (exit {code})")).unwrap_or_default(),
                     error.code,
                     error.message
                 )
@@ -3574,7 +3659,9 @@ impl std::fmt::Display for ResolvePostgresUrlError {
             Self::UnsupportedUrlScheme(scheme) => {
                 write!(f, "credential helper returned unsupported URL scheme '{scheme}'")
             }
-            Self::InvalidResolvedUrl(message) => write!(f, "credential helper returned invalid URL: {message}"),
+            Self::InvalidResolvedUrl(message) => {
+                write!(f, "credential helper returned invalid URL: {message}")
+            }
             Self::TargetMismatch {
                 expected_host,
                 expected_port,
@@ -3858,13 +3945,15 @@ mod root_probe_case_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::canonical_scope;
     use super::{
         branch_pattern_matches, current_git_branch, current_git_commit,
         evaluate_workspace_baseline_support, is_publish_branch_allowed, parse_timestamp_utc,
         resolve_postgres_url, resolve_workspace_branch_policy, wildcard_matches, ConfigLoadError,
         DiagnosticsBaselineConfig, DiagnosticsBaselineGroupConfig,
-        DiagnosticsBaselinePartitionIdentity, DiagnosticsBaselinePartitionPolicy,
-        DiagnosticsBaselineProjectError, DiagnosticsBaselineProjectMode,
+        DiagnosticsBaselinePartitionIdentity, DiagnosticsBaselinePartitionPlan,
+        DiagnosticsBaselinePartitionPolicy, DiagnosticsBaselineProjectError,
+        DiagnosticsBaselineProjectExtension, DiagnosticsBaselineProjectMode,
         DiagnosticsBaselineProjectScope, DiagnosticsBaselineSelection, ExtensionDecl,
         FeaturesConfig, PlatformHelpSelection, PostgresAccessMode, Project, ProjectConfig,
         ProjectDiagnosticsConfig, ProjectError, ResolvePostgresUrlError, SearchBaselineBackend,
@@ -4525,10 +4614,20 @@ root = "src/cf"
     }
 
     fn structured(name: &str, path: &str, deps: &[&str]) -> ExtensionDecl {
+        structured_with_scope(name, path, deps, bsl_metadata::ExtensionScope::InfoBase)
+    }
+
+    fn structured_with_scope(
+        name: &str,
+        path: &str,
+        deps: &[&str],
+        scope: bsl_metadata::ExtensionScope,
+    ) -> ExtensionDecl {
         ExtensionDecl::Structured(StructuredExtensionDecl {
             name: name.to_string(),
             path: path.to_string(),
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            scope,
         })
     }
 
@@ -4539,8 +4638,8 @@ root = "src/cf"
 root = "src/cf"
 extensions = [
   "vendor/legacy",
-  { name = "yaxunit", path = "vendor/yaxunit" },
-  { name = "TESTS", path = "src/cfe/TESTS", dependsOn = ["yaxunit"] },
+  { name = "yaxunit", path = "vendor/yaxunit", scope = "InfoBase" },
+  { name = "TESTS", path = "src/cfe/TESTS", dependsOn = ["yaxunit"], scope = "DataSeparation" },
 ]
 "#;
         let config: super::TomlConfig = toml::from_str(toml_str).unwrap();
@@ -4550,7 +4649,12 @@ extensions = [
             Some(vec![
                 "vendor/legacy".into(),
                 structured("yaxunit", "vendor/yaxunit", &[]),
-                structured("TESTS", "src/cfe/TESTS", &["yaxunit"]),
+                structured_with_scope(
+                    "TESTS",
+                    "src/cfe/TESTS",
+                    &["yaxunit"],
+                    bsl_metadata::ExtensionScope::DataSeparation,
+                ),
             ])
         );
     }
@@ -4559,11 +4663,66 @@ extensions = [
     fn toml_depends_on_accepts_snake_case_alias() {
         let toml_str = r#"
 [source]
-extensions = [{ name = "T", path = "src/cfe/T", depends_on = ["Y"] }]
+extensions = [{ name = "T", path = "src/cfe/T", depends_on = ["Y"], scope = "InfoBase" }]
 "#;
         let config: super::TomlConfig = toml::from_str(toml_str).unwrap();
         let project = ProjectConfig::from(config);
         assert_eq!(project.extensions, Some(vec![structured("T", "src/cfe/T", &["Y"])]));
+    }
+
+    #[test]
+    fn structured_scope_is_required_and_strictly_typed() {
+        for (config, expected) in [
+            ("[source]\nextensions = [{ name = \"A\", path = \"ext/A\" }]", "scope"),
+            (
+                "[source]\nextensions = [{ name = \"A\", path = \"ext/A\", scope = \"Unknown\" }]",
+                "scope",
+            ),
+            (
+                "[source]\nextensions = [{ name = \"A\", path = \"ext/A\", scope = [\"InfoBase\"] }]",
+                "scope",
+            ),
+            (
+                "[source]\nextensions = [{ name = \"A\", path = \"ext/A\", scope = \"InfoBase\", scope = \"DataSeparation\" }]",
+                "duplicate",
+            ),
+        ] {
+            let error = toml::from_str::<super::TomlConfig>(config).unwrap_err().to_string();
+            assert!(error.contains(expected), "expected {expected:?} in {error:?}");
+        }
+    }
+
+    #[test]
+    fn included_legacy_extension_requires_scope_after_exclusions() {
+        let dir = tempdir().unwrap();
+        touch_extension(dir.path(), "src/cfe/Legacy");
+
+        let config =
+            ProjectConfig { extensions: Some(vec!["src/cfe/Legacy".into()]), ..Default::default() };
+        let error = Project::with_config(dir.path(), config).unwrap_err();
+        assert!(matches!(
+            error,
+            ProjectError::Topology(TopologyError::MissingScope { ref name, .. }) if name == "Legacy"
+        ));
+
+        let excluded = ProjectConfig {
+            extensions: Some(vec!["src/cfe/Legacy".into()]),
+            source_exclude: vec!["src/cfe/Legacy".into()],
+            ..Default::default()
+        };
+        let project = Project::with_config(dir.path(), excluded).unwrap();
+        assert!(project.extension_topology().nodes().is_empty());
+    }
+
+    #[test]
+    fn structured_missing_scope_fails_even_when_excluded() {
+        let config = r#"
+[source]
+exclude = ["src/cfe/A"]
+extensions = [{ name = "A", path = "src/cfe/A" }]
+"#;
+        let error = toml::from_str::<super::TomlConfig>(config).unwrap_err().to_string();
+        assert!(error.contains("scope"), "got: {error}");
     }
 
     #[test]
@@ -4591,13 +4750,21 @@ extensions = [{ name = "T" }]
         let json = r#"{
             "extensions": [
                 "vendor/legacy",
-                { "name": "TESTS", "path": "src/cfe/TESTS", "dependsOn": ["yaxunit"] }
+                { "name": "TESTS", "path": "src/cfe/TESTS", "dependsOn": ["yaxunit"], "scope": "DataSeparation" }
             ]
         }"#;
         let config: ProjectConfig = serde_json::from_str(json).unwrap();
         assert_eq!(
             config.extensions,
-            Some(vec!["vendor/legacy".into(), structured("TESTS", "src/cfe/TESTS", &["yaxunit"]),])
+            Some(vec![
+                "vendor/legacy".into(),
+                structured_with_scope(
+                    "TESTS",
+                    "src/cfe/TESTS",
+                    &["yaxunit"],
+                    bsl_metadata::ExtensionScope::DataSeparation,
+                ),
+            ])
         );
     }
 
@@ -4667,7 +4834,12 @@ extensions = [{ name = "T" }]
         let config = ProjectConfig {
             extensions: Some(vec![
                 structured("yaxunit", "vendor/yaxunit", &[]),
-                structured("TESTS", "src/cfe/TESTS", &["yaxunit"]),
+                structured_with_scope(
+                    "TESTS",
+                    "src/cfe/TESTS",
+                    &["yaxunit"],
+                    bsl_metadata::ExtensionScope::DataSeparation,
+                ),
             ]),
             ..Default::default()
         };
@@ -4702,7 +4874,7 @@ extensions = [{ name = "T" }]
     }
 
     #[test]
-    fn structured_entries_without_depends_on_resolve_like_legacy() {
+    fn included_legacy_entries_are_rejected_without_scope() {
         let dir = tempdir().unwrap();
         touch_extension(dir.path(), "vendor/yaxunit");
         touch_extension(dir.path(), "src/cfe/TESTS");
@@ -4713,16 +4885,11 @@ extensions = [{ name = "T" }]
             ]),
             ..Default::default()
         };
-        let project = Project::with_config(dir.path(), config).unwrap();
-        let names: Vec<&str> = project.extension_paths().iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(
-            names,
-            ["named-yaxunit", "TESTS"],
-            "structured entries keep the declared name; legacy entries derive it from the dir"
-        );
-        let topology = project.extension_topology();
-        assert_eq!(topology.nodes().len(), 2);
-        assert!(topology.nodes().iter().all(|n| n.closure().is_empty()));
+        let error = Project::with_config(dir.path(), config).unwrap_err();
+        assert!(matches!(
+            error,
+            ProjectError::Topology(TopologyError::MissingScope { ref name, .. }) if name == "TESTS"
+        ));
     }
 
     #[test]
@@ -4732,13 +4899,38 @@ extensions = [{ name = "T" }]
         touch_extension(dir.path(), "src/cfe/B");
         let fingerprint = |exts: &[&str]| {
             let config = ProjectConfig {
-                extensions: Some(exts.iter().map(|s| ExtensionDecl::from(*s)).collect()),
+                extensions: Some(
+                    exts.iter()
+                        .map(|path| {
+                            let name = Path::new(path).file_name().unwrap().to_str().unwrap();
+                            structured(name, path, &[])
+                        })
+                        .collect(),
+                ),
                 ..Default::default()
             };
             Project::with_config(dir.path(), config).unwrap().extension_topology().fingerprint()
         };
         assert_eq!(fingerprint(&["src/cfe/A"]), fingerprint(&["src/cfe/A"]));
         assert_ne!(fingerprint(&["src/cfe/A"]), fingerprint(&["src/cfe/A", "src/cfe/B"]));
+
+        let scoped = |scope| {
+            let config = ProjectConfig {
+                extensions: Some(vec![ExtensionDecl::Structured(StructuredExtensionDecl {
+                    name: "A".into(),
+                    path: "src/cfe/A".into(),
+                    depends_on: vec![],
+                    scope,
+                })]),
+                ..Default::default()
+            };
+            Project::with_config(dir.path(), config).unwrap().extension_topology().fingerprint()
+        };
+        assert_ne!(
+            scoped(bsl_metadata::ExtensionScope::InfoBase),
+            scoped(bsl_metadata::ExtensionScope::DataSeparation),
+            "installation Scope is part of topology identity"
+        );
     }
 
     #[test]
@@ -4933,7 +5125,7 @@ extensions = [{ name = "T" }]
                 extension_at(root, "Расширения/Feature");
                 std::fs::write(
                     root.join("bsl-analyzer.toml"),
-                    "[source]\nextensions = [\"Расширения/Feature\"]\n",
+                    "[source]\nextensions = [{ name = \"Feature\", path = \"Расширения/Feature\", scope = \"InfoBase\" }]\n",
                 )
                 .unwrap();
             })
@@ -4949,6 +5141,11 @@ extensions = [{ name = "T" }]
                 std::fs::create_dir_all(&cf).unwrap();
                 std::fs::write(cf.join("Configuration.xml"), "<Configuration/>").unwrap();
                 extension_at(root, "src/cfe/A");
+                std::fs::write(
+                    root.join("bsl-analyzer.toml"),
+                    "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"A\", path = \"src/cfe/A\", scope = \"InfoBase\" }]\n",
+                )
+                .unwrap();
             })
             .is_none(),
             "a project with a main configuration stays silent"
@@ -5079,6 +5276,32 @@ extensions = [{ name = "T" }]
     }
 
     #[test]
+    fn a_baseline_without_extension_scope_loads_but_keeps_a_distinct_identity() {
+        let old: DiagnosticsBaselineProjectScope = serde_json::from_str(
+            r#"{"source_root":"src/cf","extensions":[{"name":"A","path":"src/cfe/A","depends_on":[]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(old.extensions[0].scope, None);
+
+        let current = DiagnosticsBaselineProjectScope {
+            source_root: Some("src/cf".to_owned()),
+            extensions: vec![DiagnosticsBaselineProjectExtension {
+                name: "A".to_owned(),
+                path: "src/cfe/A".to_owned(),
+                scope: Some(bsl_metadata::ExtensionScope::InfoBase),
+                dependency_scopes: Vec::new(),
+                depends_on: Vec::new(),
+            }],
+            externals: Vec::new(),
+        };
+        assert_ne!(
+            serde_json::to_vec(&canonical_scope(&old)).unwrap(),
+            serde_json::to_vec(&canonical_scope(&current)).unwrap(),
+            "loading an old baseline must not guess its missing deployment scope"
+        );
+    }
+
+    #[test]
     fn extensions_auto_discovery_supports_russian_container() {
         let dir = tempdir().unwrap();
         let root = dir.path();
@@ -5102,7 +5325,7 @@ extensions = [{ name = "T" }]
         )
         .unwrap();
         let config = ProjectConfig {
-            extensions: Some(vec!["Расширения/Feature".into()]),
+            extensions: Some(vec![structured("Feature", "Расширения/Feature", &[])]),
             ..Default::default()
         };
 
@@ -5372,7 +5595,7 @@ extensions = [{ name = "T" }]
 
         let from_config = ProjectConfig {
             configuration_root: Some("src/cf".to_string()),
-            extensions: Some(vec!["ext".into()]),
+            extensions: Some(vec![structured("ext", "ext", &[])]),
             ..Default::default()
         };
 
@@ -5536,7 +5759,11 @@ extensions = [{ name = "T" }]
             root,
             ProjectConfig {
                 configuration_root: Some("src/cf".to_owned()),
-                extensions: Some(vec!["src/cfe/VisibleWithoutExclude".into()]),
+                extensions: Some(vec![structured(
+                    "VisibleWithoutExclude",
+                    "src/cfe/VisibleWithoutExclude",
+                    &[],
+                )]),
                 ..ProjectConfig::default()
             },
         )
@@ -5547,7 +5774,11 @@ extensions = [{ name = "T" }]
             root,
             ProjectConfig {
                 configuration_root: Some("src/cf".to_owned()),
-                extensions: Some(vec!["src/cfe/VisibleWithoutExclude".into()]),
+                extensions: Some(vec![structured(
+                    "VisibleWithoutExclude",
+                    "src/cfe/VisibleWithoutExclude",
+                    &[],
+                )]),
                 source_exclude: vec!["src".to_owned()],
                 ..ProjectConfig::default()
             },
@@ -5632,11 +5863,20 @@ extensions = [{ name = "T" }]
         touch_extension(root, "src/cfe/Hidden");
         touch_extension(root, "src/cfe/Allowed");
 
+        let discovery_config = ProjectConfig {
+            source_exclude: vec!["a-hidden".to_owned(), "src/cfe/Hidden".to_owned()],
+            ..ProjectConfig::default()
+        };
+        let error = Project::with_config(root, discovery_config.clone()).unwrap_err();
+        assert!(matches!(
+            error,
+            ProjectError::Topology(TopologyError::MissingScope { ref name, .. }) if name == "Allowed"
+        ));
         let project = Project::with_config(
             root,
             ProjectConfig {
-                source_exclude: vec!["a-hidden".to_owned(), "src/cfe/Hidden".to_owned()],
-                ..ProjectConfig::default()
+                extensions: Some(vec![structured("Allowed", "src/cfe/Allowed", &[])]),
+                ..discovery_config
             },
         )
         .unwrap();
@@ -6282,7 +6522,7 @@ include = ["main", "extension:Sales"]
         assert_ne!(first.selection_fingerprint, selective.selection_fingerprint);
         assert_eq!(
             selective.selection_fingerprint,
-            "de9c18d9f747ca156eefc83917fbaa60d748cd8410ece8f043384354bbad559d"
+            "a37175a2fa2457392021e918d95328a8259cc0ca9d1f4a5e514cf6b138f05a2e"
         );
 
         touch_extension(dir.path(), "src/cfe/A2");
@@ -6417,6 +6657,62 @@ include = ["main", "extension:Sales"]
         assert_eq!(straight.selection_fingerprint, swapped.selection_fingerprint);
     }
 
+    #[test]
+    fn dependency_scopes_are_part_of_extension_and_group_baseline_identity() {
+        let dir = tempdir().unwrap();
+        write_configuration_xml(&dir.path().join("src/cf"), "<xml/>");
+        touch_extension(dir.path(), "src/cfe/A");
+        touch_extension(dir.path(), "src/cfe/B");
+        let plan_for = |dependency_scope, group_a| {
+            let config = ProjectConfig {
+                diagnostics: partitioned_config(
+                    "baselines",
+                    if group_a {
+                        vec![DiagnosticsBaselineGroupConfig {
+                            name: "app".to_owned(),
+                            extensions: vec!["A".to_owned()],
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                ),
+                configuration_root: Some("src/cf".to_owned()),
+                extensions: Some(vec![
+                    ExtensionDecl::Structured(StructuredExtensionDecl {
+                        name: "B".to_owned(),
+                        path: "src/cfe/B".to_owned(),
+                        depends_on: Vec::new(),
+                        scope: dependency_scope,
+                    }),
+                    ExtensionDecl::Structured(StructuredExtensionDecl {
+                        name: "A".to_owned(),
+                        path: "src/cfe/A".to_owned(),
+                        depends_on: vec!["B".to_owned()],
+                        scope: bsl_metadata::ExtensionScope::InfoBase,
+                    }),
+                ]),
+                ..Default::default()
+            };
+            let project = Project::with_config(dir.path(), config).unwrap();
+            project.diagnostics_baseline_partition_plan().unwrap().unwrap()
+        };
+
+        let info_base = plan_for(bsl_metadata::ExtensionScope::InfoBase, false);
+        let data_separation = plan_for(bsl_metadata::ExtensionScope::DataSeparation, false);
+        let grouped_info_base = plan_for(bsl_metadata::ExtensionScope::InfoBase, true);
+        let grouped_data_separation = plan_for(bsl_metadata::ExtensionScope::DataSeparation, true);
+        assert_ne!(info_base.project_scope_fingerprint, data_separation.project_scope_fingerprint);
+        assert_ne!(info_base.selection_fingerprint, data_separation.selection_fingerprint);
+        let extension_identity = |plan: &DiagnosticsBaselinePartitionPlan| {
+            plan.partitions.iter().find(|part| part.id == "extension:A").unwrap().identity.clone()
+        };
+        let group_identity = |plan: &DiagnosticsBaselinePartitionPlan| {
+            plan.partitions.iter().find(|part| part.id == "group:app").unwrap().identity.clone()
+        };
+        assert_ne!(extension_identity(&info_base), extension_identity(&data_separation));
+        assert_ne!(group_identity(&grouped_info_base), group_identity(&grouped_data_separation));
+    }
+
     /// Extension names in 1C configurations are Russian, and a byte-counted bound
     /// would reject an ordinary one at half the length it allows in Latin.
     #[test]
@@ -6454,11 +6750,8 @@ include = ["main", "extension:Sales"]
             extensions: Some(vec!["src/cfe/A".into()]),
             ..Default::default()
         };
-        let error = Project::with_config(dir.path(), legacy)
-            .unwrap()
-            .diagnostics_baseline_partition_plan()
-            .unwrap_err();
-        assert!(matches!(error, DiagnosticsBaselineProjectError::LegacyExtension(_)));
+        let error = Project::with_config(dir.path(), legacy).unwrap_err();
+        assert!(matches!(error, ProjectError::Topology(TopologyError::MissingScope { .. })));
 
         let nested_dir = tempdir().unwrap();
         write_configuration_xml(&nested_dir.path().join("src"), "<xml/>");
@@ -7012,6 +7305,7 @@ mod external_root_tests {
             name: name.to_string(),
             path: path.to_string(),
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            scope: bsl_metadata::ExtensionScope::InfoBase,
         })
     }
 
@@ -7541,8 +7835,8 @@ externals = [
         let scope_json = serde_json::to_string(&plan.project_scope).unwrap();
         assert_eq!(
             scope_json,
-            r#"{"source_root":"src/cf","extensions":[{"name":"A","path":"src/cfe/A","depends_on":[]}],"externals":[{"name":"E","path":"src/epf/E"}]}"#,
-            "an external without dependsOn serializes as it did before the key existed"
+            r#"{"source_root":"src/cf","extensions":[{"name":"A","path":"src/cfe/A","scope":"InfoBase","depends_on":[]}],"externals":[{"name":"E","path":"src/epf/E"}]}"#,
+            "extension scope is serialized while an external without dependsOn stays unchanged"
         );
         assert_eq!(
             plan.owner_for_project_path("src/epf/E/E/Ext/ObjectModule.bsl"),
@@ -7716,8 +8010,8 @@ externals = [
         // `X` already exports, `src/erf/x` collides with the discovered name
         // `X`, and `арм` with the extension's name (case-folded): each is skipped.
         assert_eq!(names_with(Some(vec![structured("АРМ", "src/cfe/АРМ", &[])])), ["X", "Свой"]);
-        // A legacy extension of that name too: the extension keeps its slot.
-        assert_eq!(names_with(Some(vec!["src/cfe/АРМ".into()])), ["X", "Свой"]);
+        // A structured extension of that name too: the extension keeps its slot.
+        assert_eq!(names_with(Some(vec![structured("АРМ", "src/cfe/АРМ", &[])])), ["X", "Свой"]);
 
         // The control: declared, the collision with the structured name is the
         // duplicate it always was.
@@ -7766,21 +8060,6 @@ externals = [
         assert_eq!(
             plan.owner_for_project_path("src/epf/А/А/Ext/ObjectModule.bsl"),
             Some("external:А")
-        );
-
-        // The control: a legacy extension is still what the gate refuses.
-        touch_extension(dir.path(), "src/cfe/Legacy");
-        let legacy = ProjectConfig {
-            extensions: Some(vec![structured("A", "src/cfe/A", &[]), "src/cfe/Legacy".into()]),
-            ..config
-        };
-        let err = Project::with_config(dir.path(), legacy)
-            .unwrap()
-            .diagnostics_baseline_partition_plan()
-            .unwrap_err();
-        assert!(
-            matches!(err, super::DiagnosticsBaselineProjectError::LegacyExtension(ref name) if name == "Legacy"),
-            "{err:?}"
         );
     }
 

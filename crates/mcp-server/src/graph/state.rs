@@ -7470,8 +7470,8 @@ mod tests {
             )
             .unwrap();
         };
-        let both = "  { name = \"a\", path = \"ext/a\" },\n  { name = \"b\", path = \"ext/b\" },\n";
-        let only_a = "  { name = \"a\", path = \"ext/a\" },\n";
+        let both = "  { name = \"a\", path = \"ext/a\", scope = \"InfoBase\" },\n  { name = \"b\", path = \"ext/b\", scope = \"InfoBase\" },\n";
+        let only_a = "  { name = \"a\", path = \"ext/a\", scope = \"InfoBase\" },\n";
         declare(both);
 
         // A subtree that cannot be walked, so the verdict of a complete walk and of a short
@@ -7504,7 +7504,7 @@ mod tests {
                 }
                 fs::write(
                     root.join("bsl-analyzer.toml"),
-                    "[source]\nroot = \"src\"\nextensions = [\n  { name = \"a\", path = \"ext/a\" },\n]\n",
+                    "[source]\nroot = \"src\"\nextensions = [\n  { name = \"a\", path = \"ext/a\", scope = \"InfoBase\" },\n]\n",
                 )
                 .unwrap();
                 // Another owner reads the new declaration and refreshes every cache a
@@ -7779,8 +7779,8 @@ mod tests {
             )
             .unwrap();
         };
-        let both = "  { name = \"a\", path = \"ext/a\" },\n  { name = \"b\", path = \"ext/b\" },\n";
-        let only_a = "  { name = \"a\", path = \"ext/a\" },\n";
+        let both = "  { name = \"a\", path = \"ext/a\", scope = \"InfoBase\" },\n  { name = \"b\", path = \"ext/b\", scope = \"InfoBase\" },\n";
+        let only_a = "  { name = \"a\", path = \"ext/a\", scope = \"InfoBase\" },\n";
 
         // One module under the root that is always declared — the anchor — and one under the
         // root that comes and goes. Both unreadable, so both are obligations.
@@ -8781,8 +8781,8 @@ mod tests {
             )
             .unwrap();
         };
-        let both = "  { name = \"a\", path = \"ext/a\" },\n  { name = \"b\", path = \"ext/b\" },\n";
-        let only_a = "  { name = \"a\", path = \"ext/a\" },\n";
+        let both = "  { name = \"a\", path = \"ext/a\", scope = \"InfoBase\" },\n  { name = \"b\", path = \"ext/b\", scope = \"InfoBase\" },\n";
+        let only_a = "  { name = \"a\", path = \"ext/a\", scope = \"InfoBase\" },\n";
         declare(both);
         let graph = GraphState::for_workspace(root.to_path_buf());
 

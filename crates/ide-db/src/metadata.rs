@@ -86,6 +86,9 @@ pub(crate) mod heap_estimate {
             + stdx::heap::vec_bytes::<std::path::PathBuf>(snapshot.canonical_paths.len())
             + snapshot.canonical_paths.iter().map(|p| p.capacity()).sum::<usize>()
             + stdx::heap::vec_bytes::<super::RootKind>(snapshot.kinds.len())
+            + stdx::heap::vec_bytes::<Option<bsl_metadata::ExtensionScope>>(
+                snapshot.extension_scopes.len(),
+            )
             + stdx::heap::vec_bytes::<Vec<usize>>(snapshot.closures.len())
             + snapshot
                 .closures
@@ -113,6 +116,7 @@ pub(crate) mod heap_estimate {
             Arc<Vec<super::WebServiceEntry>>,
             Arc<Vec<super::IntegrationServiceEntry>>,
             Arc<Vec<super::SubsystemEntry>>,
+            Arc<Vec<super::CommonAttributeEntry>>,
         ),
     ) -> usize {
         let (
@@ -126,6 +130,7 @@ pub(crate) mod heap_estimate {
             web_services,
             integration_services,
             subsystems,
+            common_attributes,
         ) = fields;
 
         stdx::heap::vec_bytes::<super::MdoEntry>(entries.len())
@@ -148,6 +153,8 @@ pub(crate) mod heap_estimate {
             + integration_services.iter().map(|e| e.name.capacity()).sum::<usize>()
             + stdx::heap::vec_bytes::<super::SubsystemEntry>(subsystems.len())
             + subsystems.iter().map(|e| e.name.capacity()).sum::<usize>()
+            + stdx::heap::vec_bytes::<super::CommonAttributeEntry>(common_attributes.len())
+            + common_attributes.iter().map(|e| e.name.capacity()).sum::<usize>()
     }
 
     /// A `resolve_metadata_object` result is a clone of an `Arc` owned by
@@ -160,6 +167,22 @@ pub(crate) mod heap_estimate {
     /// `Arc` owned by `parse_register_query`; the payload is counted there once.
     pub(crate) fn shared_register_heap(_v: &Option<Arc<bsl_metadata::Register>>) -> usize {
         0
+    }
+
+    pub(crate) fn common_attribute_set_heap(v: &Arc<bsl_metadata::CommonAttributeSet>) -> usize {
+        stdx::heap::vec_bytes::<bsl_metadata::CommonAttribute>(v.attributes.len())
+            + v.attributes
+                .iter()
+                .map(|a| {
+                    a.name.capacity()
+                        + a.attr_type.estimated_heap_size()
+                        + stdx::heap::map_table_bytes::<
+                            (bsl_metadata::MdoType, String),
+                            bsl_metadata::CommonAttributeUse,
+                        >(a.content.len())
+                        + a.content.keys().map(|(_, name)| name.capacity()).sum::<usize>()
+                })
+                .sum::<usize>()
     }
 
     /// A `resolve_common_module`/`resolve_common_module_by_file` result is a
@@ -384,6 +407,8 @@ pub struct WorkspaceConfigsSnapshot {
     pub paths: Vec<(Option<String>, PathBuf)>,
     /// Per entry (same order as `paths`): what the root is.
     pub kinds: Vec<RootKind>,
+    /// Installation scope per root; base and external roots have no extension scope.
+    pub extension_scopes: Vec<Option<bsl_metadata::ExtensionScope>>,
     /// Canonicalized counterpart of `paths` (same order) — what per-file
     /// longest-prefix matching uses, so a symlinked workspace still matches.
     pub canonical_paths: Vec<PathBuf>,
@@ -420,9 +445,11 @@ impl WorkspaceConfigsSnapshot {
         let closures = vec![Vec::new(); paths.len()];
         let topological_order = (0..paths.len()).collect();
         let kinds = RootKind::from_labels(&paths);
+        let extension_scopes = vec![None; paths.len()];
         Self {
             paths,
             kinds,
+            extension_scopes,
             canonical_paths,
             closures,
             topological_order,
@@ -439,6 +466,7 @@ impl WorkspaceConfigsSnapshot {
         let topology = project.extension_topology();
         let mut paths: Vec<(Option<String>, PathBuf)> = Vec::new();
         let mut kinds: Vec<RootKind> = Vec::new();
+        let mut extension_scopes = Vec::new();
         let mut canonical_paths = Vec::new();
         let mut closures: Vec<Vec<usize>> = Vec::new();
         let base = project.semantic_base_path();
@@ -448,10 +476,12 @@ impl WorkspaceConfigsSnapshot {
             let canonical_base = std::fs::canonicalize(&base).unwrap_or_else(|_| base.clone());
             paths.push((None, base));
             kinds.push(RootKind::Base);
+            extension_scopes.push(None);
             canonical_paths.push(canonical_base);
             closures.push(Vec::new());
         }
         for node in topology.nodes() {
+            extension_scopes.push(node.scope());
             paths.push((Some(node.name().to_string()), node.path().to_path_buf()));
             canonical_paths.push(node.canonical_path().to_path_buf());
             kinds.push(match node.kind() {
@@ -468,6 +498,7 @@ impl WorkspaceConfigsSnapshot {
         Self {
             paths,
             kinds,
+            extension_scopes,
             canonical_paths,
             closures,
             topological_order,
@@ -648,6 +679,23 @@ fn source_exclusions_for<'db>(
         .unwrap_or_default()
 }
 
+/// Project the owner kind and scope so unrelated snapshot changes can be backdated.
+#[salsa::tracked]
+pub(crate) fn configuration_context(
+    db: &dyn salsa::Database,
+    path: ConfigurationPathInput<'_>,
+) -> Option<(RootKind, Option<bsl_metadata::ExtensionScope>)> {
+    let snapshot = WorkspaceConfigsInput::try_get(db)?.snapshot(db);
+    let requested = path.path(db);
+    snapshot.paths.iter().enumerate().find_map(|(idx, (_, configured))| {
+        let canonical = &snapshot.canonical_paths[idx];
+        [configured, canonical]
+            .into_iter()
+            .any(|p| canonicalize_configuration_path(&p.to_string_lossy()) == *requested)
+            .then(|| (snapshot.kinds[idx], snapshot.extension_scopes[idx]))
+    })
+}
+
 /// The base configuration merged with one extension's overlay, memoised per
 /// (base, extension) path pair. `Configuration::merged_with_extension` deep-clones the
 /// whole base configuration, so without this every metadata lookup of every extension
@@ -671,7 +719,12 @@ pub fn merged_configuration<'db>(
     // every batch re-run the whole-config XML load inside the worker pool.
     let main = db.load_configuration(main_input);
     let extension = db.load_configuration(extension_input);
-    Arc::new(main.merged_with_extension(&extension))
+    let scope =
+        configuration_context(db.as_dyn_database(), extension_input).and_then(|(_, scope)| scope);
+    let base_attributes = configuration_context(db.as_dyn_database(), main_input)
+        .filter(|(kind, _)| *kind == RootKind::Base)
+        .map(|_| main.common_attribute_set());
+    Arc::new(main.merged_with_extension(&extension, scope, base_attributes))
 }
 
 /// An ordered visibility chain of config roots: the base first, then the
@@ -704,12 +757,35 @@ pub fn chain_configuration<'db>(
     let inputs = chain.inputs(db.as_dyn_database());
     match inputs.split_last() {
         None => Arc::new(Configuration::new("Configuration")),
-        Some((only, [])) => db.load_configuration(*only),
+        Some((only, [])) => {
+            let config = db.load_configuration(*only);
+            match configuration_context(db.as_dyn_database(), *only) {
+                Some((RootKind::Extension, Some(scope))) => {
+                    let mut standalone = (*config).clone();
+                    standalone.apply_extension_common_attributes(*scope);
+                    Arc::new(standalone)
+                }
+                _ => config,
+            }
+        }
         Some((last, prefix)) => {
             let prefix_chain = ConfigChainInput::new(db.as_dyn_database(), prefix.to_vec());
             let base = chain_configuration(db, prefix_chain);
             let overlay = db.load_configuration(*last);
-            Arc::new(base.merged_with_extension(&overlay))
+            let scope =
+                configuration_context(db.as_dyn_database(), *last).and_then(|(_, scope)| scope);
+            let main = inputs
+                .iter()
+                .find(|input| {
+                    configuration_context(db.as_dyn_database(), **input)
+                        .is_some_and(|(kind, _)| kind == RootKind::Base)
+                })
+                .map(|input| db.load_configuration(*input));
+            Arc::new(base.merged_with_extension(
+                &overlay,
+                scope,
+                main.as_ref().map(|main| main.common_attribute_set()),
+            ))
         }
     }
 }
@@ -718,6 +794,9 @@ pub fn chain_configuration<'db>(
 /// optional `Ext/Predefined.xml`, plus the kind that selects the parser. Interned
 /// so [`parse_mdo_query`] keys on the file identities; the per-file content
 /// revisions drive invalidation, so editing one MDO's XML re-parses only it.
+///
+/// `listing` is the config root the object belongs to: its common attributes add fields to
+/// the object, so the parse attaches them and the object is held once, already complete.
 #[salsa::interned(debug, heap_size = stdx::heap::zero)]
 pub struct MdoFiles<'db> {
     #[returns(copy)]
@@ -726,6 +805,8 @@ pub struct MdoFiles<'db> {
     pub main: vfs::FileId,
     #[returns(copy)]
     pub predefined: Option<vfs::FileId>,
+    #[returns(copy)]
+    pub listing: MetadataListingInput,
 }
 
 /// Whether a loose-XML metadata object's discovery key (its file stem) disagrees
@@ -769,12 +850,17 @@ pub fn parse_mdo_query<'db>(
     let main_text = db.file_text_ref(files.main(db));
     let predefined_text = files.predefined(db).map(|fid| db.file_text_ref(fid));
 
-    bsl_metadata::parse_metadata_object_from_texts(
+    let mut object = bsl_metadata::parse_metadata_object_from_texts(
         files.mdo_type(db),
         main_text,
         predefined_text.map(|t| &**t),
-    )
-    .map(Arc::new)
+    )?;
+    let applied =
+        common_attribute_set(db, files.listing(db)).for_object(object.mdo_type, &object.name);
+    if !applied.is_empty() {
+        object.set_common_attributes(applied);
+    }
+    Some(Arc::new(object))
 }
 
 /// One discovered metadata object in a config root's *structure* listing: which
@@ -885,6 +971,15 @@ pub struct SubsystemEntry {
     pub main: vfs::FileId,
 }
 
+/// One discovered common attribute in a config root's *structure* listing: its name and the
+/// [`vfs::FileId`] of its XML (`CommonAttributes/<Name>.xml`). Common attributes are read as a
+/// set per root ([`common_attribute_set`]) because each one may add a field to any object.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CommonAttributeEntry {
+    pub name: String,
+    pub main: vfs::FileId,
+}
+
 /// One config root's discovered metadata listing, grouped for the database setter
 /// while keeping each metadata family typed separately.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -899,6 +994,7 @@ pub struct MetadataListingData {
     pub web_services: Vec<WebServiceEntry>,
     pub integration_services: Vec<IntegrationServiceEntry>,
     pub subsystems: Vec<SubsystemEntry>,
+    pub common_attributes: Vec<CommonAttributeEntry>,
 }
 
 /// The per-config-root *structure* input: the MDOs and defined types that exist in
@@ -921,6 +1017,7 @@ pub struct MetadataListingInput {
     pub web_services: Arc<Vec<WebServiceEntry>>,
     pub integration_services: Arc<Vec<IntegrationServiceEntry>>,
     pub subsystems: Arc<Vec<SubsystemEntry>>,
+    pub common_attributes: Arc<Vec<CommonAttributeEntry>>,
 }
 
 /// The composing-file identities for one MDO, as held in a [`ConfigIndex`].
@@ -987,6 +1084,24 @@ pub fn config_index(
     Arc::new(ConfigIndex { by_name, register_by_name })
 }
 
+/// Every common attribute of one config root, read through the versioned VFS. Depends on the
+/// listing's `common_attributes` family and on the content of those files only, so editing an
+/// object's XML leaves it memoised. A file that does not parse marks the set unreadable.
+#[salsa::tracked(heap_size = heap_estimate::common_attribute_set_heap, returns(clone))]
+pub fn common_attribute_set(
+    db: &dyn base_db::SourceDatabase,
+    listing: MetadataListingInput,
+) -> Arc<bsl_metadata::CommonAttributeSet> {
+    let _span = tracing::info_span!("common_attribute_set").entered();
+
+    let mut set = bsl_metadata::CommonAttributeSet::default();
+    for entry in listing.common_attributes(db).iter() {
+        let text = db.file_text_ref(entry.main);
+        set.push_parsed(bsl_metadata::parse_common_attribute_from_text(text));
+    }
+    Arc::new(set)
+}
+
 /// Resolve a single metadata object within one config root, at per-MDO Salsa
 /// granularity. Depends on [`config_index`] (structure) to map the name to its
 /// files, then on [`parse_mdo_query`] (content) for that one MDO. A content edit
@@ -1005,7 +1120,7 @@ pub fn resolve_metadata_object(
 
     let index = config_index(db, listing);
     let ids = index.lookup(mdo_type, &name)?;
-    let files = MdoFiles::new(db, mdo_type, ids.main, ids.predefined);
+    let files = MdoFiles::new(db, mdo_type, ids.main, ids.predefined, listing);
     let object = parse_mdo_query(db, files)?;
     warn_on_stem_name_divergence(mdo_type.english_name(), &name, &object.name);
     Some(object)
@@ -1024,7 +1139,13 @@ pub fn parse_register_query(
     let _span = tracing::info_span!("parse_register").entered();
 
     let main_text = db.file_text_ref(files.main(db));
-    bsl_metadata::parse_register_from_text(files.mdo_type(db), main_text).map(Arc::new)
+    let mut register = bsl_metadata::parse_register_from_text(files.mdo_type(db), main_text)?;
+    let common = common_attribute_set(db, files.listing(db));
+    let applied = common.for_object(register.mdo_type(), register.name());
+    if !applied.is_empty() {
+        register.set_common_attributes(applied);
+    }
+    Some(Arc::new(register))
 }
 
 /// Resolve a single register within one config root, the register counterpart of
@@ -1042,7 +1163,7 @@ pub fn resolve_register(
 
     let index = config_index(db, listing);
     let ids = index.lookup(mdo_type, &name)?;
-    let files = MdoFiles::new(db, mdo_type, ids.main, ids.predefined);
+    let files = MdoFiles::new(db, mdo_type, ids.main, ids.predefined, listing);
     let register = parse_register_query(db, files)?;
     warn_on_stem_name_divergence(mdo_type.english_name(), &name, register.name());
     Some(register)
@@ -1064,7 +1185,7 @@ pub fn resolve_register_by_name(
 
     let index = config_index(db, listing);
     let (kind, ids) = index.lookup_register_by_name(&name)?;
-    let files = MdoFiles::new(db, kind, ids.main, ids.predefined);
+    let files = MdoFiles::new(db, kind, ids.main, ids.predefined, listing);
     let register = parse_register_query(db, files)?;
     warn_on_stem_name_divergence(kind.english_name(), &name, register.name());
     Some(register)
@@ -2378,7 +2499,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             dir.path().join("bsl-analyzer.toml"),
-            "[source]\nextensions = [\"Расширения/Feature\"]\n",
+            "[source]\nextensions = [{ name = \"Feature\", path = \"Расширения/Feature\", scope = \"InfoBase\" }]\n",
         )
         .unwrap();
 
@@ -2392,6 +2513,7 @@ mod tests {
         assert_eq!(snapshot.topological_order, vec![0]);
         assert_eq!(snapshot.closures, vec![Vec::<usize>::new()]);
         assert_eq!(snapshot.kinds, vec![super::RootKind::Extension]);
+        assert_eq!(snapshot.extension_scopes, vec![Some(bsl_metadata::ExtensionScope::InfoBase)]);
     }
 
     /// An external object declared first still lands after every extension, sees
@@ -2422,8 +2544,8 @@ mod tests {
             "[source]\nroot = \"src/cf\"\n\
              externals = [{ name = \"EPF\", path = \"src/epf/Обработка\" }]\n\
              extensions = [\n\
-               { name = \"A\", path = \"src/cfe/A\", dependsOn = [\"B\"] },\n\
-               { name = \"B\", path = \"src/cfe/B\" },\n\
+               { name = \"A\", path = \"src/cfe/A\", scope = \"DataSeparation\", dependsOn = [\"B\"] },\n\
+               { name = \"B\", path = \"src/cfe/B\", scope = \"InfoBase\" },\n\
              ]\n",
         )
         .unwrap();
@@ -2434,6 +2556,15 @@ mod tests {
         let labels: Vec<Option<&str>> =
             snapshot.paths.iter().map(|(label, _)| label.as_deref()).collect();
         assert_eq!(labels, vec![None, Some("A"), Some("B"), Some("EPF")]);
+        assert_eq!(
+            snapshot.extension_scopes,
+            vec![
+                None,
+                Some(bsl_metadata::ExtensionScope::DataSeparation),
+                Some(bsl_metadata::ExtensionScope::InfoBase),
+                None
+            ]
+        );
         assert_eq!(
             snapshot.kinds,
             vec![

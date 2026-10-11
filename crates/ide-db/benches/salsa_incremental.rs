@@ -225,7 +225,7 @@ fn bench_metadata_revalidation_after_bsl_edit(c: &mut Criterion) {
         db.set_file_text(FileId(1000 + i), &catalog_xml(&format!("Справочник{i}"), i));
     }
 
-    db.set_all_config_paths(vec![(None, PathBuf::from("/cfg"))]);
+    db.set_all_config_paths(vec![(None, PathBuf::from("/cfg"))], None);
     let entries: Vec<MdoEntry> = (0..NUM_MDOS)
         .map(|i| MdoEntry {
             kind: bsl_metadata::MdoType::Catalog,
@@ -237,6 +237,7 @@ fn bench_metadata_revalidation_after_bsl_edit(c: &mut Criterion) {
     db.set_metadata_listing(
         "/cfg",
         MetadataListingData {
+            common_attributes: Vec::new(),
             entries,
             defined_types: Vec::new(),
             common_modules: Vec::new(),

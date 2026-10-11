@@ -43,6 +43,7 @@ fn a_cli_source_set_changes_the_backend_identity() {
                 name: "EXT".to_owned(),
                 path: "ext".to_owned(),
                 depends_on: Vec::new(),
+                scope: bsl_metadata::ExtensionScope::InfoBase,
             })]),
             externals: None,
         }),

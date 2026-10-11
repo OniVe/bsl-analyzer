@@ -703,8 +703,18 @@ impl RootDatabaseImpl {
     /// bootstrapped once its own roots are listed, and the readers that take a
     /// single side read the file's visibility chain instead of a base — see
     /// [`Self::substrate_listings`].
-    pub fn set_all_config_paths(&mut self, paths: Vec<(Option<String>, std::path::PathBuf)>) {
-        self.set_workspace_configs_snapshot(metadata::WorkspaceConfigsSnapshot::from_paths(paths));
+    pub fn set_all_config_paths(
+        &mut self,
+        paths: Vec<(Option<String>, std::path::PathBuf)>,
+        extension_scope: Option<bsl_metadata::ExtensionScope>,
+    ) {
+        let mut snapshot = metadata::WorkspaceConfigsSnapshot::from_paths(paths);
+        snapshot.extension_scopes = snapshot
+            .kinds
+            .iter()
+            .map(|kind| if *kind == metadata::RootKind::Extension { extension_scope } else { None })
+            .collect();
+        self.set_workspace_configs_snapshot(snapshot);
     }
 
     /// Set the full workspace-configs snapshot (roots + dependency closures +
@@ -731,6 +741,18 @@ impl RootDatabaseImpl {
             snapshot.paths.len(),
             snapshot.kinds.len(),
             "workspace-configs snapshot: kinds must parallel paths"
+        );
+        assert_eq!(
+            snapshot.paths.len(),
+            snapshot.extension_scopes.len(),
+            "workspace-configs snapshot: extension_scopes must parallel paths"
+        );
+        assert!(
+            snapshot.kinds.iter().zip(&snapshot.extension_scopes).all(|(kind, scope)| {
+                matches!((kind, scope), (metadata::RootKind::Extension, Some(_)))
+                    || (*kind != metadata::RootKind::Extension && scope.is_none())
+            }),
+            "workspace-configs snapshot: every extension requires an explicit Scope"
         );
         assert!(
             snapshot.closures.iter().flatten().all(|&dep| dep < snapshot.paths.len()),
@@ -840,6 +862,7 @@ impl RootDatabaseImpl {
             web_services,
             integration_services,
             subsystems,
+            common_attributes,
         } = listing;
         let entries = Arc::new(entries);
         let defined_types = Arc::new(defined_types);
@@ -851,6 +874,7 @@ impl RootDatabaseImpl {
         let web_services = Arc::new(web_services);
         let integration_services = Arc::new(integration_services);
         let subsystems = Arc::new(subsystems);
+        let common_attributes = Arc::new(common_attributes);
         match self.metadata_listings.get(&key).map(|e| *e.value()) {
             Some(input) => {
                 input.set_entries(self).to(entries);
@@ -863,6 +887,7 @@ impl RootDatabaseImpl {
                 input.set_web_services(self).to(web_services);
                 input.set_integration_services(self).to(integration_services);
                 input.set_subsystems(self).to(subsystems);
+                input.set_common_attributes(self).to(common_attributes);
             }
             None => {
                 let input = metadata::MetadataListingInput::builder(
@@ -876,6 +901,7 @@ impl RootDatabaseImpl {
                     web_services,
                     integration_services,
                     subsystems,
+                    common_attributes,
                 )
                 .durability(salsa::Durability::MEDIUM)
                 .new(self);
@@ -1041,6 +1067,27 @@ impl RootDatabaseImpl {
         names.into_iter().filter(|name| seen.insert(name.fold_lower())).collect()
     }
 
+    fn extension_common_attributes_for_listing(
+        &self,
+        listing: metadata::MetadataListingInput,
+        main_listing: Option<metadata::MetadataListingInput>,
+        mdo_type: bsl_metadata::MdoType,
+        name: &str,
+    ) -> Option<bsl_metadata::ObjectCommonAttributes> {
+        let snapshot = self.workspace_configs_snapshot();
+        let owner = snapshot.paths.iter().enumerate().find_map(|(idx, (_, path))| {
+            (self.metadata_listing(&path.to_string_lossy()) == Some(listing)).then_some(idx)
+        })?;
+        if snapshot.kinds[owner] != metadata::RootKind::Extension {
+            return None;
+        }
+        let scope = snapshot.extension_scopes[owner]
+            .expect("registered extension requires an explicit Scope");
+        let local = metadata::common_attribute_set(self, listing);
+        let main = main_listing.map(|listing| metadata::common_attribute_set(self, listing));
+        Some(local.for_extension_object(main.as_deref(), scope, mdo_type, name))
+    }
+
     /// Resolve a single metadata object visible to `file_id` at per-MDO Salsa
     /// granularity, composing the main config with the file's applicable extension
     /// via [`MetadataObject::apply_extension_overlay`] (or whichever side alone
@@ -1071,22 +1118,31 @@ impl RootDatabaseImpl {
                 .map(Arc::new);
         }
 
-        let resolve_in = |listing: Option<metadata::MetadataListingInput>| {
-            listing.and_then(|l| {
-                metadata::resolve_metadata_object(self, l, mdo_type, name.to_string())
-            })
-        };
         // Forward overlay composition: the base result first, then each chain
         // root's overlay in dependency order, the file's own extension last.
-        let hits = std::iter::once(resolve_in(main_listing))
-            .chain(chain_listings.into_iter().map(resolve_in))
-            .flatten();
         let mut merged: Option<bsl_metadata::MetadataObject> = None;
-        for overlay in hits {
+        for listing in main_listing.into_iter().chain(chain_listings.into_iter().flatten()) {
+            let Some(parsed) =
+                metadata::resolve_metadata_object(self, listing, mdo_type, name.to_string())
+            else {
+                continue;
+            };
+            let mut overlay = (*parsed).clone();
+            if let Some(mut common) =
+                self.extension_common_attributes_for_listing(listing, main_listing, mdo_type, name)
+            {
+                if bsl_metadata::kind_takes_common_attributes(mdo_type)
+                    && overlay.object_belonging == bsl_metadata::ObjectBelonging::Adopted
+                    && !merged.as_ref().is_some_and(|base| overlay.adopts(base))
+                {
+                    common.open = true;
+                }
+                overlay.set_common_attributes(common);
+            }
             match &mut merged {
                 Some(base) if overlay.adopts(base) => base.apply_extension_overlay(&overlay),
-                Some(base) => *base = (*overlay).clone(),
-                None => merged = Some((*overlay).clone()),
+                Some(base) => *base = overlay,
+                None => merged = Some(overlay),
             }
         }
         merged.map(Arc::new)
@@ -1115,18 +1171,31 @@ impl RootDatabaseImpl {
                 .map(Arc::new);
         }
 
-        let resolve_in = |listing: Option<metadata::MetadataListingInput>| {
-            listing.and_then(|l| metadata::resolve_register(self, l, mdo_type, name.to_string()))
-        };
-        let mut hits = std::iter::once(resolve_in(main_listing))
-            .chain(chain_listings.into_iter().map(resolve_in))
-            .flatten();
-        let first = hits.next()?;
         let mut merged: Option<bsl_metadata::Register> = None;
-        for overlay in hits {
-            merged.get_or_insert_with(|| (*first).clone()).apply_extension_overlay(&overlay);
+        for listing in main_listing.into_iter().chain(chain_listings.into_iter().flatten()) {
+            let Some(parsed) =
+                metadata::resolve_register(self, listing, mdo_type, name.to_string())
+            else {
+                continue;
+            };
+            let mut overlay = (*parsed).clone();
+            if let Some(mut common) =
+                self.extension_common_attributes_for_listing(listing, main_listing, mdo_type, name)
+            {
+                if overlay.object_belonging() == bsl_metadata::ObjectBelonging::Adopted
+                    && !merged.as_ref().is_some_and(|base| overlay.adopts(base))
+                {
+                    common.open = true;
+                }
+                overlay.set_common_attributes(common);
+            }
+            match &mut merged {
+                Some(base) if overlay.adopts(base) => base.apply_extension_overlay(&overlay),
+                Some(base) => *base = overlay,
+                None => merged = Some(overlay),
+            }
         }
-        Some(merged.map(Arc::new).unwrap_or(first))
+        merged.map(Arc::new)
     }
 
     /// Resolve a register visible to `file_id` by NAME alone (its kind unknown to
@@ -1149,27 +1218,45 @@ impl RootDatabaseImpl {
                 .map(Arc::new);
         }
 
-        let resolve_in = |listing: Option<metadata::MetadataListingInput>| {
-            listing.and_then(|l| metadata::resolve_register_by_name(self, l, name.to_string()))
-        };
         // Same name along the chain: the WINNING kind is the last (most
         // dependent) hit's kind — a same-name register of a different kind is
         // not a borrow, so the later root's replaces outright, mirroring
         // `merge_extension_overlay`. All hits OF the winning kind then merge in
         // chain order, so a base register still contributes its fields when an
         // intervening dependency declared an unrelated kind under the name.
-        let hits: Vec<Arc<bsl_metadata::Register>> = std::iter::once(resolve_in(main_listing))
-            .chain(chain_listings.into_iter().map(resolve_in))
-            .flatten()
+        let hits: Vec<_> = main_listing
+            .into_iter()
+            .chain(chain_listings.into_iter().flatten())
+            .filter_map(|listing| {
+                metadata::resolve_register_by_name(self, listing, name.to_string())
+                    .map(|register| (listing, register))
+            })
             .collect();
-        let winning_kind = hits.last()?.mdo_type();
-        let mut same_kind = hits.iter().filter(|hit| hit.mdo_type() == winning_kind);
-        let first = same_kind.next()?.clone();
+        let winning_kind = hits.last()?.1.mdo_type();
         let mut merged: Option<bsl_metadata::Register> = None;
-        for overlay in same_kind {
-            merged.get_or_insert_with(|| (*first).clone()).apply_extension_overlay(overlay);
+        for (listing, parsed) in hits.into_iter().filter(|(_, hit)| hit.mdo_type() == winning_kind)
+        {
+            let mut overlay = (*parsed).clone();
+            if let Some(mut common) = self.extension_common_attributes_for_listing(
+                listing,
+                main_listing,
+                winning_kind,
+                name,
+            ) {
+                if overlay.object_belonging() == bsl_metadata::ObjectBelonging::Adopted
+                    && !merged.as_ref().is_some_and(|base| overlay.adopts(base))
+                {
+                    common.open = true;
+                }
+                overlay.set_common_attributes(common);
+            }
+            match &mut merged {
+                Some(base) if overlay.adopts(base) => base.apply_extension_overlay(&overlay),
+                Some(base) => *base = overlay,
+                None => merged = Some(overlay),
+            }
         }
-        Some(merged.map(Arc::new).unwrap_or(first))
+        merged.map(Arc::new)
     }
 
     /// The defined-type counterpart of [`resolve_metadata_object_for_file`]:
@@ -3184,7 +3271,6 @@ impl hir::ConfigsDatabase for RootDatabaseImpl {
             .collect();
         match chain_inputs.as_slice() {
             [] => None,
-            [only] => Some(self.load_configuration(*only)),
             _ => {
                 // Warm every prefix bottom-up so the recursive step inside
                 // `chain_configuration` always finds its sub-chain memoised:

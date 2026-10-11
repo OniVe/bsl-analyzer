@@ -4018,7 +4018,7 @@ mod tests {
         fs::write(&legitimate_build, "Процедура ИзBuild() КонецПроцедуры\n").unwrap();
         fs::write(
             workspace.join("bsl-analyzer.toml"),
-            "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"Neighbor\", path = \".derived/workspaces/v1-neighbor\" }]\n",
+            "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"Neighbor\", path = \".derived/workspaces/v1-neighbor\", scope = \"InfoBase\" }]\n",
         )
         .unwrap();
 
@@ -4325,7 +4325,7 @@ mod tests {
         // Only now is the extension part of the project.
         fs::write(
             workspace.join("bsl-analyzer.toml"),
-            "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"e\", path = \"ext\" }]\n",
+            "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"e\", path = \"ext\", scope = \"InfoBase\" }]\n",
         )
         .unwrap();
         let new_cache = resolved_workspace_cache(&workspace);
@@ -5013,6 +5013,89 @@ mod tests {
     }
 
     #[test]
+    fn workspace_cache_scope_change_invalidates_frozen_extension_scope() {
+        use std::time::Duration;
+
+        let workspace = tempdir().unwrap();
+        let cache_parent = tempdir().unwrap();
+        let root = workspace.path().to_path_buf();
+        let configuration = root.join("src/cf");
+        let extension = root.join("ext");
+        fs::create_dir_all(&configuration).unwrap();
+        fs::create_dir_all(&extension).unwrap();
+        fs::write(configuration.join("Configuration.xml"), "<Configuration/>").unwrap();
+        fs::write(
+            extension.join("Configuration.xml"),
+            "<Properties><ConfigurationExtensionPurpose>Customization</ConfigurationExtensionPurpose></Properties>",
+        )
+        .unwrap();
+        let project_file = root.join("bsl-analyzer.toml");
+        let config_for_scope = |scope: &str| {
+            format!(
+                "[source]\nroot = \"src/cf\"\nextensions = [{{ name = \"Feature\", path = \"ext\", scope = \"{scope}\" }}]\n"
+            )
+        };
+        fs::write(&project_file, config_for_scope("InfoBase")).unwrap();
+
+        let old_project = crate::project::at(&root).expect("InfoBase Project parses");
+        assert_eq!(old_project.extension_paths().len(), 1);
+        let cache_base = cache_parent.path().join("cache");
+        let old_cache = crate::cache::WorkspaceCacheLayout::for_project(
+            &old_project,
+            Some(&cache_base),
+            cache_parent.path(),
+            None,
+        )
+        .expect("old frozen scope resolves");
+        let old_leaf = old_cache.root().to_path_buf();
+        assert!(!old_leaf.exists());
+
+        let hub = WorkspaceChangeHub::start(vec![root.clone()]);
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        let owners = super::super::OwnerStop::default();
+        let transport_stop = tokio_util::sync::CancellationToken::new();
+        owners.set_scope_transport_stop(transport_stop.clone());
+        SharedState::start_scope_guard(
+            hub.clone(),
+            root.clone(),
+            old_cache.clone(),
+            owners.clone(),
+            transport_stop.clone(),
+        );
+        assert!(crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
+            hub.active_cursor_count() == 1
+        }));
+
+        // Scope is the only project input changed: the named extension and both source roots stay fixed.
+        fs::write(&project_file, config_for_scope("DataSeparation")).unwrap();
+        assert!(crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
+            owners.is_stopped() && transport_stop.is_cancelled()
+        }));
+        assert!(crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
+            hub.active_cursor_count() == 0
+        }));
+
+        let new_project = crate::project::at(&root).expect("DataSeparation Project parses");
+        assert_eq!(new_project.extension_paths(), old_project.extension_paths());
+        let new_cache = crate::cache::WorkspaceCacheLayout::for_project(
+            &new_project,
+            Some(&cache_base),
+            cache_parent.path(),
+            None,
+        )
+        .expect("new Project selects its own frozen scope");
+        assert_ne!(new_cache.root(), old_cache.root());
+
+        let error = SharedState::workspace_with_cache(root, old_cache)
+            .err()
+            .expect("the old frozen session must reconnect after scope drift");
+        assert!(error.to_string().contains("cache scope no longer matches"));
+        assert!(!old_leaf.exists(), "the invalidated session never creates its old cache leaf");
+        hub.shutdown();
+        assert!(owners.wait_empty(Duration::from_secs(1)));
+    }
+
+    #[test]
     fn workspace_cache_scope_supplied_layout_rejects_project_drift_before_cache_creation() {
         let workspace = tempdir().unwrap();
         let cache_parent = tempdir().unwrap();
@@ -5114,7 +5197,7 @@ mod tests {
         .unwrap();
         fs::write(
             ws.join("bsl-analyzer.toml"),
-            "[source]\nextensions = [\"Расширения/Feature\"]\n",
+            "[source]\nextensions = [{ name = \"Feature\", path = \"Расширения/Feature\", scope = \"InfoBase\" }]\n",
         )
         .unwrap();
 
@@ -5586,7 +5669,7 @@ mod tests {
         fs::write(
             workspace.join("bsl-analyzer.toml"),
             "[source]\nroot = \"src/cf\"\n\
-             extensions = [{ name = \"a\", path = \"ext-a\" }, { name = \"b\", path = \"ext-b\" }]\n",
+             extensions = [{ name = \"a\", path = \"ext-a\", scope = \"InfoBase\" }, { name = \"b\", path = \"ext-b\", scope = \"InfoBase\" }]\n",
         )
         .unwrap();
         (dir, workspace)
@@ -5923,7 +6006,7 @@ mod tests {
         fs::write(extension.join("Configuration.xml"), "<Configuration/>").unwrap();
         fs::write(
             workspace.join("bsl-analyzer.toml"),
-            "[source]\nroot = \"cf\"\nextensions = [{ name = \"extra\", path = \"extra-extension\" }]\n",
+            "[source]\nroot = \"cf\"\nextensions = [{ name = \"extra\", path = \"extra-extension\", scope = \"InfoBase\" }]\n",
         )
         .unwrap();
         assert!(
@@ -6128,8 +6211,8 @@ mod tests {
         fs::write(
             workspace.join("bsl-analyzer.toml"),
             "[source]\nroot = \"src/cf\"\n\
-             extensions = [{ name = \"inner\", path = \"src/cf/inner-ext\" }, \
-             { name = \"outer\", path = \".\" }]\n",
+             extensions = [{ name = \"inner\", path = \"src/cf/inner-ext\", scope = \"InfoBase\" }, \
+             { name = \"outer\", path = \".\", scope = \"InfoBase\" }]\n",
         )
         .unwrap();
         let project = crate::project::at(&workspace);
@@ -6207,7 +6290,7 @@ mod tests {
         }
         fs::write(
             workspace.join("bsl-analyzer.toml"),
-            "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"a\", path = \"ext-a\" }]\n",
+            "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"a\", path = \"ext-a\", scope = \"InfoBase\" }]\n",
         )
         .unwrap();
 
@@ -6296,7 +6379,7 @@ mod tests {
         // The extension is declared while the daemon is down.
         fs::write(
             workspace.join("bsl-analyzer.toml"),
-            "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"a\", path = \"ext-a\" }]\n",
+            "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"a\", path = \"ext-a\", scope = \"InfoBase\" }]\n",
         )
         .unwrap();
         let warm = SharedState::init_workspace_search_engine_unmanaged(

@@ -136,6 +136,7 @@ fn setup(external_sees_extension: bool) -> Fixture {
         (Some("АРМ".to_string()), external.clone()),
     ];
     db.set_workspace_configs_snapshot(WorkspaceConfigsSnapshot {
+        extension_scopes: vec![None, Some(bsl_metadata::ExtensionScope::InfoBase), None],
         canonical_paths: paths
             .iter()
             .map(|(_, path)| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
@@ -292,6 +293,12 @@ fn extension_metadata_external_dependency_selects_only_named_extension_metadata(
         (Some("АРМ".to_string()), external.clone()),
     ];
     db.set_workspace_configs_snapshot(WorkspaceConfigsSnapshot {
+        extension_scopes: vec![
+            None,
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+            None,
+        ],
         canonical_paths: paths
             .iter()
             .map(|(_, path)| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
@@ -443,10 +450,10 @@ fn extension_metadata_substrate_invalidates_module_diagnostics_and_added_columns
     }
     let object_text = "Процедура Тест()\nДок = Документы.Заказ.СоздатьДокумент();\nСтрока = Док.Товары.Добавить();\nСтрока.ПослеИзменения = 1;\nЗапрос = Новый Запрос(\"ВЫБРАТЬ Т.ПослеИзменения ИЗ Документ.Заказ.Товары КАК Т\");\nКонецПроцедуры";
     db.set_file_text(object_module, object_text);
-    db.set_all_config_paths(vec![
-        (None, base.clone()),
-        (Some("Расширение".to_string()), extension.clone()),
-    ]);
+    db.set_all_config_paths(
+        vec![(None, base.clone()), (Some("Расширение".to_string()), extension.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
     db.set_metadata_listing(
         &base.to_string_lossy(),
         MetadataListingData {
@@ -586,10 +593,10 @@ fn extension_metadata_filesystem_fallback_rereads_after_revision_bump() {
         db.set_file_source_root(file_id, SourceRootId(0));
         db.set_file_text(file_id, text);
     }
-    db.set_all_config_paths(vec![
-        (None, base.clone()),
-        (Some("Расширение".to_string()), extension.clone()),
-    ]);
+    db.set_all_config_paths(
+        vec![(None, base.clone()), (Some("Расширение".to_string()), extension.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
 
     assert_eq!(diagnostic_count(&db, common_file, DiagnosticCode::CommonModuleNameCached), 0);
     assert_eq!(diagnostic_count(&db, object_file, DiagnosticCode::UnresolvedField), 1);

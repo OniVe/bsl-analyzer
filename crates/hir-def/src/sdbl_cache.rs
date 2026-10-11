@@ -10,14 +10,21 @@ use crate::configs::ConfigsDatabase;
 use crate::{DefDatabase, DefWithBodyId, MethodId, MethodIdInput, ModuleId, SdblExprId};
 use cfg_types::ExprId;
 
-/// Db-backed metadata resolution for SDBL lowering: routes each lookup through
+/// Db-backed metadata resolution for SDBL lowering and completion: routes each lookup through
 /// the file-scoped per-MDO [`ConfigsDatabase`] accessors so lowering a query
 /// depends on just the metadata objects it references, not the whole merged
 /// `Configuration`. Mirrors hir-ty's `DbObjectResolver` but lives here because
 /// `sdbl_hir_for_file_query` only holds a `&dyn ConfigsDatabase`.
-struct DbSdblResolver<'a> {
+pub struct DbSdblResolver<'a> {
     db: &'a dyn ConfigsDatabase,
     file_id: FileId,
+}
+
+impl<'a> DbSdblResolver<'a> {
+    /// Resolve metadata in the source roots visible to this file.
+    pub fn new(db: &'a dyn ConfigsDatabase, file_id: FileId) -> Self {
+        Self { db, file_id }
+    }
 }
 
 impl std::fmt::Debug for DbSdblResolver<'_> {

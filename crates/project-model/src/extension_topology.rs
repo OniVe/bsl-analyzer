@@ -24,7 +24,7 @@ use stdx::case::fold_lower_per_char;
 /// recipe change confined to nodes whose own bytes change with it (the
 /// visibility mode of external objects) needs no bump: every such digest is
 /// new, and the unchanged nodes still digest as before.
-pub const TOPOLOGY_FORMAT_VERSION: u32 = 2;
+pub const TOPOLOGY_FORMAT_VERSION: u32 = 3;
 
 /// Index of a node inside [`ExtensionTopology`]; stable for the lifetime of
 /// the topology value it came from.
@@ -80,6 +80,9 @@ pub struct ExtensionNodeSpec {
     /// extension, with it exactly the declared closure — an empty one is the base
     /// alone.
     pub depends_on: Option<Vec<String>>,
+    /// Declared installation scope for an extension. Legacy/discovered
+    /// candidates remain unset until project exclusions have been applied.
+    pub scope: Option<bsl_metadata::ExtensionScope>,
     /// The name is a user-visible identity, unique among roots: duplicate names
     /// are errors and the node may own a baseline partition. Legacy string
     /// entries are not — they keep their historical lenient semantics.
@@ -96,6 +99,7 @@ pub struct ExtensionNode {
     closure: Vec<NodeId>,
     sees_every_extension: bool,
     structured: bool,
+    scope: Option<bsl_metadata::ExtensionScope>,
 }
 
 impl ExtensionNode {
@@ -138,6 +142,10 @@ impl ExtensionNode {
 
     pub fn is_structured(&self) -> bool {
         self.structured
+    }
+
+    pub fn scope(&self) -> Option<bsl_metadata::ExtensionScope> {
+        self.scope
     }
 }
 
@@ -201,6 +209,10 @@ pub enum TopologyError {
         path: PathBuf,
     },
     StructuredNotAnExtension {
+        name: String,
+        path: PathBuf,
+    },
+    MissingScope {
         name: String,
         path: PathBuf,
     },
@@ -301,6 +313,11 @@ impl fmt::Display for TopologyError {
             TopologyError::StructuredNotAnExtension { name, path } => {
                 write!(f, "extension '{name}': no Configuration.xml under {}", path.display())
             }
+            TopologyError::MissingScope { name, path } => write!(
+                f,
+                "extension '{name}' at {} has no scope; declare scope = \"InfoBase\" or \"DataSeparation\"",
+                path.display()
+            ),
             TopologyError::ExternalInDependency { from, name } => write!(
                 f,
                 "'{from}' depends on '{name}', but an external data processor or report \
@@ -416,13 +433,13 @@ impl ExtensionTopology {
                         return Err(TopologyError::UnknownDependency {
                             from: spec.name.clone(),
                             name: dep_name.clone(),
-                        })
+                        });
                     }
                     Some(NameSlot::Ambiguous) => {
                         return Err(TopologyError::AmbiguousDependency {
                             from: spec.name.clone(),
                             name: dep_name.clone(),
-                        })
+                        });
                     }
                     Some(NameSlot::Unique(target)) => *target,
                 };
@@ -502,6 +519,7 @@ impl ExtensionTopology {
                 depends_on,
                 closure,
                 structured: spec.structured,
+                scope: spec.scope,
             })
             .collect();
 
@@ -717,6 +735,11 @@ where
         for dep in &deps {
             field(&mut hasher, dep.as_bytes());
         }
+        hasher.update(&[match node.scope {
+            None => 0,
+            Some(bsl_metadata::ExtensionScope::InfoBase) => 1,
+            Some(bsl_metadata::ExtensionScope::DataSeparation) => 2,
+        }]);
     }
     TopologyFingerprint(*hasher.finalize().as_bytes())
 }
@@ -733,11 +756,12 @@ mod tests {
             canonical_path: PathBuf::from(format!("/ws/{name}")),
             depends_on: Some(deps.iter().map(|s| s.to_string()).collect()),
             structured: true,
+            scope: Some(bsl_metadata::ExtensionScope::InfoBase),
         }
     }
 
     fn legacy_spec(name: &str) -> ExtensionNodeSpec {
-        ExtensionNodeSpec { structured: false, depends_on: None, ..spec(name, &[]) }
+        ExtensionNodeSpec { structured: false, depends_on: None, scope: None, ..spec(name, &[]) }
     }
 
     /// An external object; `deps` of `None` is a declaration without `dependsOn`.
@@ -745,6 +769,7 @@ mod tests {
         ExtensionNodeSpec {
             kind: NodeKind::External(ExternalObjectKind::DataProcessor),
             depends_on: deps.map(|deps| deps.iter().map(|s| s.to_string()).collect()),
+            scope: None,
             ..spec(name, &[])
         }
     }
@@ -1023,7 +1048,7 @@ mod tests {
     #[test]
     fn fingerprint_golden_vector() {
         let topology = build(vec![spec("TESTS", &["yaxunit"]), spec("yaxunit", &[])]).unwrap();
-        expect_test::expect!["1cf61d473c2e613cde7ac46705536cd148c79ec3386b45f1769e7a774cff7d1a"]
+        expect_test::expect!["37625c9e39336b117a36f73ff37d58839a4738b7f38657924a9c70a1ed7d84d2"]
             .assert_eq(&topology.fingerprint().to_hex());
     }
 }
