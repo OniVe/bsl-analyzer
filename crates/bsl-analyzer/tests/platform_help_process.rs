@@ -226,7 +226,9 @@ fn lsp_serves_the_configured_corpus_until_restart() {
     let shown = loop {
         match lsp.wait_for_within(std::time::Duration::from_secs(2), |message| {
             message["method"] == "window/showMessage"
-                && message["params"]["message"].as_str().is_some_and(|m| m.contains("restart"))
+                && message["params"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("restart") && m.contains("b.json"))
         }) {
             Some(message) => break message,
             None => {
