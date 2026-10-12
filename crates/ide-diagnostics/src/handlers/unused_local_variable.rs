@@ -50,6 +50,9 @@ fn build_attribute_names_to_skip(ctx: &DiagnosticsContext) -> FxHashSet<String> 
                     names.insert(en.fold_lower());
                 }
             }
+            for common in &mdo.common_attributes {
+                names.insert(common.name.fold_lower());
+            }
 
             for ts in &mdo.tabular_sections {
                 names.insert(ts.name().fold_lower());
@@ -82,6 +85,9 @@ fn build_attribute_names_to_skip(ctx: &DiagnosticsContext) -> FxHashSet<String> 
                 if let Some(en) = attr.name_en() {
                     names.insert(en.fold_lower());
                 }
+            }
+            for common in register.common_attributes() {
+                names.insert(common.name.fold_lower());
             }
 
             names
@@ -1448,6 +1454,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_standard_form_property_not_flagged_in_form_module() {
         use crate::test_utils::check_metadata_diagnostic;
 
@@ -1471,6 +1478,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_writable_form_property_not_flagged_in_form_module() {
         use crate::test_utils::check_metadata_diagnostic;
 
@@ -1498,6 +1506,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_window_opening_mode_not_flagged_in_form_module() {
         use crate::test_utils::check_metadata_diagnostic;
 
@@ -1525,6 +1534,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_form_extension_property_not_flagged_in_form_module() {
         use crate::test_utils::check_metadata_diagnostic;
 
@@ -1741,6 +1751,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_record_set_platform_property_not_flagged_with_salsa() {
         use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
         use ide_db::RootDatabaseImpl;

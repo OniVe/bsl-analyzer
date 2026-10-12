@@ -678,12 +678,13 @@ fn complete_predefined_items<DB: RootDatabase>(
     // may add or replace predefined items, so scanning the separate per-root
     // configurations and stopping at the first hit would hide them.
     if let Some(mdo) = db.resolve_metadata_object(file_id, mdo_type, object_name) {
-        let items: Vec<CompletionItem> = mdo
+        let detail = format!("{}.{}", mdo_type.russian_name(), object_name);
+        let mut items: Vec<CompletionItem> = mdo
             .predefined_items
             .iter()
             .map(|pi| CompletionItem {
                 label: pi.name.clone(),
-                detail: Some(format!("{}.{}", mdo_type.russian_name(), object_name)),
+                detail: Some(detail.clone()),
                 kind: CompletionItemKind::Constant,
                 insert_text: pi.name.clone(),
                 documentation: None,
@@ -692,6 +693,20 @@ fn complete_predefined_items<DB: RootDatabase>(
                 source: None,
             })
             .collect();
+
+        // Enumeration values live in their own field (parsed from the
+        // `<EnumValue>` children), not in `predefined_items`. Surface them so
+        // `Перечисления.СтавкиНДС.` offers НДС20 / БезНДС / … .
+        items.extend(mdo.enum_values.iter().map(|ev| CompletionItem {
+            label: ev.name.clone(),
+            detail: Some(detail.clone()),
+            kind: CompletionItemKind::EnumMember,
+            insert_text: ev.name.clone(),
+            documentation: None,
+            sort_text: Some(format!("1_{}", ev.name)),
+            filter_text: None,
+            source: None,
+        }));
 
         tracing::debug!(object_name, count = items.len(), "Predefined items found");
 
@@ -752,6 +767,7 @@ mod tests {
         db.set_metadata_listing(
             &root.to_string_lossy(),
             MetadataListingData {
+                common_attributes: Vec::new(),
                 entries: Vec::new(),
                 defined_types: Vec::new(),
                 common_modules: Vec::new(),

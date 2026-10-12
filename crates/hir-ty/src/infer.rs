@@ -598,6 +598,13 @@ pub struct InferenceContext<'db> {
 
     var_types: FxHashMap<NormName, TypeId>,
 
+    /// Locals whose latest write in walk order carried no type (an unknown value, or
+    /// `Для Каждого` over a collection whose element is unknown) while `var_types` still
+    /// holds an older one. A read answers `Unknown` for them: the older type no longer
+    /// describes the value, and checks made against it accused valid code. `var_types`
+    /// itself keeps the older type so the exported per-body summary does not change.
+    reset_vars: rustc_hash::FxHashSet<NormName>,
+
     implicit_locals: FxHashMap<String, ImplicitLocalInfo>,
 
     assigned_var_names: rustc_hash::FxHashSet<NormName>,
@@ -922,6 +929,7 @@ impl<'db> InferenceContext<'db> {
             owner,
             body: Arc::clone(body),
             var_types: FxHashMap::default(),
+            reset_vars: rustc_hash::FxHashSet::default(),
             implicit_locals: FxHashMap::default(),
             assigned_var_names: rustc_hash::FxHashSet::default(),
             assignment_target_names,
@@ -1291,6 +1299,20 @@ impl<'db> InferenceContext<'db> {
         id == self.db.unknown()
     }
 
+    /// A write that gives the local `ty` from here on in walk order.
+    fn record_local_type(&mut self, name: NormName, ty: TypeId) {
+        self.reset_vars.remove(&name);
+        self.var_types.insert(name, ty);
+    }
+
+    /// A write whose value has no type. The local stops reading as whatever an earlier
+    /// write made it; a local never typed before is left to bare-name resolution as it was.
+    fn reset_local_type(&mut self, name: NormName) {
+        if self.var_types.contains_key(&name) {
+            self.reset_vars.insert(name);
+        }
+    }
+
     fn is_undefined(&self, id: TypeId) -> bool {
         id == self.db.undefined()
     }
@@ -1532,15 +1554,7 @@ impl<'db> InferenceContext<'db> {
         };
         let type_param = self.db.type_descriptor();
         let position = signature.params.iter().position(|param| param.ty == type_param)?;
-        let arg = *args.get(position)?;
-        let (callee, text) = crate::type_literal::type_ctor_literal(body, arg)?;
-        if self.is_call_name_shadowed(callee) {
-            return None;
-        }
-        let named = crate::lower::type_string::lower_constructed_type_name_typeid(self.db, text);
-        if named == self.db.unknown() {
-            return None;
-        }
+        let named = self.literal_type_argument(body, *args.get(position)?)?;
         members
             .iter()
             .any(|member| crate::subtype::is_assignable(self.db, named, *member))
@@ -1560,6 +1574,49 @@ impl<'db> InferenceContext<'db> {
                 signature.return_ty = selected;
             }
         }
+    }
+
+    /// The type a literal `Тип("X")` argument names, when `Тип` is the platform
+    /// function and X lowers to a known type.
+    fn literal_type_argument(&mut self, body: &Body, arg: ExprIdx) -> Option<TypeId> {
+        let (callee, text) = crate::type_literal::type_ctor_literal(body, arg)?;
+        if self.is_call_name_shadowed(callee) {
+            return None;
+        }
+        let named = crate::lower::type_string::lower_constructed_type_name_typeid(self.db, text);
+        (named != self.db.unknown()).then_some(named)
+    }
+
+    /// The result of the managed form's own `РеквизитФормыВЗначение(Имя[, Тип])`:
+    /// the platform documents it as `Произвольный`, while the value is fixed by the
+    /// call — by a literal `Тип` argument when one is given, otherwise by the
+    /// declared type of the attribute the literal name points at.
+    ///
+    /// A second argument that is not a recognisable literal decides the type at
+    /// run time, so it leaves the result unknown rather than falling back to the
+    /// attribute: the two may legitimately differ.
+    fn form_attribute_to_value_return(
+        &mut self,
+        name: &hir_def::Name,
+        args: &[ExprId],
+    ) -> Option<TypeId> {
+        let method = bsl_platform::PlatformData::instance()
+            .get_method(crate::form_self::FORM_TYPE_NAME, name.as_str())?;
+        if method.english_name != "FormAttributeToValue" {
+            return None;
+        }
+        let resolver = self.get_resolver();
+        if !crate::this_object::is_managed_form_module(self.db, &resolver) {
+            return None;
+        }
+        let body = Arc::clone(&self.body);
+        if let Some(type_arg) = args.get(1) {
+            if !matches!(body.expr(*type_arg), Expr::Missing) {
+                return self.literal_type_argument(&body, type_arg.to_idx());
+            }
+        }
+        let attribute = crate::type_literal::bare_string_literal(&body, args.first()?.to_idx())?;
+        crate::form_attr::resolve_form_attribute_value(self.db, &resolver, attribute)
     }
 
     fn is_call_name_shadowed(&mut self, name: &Name) -> bool {
@@ -2220,6 +2277,7 @@ impl<'db> InferenceContext<'db> {
                 let value_ty = self.infer_expr(ExprId::from_idx(*value));
                 let target_id = ExprId::from_idx(*target);
                 let mut infer_target = true;
+                let mut reset_after_target = None;
 
                 let target_expr = self.body.expr_idx(*target).clone();
                 match &target_expr {
@@ -2303,8 +2361,10 @@ impl<'db> InferenceContext<'db> {
                                             ty: value_ty,
                                         }],
                                     });
-                                if !self.is_unknown(value_ty) {
-                                    self.var_types.insert(norm_key, value_ty);
+                                if self.is_unknown(value_ty) {
+                                    reset_after_target = Some(norm_key);
+                                } else {
+                                    self.record_local_type(norm_key, value_ty);
                                 }
                             }
                         }
@@ -2375,6 +2435,13 @@ impl<'db> InferenceContext<'db> {
                     }
                     self.infer_expr(target_id);
                 }
+                // The target itself keeps the type the local had before this write: it is
+                // the slot being written, and completion takes the expected type of the
+                // right-hand side from it (`Сумма = <incomplete>`). Reads after the write
+                // see the reset.
+                if let Some(name) = reset_after_target {
+                    self.reset_local_type(name);
+                }
             }
 
             Stmt::Expr(expr_idx) => {
@@ -2436,19 +2503,24 @@ impl<'db> InferenceContext<'db> {
                 self.infer_expr(ExprId::from_idx(*to));
                 let var_name = NormName::intern(self.body.binding_idx(*var).name.as_str());
                 let number = self.db.number(None, None);
-                self.var_types.insert(var_name, number);
+                self.record_local_type(var_name, number);
                 self.binding_types.insert(BindingId::from_idx(*var), number);
                 self.infer_stmts(body);
             }
 
             Stmt::ForEach { var, collection, body } => {
                 let coll_ty = self.infer_expr(ExprId::from_idx(*collection));
-                if let Some(elem_ty) =
-                    crate::iteration_lookup::resolve_iter_element_ty(self.db, coll_ty)
+                let var_name = NormName::intern(self.body.binding_idx(*var).name.as_str());
+                match crate::iteration_lookup::resolve_iter_element_ty(self.db, coll_ty)
+                    .filter(|elem_ty| !self.is_unknown(*elem_ty))
                 {
-                    let var_name = NormName::intern(self.body.binding_idx(*var).name.as_str());
-                    self.var_types.insert(var_name, elem_ty);
-                    self.binding_types.insert(BindingId::from_idx(*var), elem_ty);
+                    Some(elem_ty) => {
+                        self.record_local_type(var_name, elem_ty);
+                        self.binding_types.insert(BindingId::from_idx(*var), elem_ty);
+                    }
+                    // The loop rebinds the name even when the element is unknown, so a type
+                    // left by an earlier loop or assignment of the same name is stale here.
+                    None => self.reset_local_type(var_name),
                 }
                 self.infer_stmts(body);
             }
@@ -2616,13 +2688,36 @@ impl<'db> InferenceContext<'db> {
                     // A name the author has not finished writing (`Справочники.`) is not a
                     // miss: lowering keeps the incomplete field as the missing placeholder,
                     // and accusing the configuration on every keystroke would be noise.
-                    let closed_receiver = matches!(
+                    //
+                    // An object a common attribute may reach without the reader being able
+                    // to say so has an open field set, and a miss on it proves nothing.
+                    let closed_receiver = (matches!(
                         base_kind,
                         TypeKind::MetadataRef(_)
                             | TypeKind::ThisObject { .. }
                             | TypeKind::ManagerCollection(_)
-                    ) || matches!(base_kind, TypeKind::Structure(facet) if facet.closed);
-                    if !field.is_missing() && closed_receiver {
+                    ) && !crate::field_enum::metadata_fields_open(
+                        self.db,
+                        &obj_resolver,
+                        base_ty,
+                    )) || matches!(base_kind, TypeKind::Structure(facet) if facet.closed)
+                        || (crate::field_lookup::is_record_manager_form_data(self.db, base_ty)
+                            && !crate::field_enum::metadata_fields_open(
+                                self.db,
+                                &obj_resolver,
+                                crate::field_lookup::project_form_data_for_fields_id(
+                                    self.db, base_ty,
+                                )
+                                .unwrap_or(base_ty),
+                            ));
+                    // `Метаданные.Справочники` is closed on the same grounds as the manager
+                    // collection, but only where the configuration is visible: an external
+                    // processor or a loose module names objects of a configuration this
+                    // file cannot see, and there a miss proves nothing.
+                    let closed_metadata_collection =
+                        matches!(base_kind, TypeKind::MetadataObjectCollection(_))
+                            && self.db.file_has_visible_config(self.context_file_id);
+                    if !field.is_missing() && (closed_receiver || closed_metadata_collection) {
                         self.push_inference_diagnostic(InferenceDiagnostic::UnresolvedField {
                             expr: expr_id,
                             receiver_ty: base_ty,
@@ -2851,7 +2946,12 @@ impl<'db> InferenceContext<'db> {
 
         let resolved = resolver.resolve_name(self.db, name);
 
-        if let Some(ty) = self.var_types.get(&NormName::intern(name.as_str())) {
+        let flow_key = NormName::intern(name.as_str());
+        if self.reset_vars.contains(&flow_key) {
+            trace!("resolved {} as a local reset by an untyped write", name);
+            return found(self.db.unknown(), BareNameOrigin::FlowLocal, all_env);
+        }
+        if let Some(ty) = self.var_types.get(&flow_key) {
             trace!("resolved {} via var_types = {:?}", name, ty);
             let ty_id = *ty;
             // Structure-literal key enrichment: a local typed as a `Структура` gets its collected
@@ -3467,6 +3567,15 @@ impl<'db> InferenceContext<'db> {
                     let mut candidates = info.candidates;
                     let arg_idxs: Vec<ExprIdx> = args.iter().map(|arg| arg.to_idx()).collect();
                     self.select_returns_by_type_argument(&mut candidates, &arg_idxs);
+                    if self.form_self_receiver_name(base_id).is_some() {
+                        if let Some(value_ty) =
+                            self.form_attribute_to_value_return(&method_name, args)
+                        {
+                            for signature in candidates.signatures_mut() {
+                                signature.return_ty = value_ty;
+                            }
+                        }
+                    }
                     // Same coercion the user cascade dispatched on: the manager
                     // receiver and the workspace receiver are one value.
                     if let TypeKind::ObjectManager(facet) = &workspace_receiver_kind {
@@ -3766,6 +3875,9 @@ impl<'db> InferenceContext<'db> {
                     .unwrap_or(BareNameVerdict::Indeterminate)
             };
             self.report_absent_bare_call(name, callee, verdict);
+            if let Some(value_ty) = self.form_attribute_to_value_return(name, args) {
+                return value_ty;
+            }
         }
         self.db.unknown()
     }
@@ -5171,6 +5283,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_builtin_function_lookup() {
         let db = bsl_types::testing::InMemoryDb::new();
         let builtins = builtin::builtin_functions();
@@ -5188,6 +5301,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_builtin_date_function() {
         let db = bsl_types::testing::InMemoryDb::new();
         let builtins = builtin::builtin_functions();
@@ -5203,6 +5317,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_builtin_type_function() {
         let db = bsl_types::testing::InMemoryDb::new();
         let builtins = builtin::builtin_functions();

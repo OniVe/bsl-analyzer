@@ -66,6 +66,12 @@ fn resolve_iter_element_ty_inner(db: &dyn TypeKernelDb, collection: TypeId) -> O
         TypeKind::ValueList(_) => from_name("СписокЗначений"),
         TypeKind::Structure(_) => from_name("Структура"),
         TypeKind::Union(arms) => IterShape::Union(arms.to_vec()),
+        // The element stays the platform's union of every description kind rather than the
+        // collection's own kind: a loop variable is the receiver most often re-bound from an
+        // unknown collection (`Для Каждого М Из Метаданные[Вид]`), which leaves it holding
+        // the precise type of an earlier loop, and every member check downstream would judge
+        // the wrong kind.
+        TypeKind::MetadataObjectCollection(_) => from_name("КоллекцияОбъектовМетаданных"),
         _ => IterShape::Unsupported,
     };
 
@@ -170,6 +176,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn array_yields_any_per_platform_arbitrary() {
         let db = InMemoryDb::new();
         let elem = resolve(&db, db.array(None));
@@ -177,6 +184,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn map_yields_kluch_i_znachenie() {
         let db = InMemoryDb::new();
         let elem = resolve(&db, db.map(None, None));
@@ -184,6 +192,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn value_table_yields_row() {
         let db = InMemoryDb::new();
         let elem = resolve(&db, db.value_table(None, TableSource::Unknown));
@@ -191,6 +200,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn information_register_record_set_yields_record_with_mdo_name() {
         let db = InMemoryDb::new();
         let receiver = metadata_ref_id(
@@ -210,6 +220,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn accumulation_register_record_set_yields_record_with_mdo_name() {
         let db = InMemoryDb::new();
         let receiver =
@@ -229,6 +240,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn union_of_array_and_typed_array_iterates_to_concrete_arm() {
         let db = InMemoryDb::new();
         let union = db.union(vec![db.array(None), db.array(Some(db.string(None, false)))]);
@@ -237,6 +249,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn union_receiver_with_unknown_arm_absorbs_to_concrete_iterable() {
         let db = InMemoryDb::new();
         let union = db.union(vec![db.unknown(), db.array(None)]);
@@ -267,6 +280,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn union_with_undefined_filters_dead_arm() {
         let db = InMemoryDb::new();
         let union = db.union(vec![db.array(None), db.undefined()]);

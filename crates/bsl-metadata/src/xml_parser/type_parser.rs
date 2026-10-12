@@ -319,6 +319,10 @@ fn parse_reference_type(type_str: &str) -> Result<AttributeType> {
         return Ok(AttributeType::Ref { mdo_type: *mdo_type, name });
     }
 
+    if ref_type == "cfg:InformationRegisterRecordManager" {
+        return Ok(AttributeType::InformationRegisterRecordManager { name });
+    }
+
     if ref_type.ends_with("RecordManager") {
         tracing::debug!(type_str = %type_str, "record-manager type not modelled yet; treated as Unknown");
         return Ok(AttributeType::UnknownNamed(type_str.to_string()));
@@ -395,6 +399,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn namespaced_platform_tokens_resolve_via_catalogue() {
         for (token, expected_ru) in [
             ("d5p1:TextDocument", "ТекстовыйДокумент"),
@@ -411,6 +416,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn xdto_named_token_resolves_to_class_type() {
         // `FlowchartContextType` is the XDTO type name of `ГрафическаяСхема`;
         // the token must resolve to the class type via the catalogue's XDTO alias.
@@ -421,6 +427,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn platform_token_resolution_is_namespace_prefix_agnostic() {
         // 1C emits the same logical type under version-namespaced prefixes;
         // both must resolve to the same Russian type name.
@@ -453,10 +460,23 @@ mod tests {
     }
 
     #[test]
-    fn record_manager_token_keeps_its_presentation() {
+    fn record_manager_token_names_its_register() {
         assert_eq!(
             parse_single_type("cfg:InformationRegisterRecordManager.Курсы", &qualifiers()).unwrap(),
-            AttributeType::UnknownNamed("cfg:InformationRegisterRecordManager.Курсы".to_string()),
+            AttributeType::InformationRegisterRecordManager { name: "Курсы".to_string() },
+        );
+    }
+
+    /// A record set is a collection, not a record: it must not be read as the
+    /// record manager of the same register.
+    #[test]
+    fn record_set_token_stays_a_register_reference() {
+        assert_eq!(
+            parse_single_type("cfg:InformationRegisterRecordSet.Курсы", &qualifiers()).unwrap(),
+            AttributeType::Ref {
+                mdo_type: MdoType::InformationRegister,
+                name: "Курсы".to_string(),
+            },
         );
     }
 
@@ -472,6 +492,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn fill_checking_is_not_a_value_type_but_resolves_via_catalogue() {
         // Not one of the hand-modelled kernel value types...
         assert_eq!(parse_platform_value_type("v8:FillChecking"), None);

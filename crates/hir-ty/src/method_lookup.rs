@@ -541,6 +541,7 @@ pub fn platform_type_key_id(db: &dyn TypeKernelDb, id: TypeId) -> Option<String>
         | TypeKind::Null
         | TypeKind::Undefined => None,
         TypeKind::Uuid => Some("УникальныйИдентификатор".to_string()),
+        TypeKind::MetadataObjectCollection(_) => Some("КоллекцияОбъектовМетаданных".to_string()),
         TypeKind::ValueStorage => Some("ХранилищеЗначения".to_string()),
         TypeKind::MetadataRef(_)
         | TypeKind::AnyMetadataRef { .. }
@@ -1147,6 +1148,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_lookup_platform_type_hit() {
         let db = InMemoryDb::new();
         let info = lookup(&db, db.array(None), &Name::new("Добавить"))
@@ -1155,6 +1157,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_lookup_typed_array_shares_array_method_table() {
         let db = InMemoryDb::new();
         let receiver = db.array(Some(db.string(None, false)));
@@ -1182,6 +1185,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_lookup_platform_object_query_execute_direct() {
         let db = InMemoryDb::new();
         let info = lookup(&db, platform_id(&db, "Запрос"), &Name::new("Выполнить"));
@@ -1189,6 +1193,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_lookup_query_execute_returns_union_with_undefined() {
         let db = InMemoryDb::new();
         let info = lookup(&db, platform_id(&db, "Запрос"), &Name::new("Выполнить"))
@@ -1240,6 +1245,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn to_method_info_multi_type_param_lowers_to_union() {
         let db = InMemoryDb::new();
         let info = to_type_method_info(
@@ -1276,6 +1282,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_lookup_value_table_english_key_hits_russian_method_name() {
         let db = InMemoryDb::new();
         let info = lookup(&db, value_table_id(&db, None), &Name::new("Добавить"))
@@ -1284,6 +1291,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_lookup_object_manager_resolves_through_platform_manager_adapter() {
         let db = InMemoryDb::new();
         let om = object_manager_id(&db, MdoType::Catalog, "Номенклатура");
@@ -1303,6 +1311,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_lookup_metadata_ref_catalog_object_resolves_write() {
         let db = InMemoryDb::new();
         let r = metadata_ref_id(&db, MetadataKind::CatalogObject, "Номенклатура");
@@ -1312,6 +1321,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_lookup_register_filter_resolves_filter_method_via_scalar_key() {
         let db = InMemoryDb::new();
         let r = metadata_ref_id(
@@ -1345,6 +1355,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_lookup_tabular_section_add_returns_row_metadata_ref() {
         let db = InMemoryDb::new();
         let r = ts_receiver(&db, MdoType::Catalog, "Номенклатура.Услуги");
@@ -1362,6 +1373,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_lookup_tabular_section_count_returns_number() {
         let db = InMemoryDb::new();
         let r = ts_receiver(&db, MdoType::Catalog, "X.Y");
@@ -1371,6 +1383,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_lookup_tabular_section_unload_returns_value_table() {
         let db = InMemoryDb::new();
         let r = ts_receiver(&db, MdoType::Catalog, "X.Y");
@@ -1380,6 +1393,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_lookup_tabular_section_find_returns_union_with_row() {
         let db = InMemoryDb::new();
         let r = ts_receiver(&db, MdoType::Catalog, "X.Y");
@@ -1404,6 +1418,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_lookup_tabular_section_findrows_returns_typed_array_of_rows() {
         let db = InMemoryDb::new();
         let r = ts_receiver(&db, MdoType::Catalog, "X.Y");
@@ -1424,6 +1439,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_lookup_tabular_section_findrows_english_alias_typed_array() {
         let db = InMemoryDb::new();
         let r = ts_receiver(&db, MdoType::Document, "ПКО.Товары");
@@ -1445,6 +1461,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_lookup_tabular_section_english_name_resolves() {
         let db = InMemoryDb::new();
         let r = ts_receiver(&db, MdoType::Catalog, "X.Y");
@@ -1465,6 +1482,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_lookup_tabular_section_parent_propagates_document() {
         let db = InMemoryDb::new();
         let r = ts_receiver(&db, MdoType::Document, "ПКО.Товары");
@@ -1481,6 +1499,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_lookup_tabular_section_parent_propagates_exchange_plan() {
         let db = InMemoryDb::new();
         let r = ts_receiver(&db, MdoType::ExchangePlan, "ПО.Состав");
@@ -1497,6 +1516,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_lookup_tabular_section_find_params_preserve_arbitrary_as_any() {
         let db = InMemoryDb::new();
         let r = ts_receiver(&db, MdoType::Catalog, "X.Y");
@@ -1509,6 +1529,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_lookup_tabular_section_index_param_stays_unknown() {
         let db = InMemoryDb::new();
         let r = ts_receiver(&db, MdoType::Catalog, "X.Y");
@@ -1522,6 +1543,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_lookup_tabular_section_parent_propagates_chart_of_accounts() {
         let db = InMemoryDb::new();
         let r = ts_receiver(&db, MdoType::ChartOfAccounts, "Основной.ВидыСубконто");
@@ -1538,6 +1560,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_lookup_usual_group_resolves_extension_method() {
         let db = InMemoryDb::new();
         let receiver = form_control_id(&db, FormElementKind::UsualGroup);
@@ -1569,6 +1592,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_lookup_form_data_collection_get_rewrites_item_return_to_row() {
         let db = InMemoryDb::new();
         let receiver = form_data_id(
@@ -1612,6 +1636,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn sdbl_chain_rewrite_executes_query() {
         let db = InMemoryDb::new();
         let receiver = platform_id(&db, "Запрос");
@@ -1621,6 +1646,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn sdbl_chain_rewrite_executes_query_english_alias() {
         let db = InMemoryDb::new();
         let receiver = platform_id(&db, "Запрос");
@@ -1630,6 +1656,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn sdbl_chain_rewrite_choose_on_result() {
         let db = InMemoryDb::new();
         let receiver = platform_id(&db, "РезультатЗапроса");
@@ -1639,6 +1666,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn sdbl_chain_rewrite_choose_on_typed_result() {
         let db = InMemoryDb::new();
         let receiver = db.query_result(None, ProjectionSource::Unknown);
@@ -1661,6 +1689,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn sdbl_chain_rewrite_execute_batch() {
         let db = InMemoryDb::new();
         let receiver = platform_id(&db, "Запрос");

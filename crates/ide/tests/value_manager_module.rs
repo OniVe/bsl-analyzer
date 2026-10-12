@@ -3,7 +3,7 @@
 //! graph all key a module by its path, and a path the module index does not know is a
 //! module none of them can name.
 //!
-//! The layout mirrors BASSmallBusiness, where
+//! The layout mirrors a typical vendor configuration, where
 //! `Константы.КаталогСообщенийОбменаДаннымиДляLinux.СоздатьМенеджерЗначения()
 //! .ПриЗаполненииРазрешенийНаДоступКВнешнимРесурсам(...)` is called from
 //! `ОбменДаннымиСервер`.

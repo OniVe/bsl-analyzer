@@ -347,6 +347,12 @@ impl GraphStore {
         })
     }
 
+    /// Whether an installed snapshot exists and is servable.
+    pub(crate) fn has_installed(&self) -> bool {
+        let pool = crate::graph::state::lock_recover(&self.shared.pool);
+        pool.installed && pool.unusable.is_none() && pool.admission != Admission::Retired
+    }
+
     /// Why the installed file is not served, after a replacement whose outcome is unknown.
     pub(crate) fn unusable_reason(&self) -> Option<String> {
         lock_recover(&self.shared.pool).unusable.clone()
@@ -774,6 +780,11 @@ impl PreparedSnapshotPool {
     pub(super) fn declared_unread(&self) -> Option<&[bsl_search::FileKey]> {
         self.declared_unread.as_deref()
     }
+
+    /// The publication id of the prepared candidate, read from its meta table if opened.
+    pub(super) fn publication_id(&self) -> Option<String> {
+        self.entry.as_ref().and_then(|e| e.db.publication_id().ok())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1007,6 +1018,9 @@ impl GraphState {
         expected_fingerprint: crate::graph_db::GraphFp,
         expected_force_stale: bool,
     ) -> Result<PreparedSnapshotPool, SnapshotPrepareError> {
+        if !self.validate_workspace_scope() {
+            return Err(SnapshotPrepareError::Changed);
+        }
         let path = self
             .graph_db_path()
             .ok_or_else(|| SnapshotPrepareError::Open(anyhow::anyhow!("graph path unavailable")))?;
@@ -1055,9 +1069,11 @@ impl GraphState {
     ///
     /// Two different numbers travel with a publication and they are not interchangeable. The
     /// SPONSOR CUTOFF (`forced_through`) says which demand paid for this build; the
-    /// OBSERVATION (`Published::observed_through`) says how far its scan can vouch, and marks
-    /// are consumed against that. A build admitted for one fact may observe no further, and it
-    /// must not claim to have answered anything above either line.
+    /// OBSERVATION (`Published::observed_through`) says how far the installed graph is proven
+    /// to cover: initially its scan cutoff, later possibly an exact clean comparison against
+    /// the same fingerprint. Marks are consumed against that frontier. A build admitted for
+    /// one fact may observe no further, and it must not claim to have answered anything above
+    /// either line.
     ///
     /// The debts are discharged inside the same critical section that installs the snapshot,
     /// so an observer holding `inner` — such as [`GraphState::try_claim_reload`] — sees the
@@ -1080,6 +1096,9 @@ impl GraphState {
         recovery_through: Option<u64>,
         recovery: super::debt::RecoveryPublicationProof,
     ) -> crate::workspace_lease::LeaseOperationOutcome<(), SnapshotInstallError> {
+        if !self.validate_workspace_scope() {
+            return crate::workspace_lease::LeaseOperationOutcome::Released;
+        }
         #[cfg(test)]
         SNAPSHOT_OPEN_HOOK.with(|slot| {
             if let Some(hook) = slot.borrow_mut().take() {
@@ -1126,7 +1145,7 @@ impl GraphState {
                 Ok(identity) if identity == prepared.path_identity => {}
                 Ok(_) => return Err(SnapshotInstallError::Changed),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(SnapshotInstallError::Changed)
+                    return Err(SnapshotInstallError::Changed);
                 }
                 Err(error) => return Err(SnapshotInstallError::Operation(error.to_string())),
             }
@@ -1228,6 +1247,11 @@ impl GraphState {
         op: impl FnOnce(&GraphSnapshot) -> R,
     ) -> Result<R, GraphReadError> {
         self.store.read(None, Duration::ZERO, op)
+    }
+
+    /// Whether an installed publication is available in the store.
+    pub(crate) fn has_installed_snapshot(&self) -> bool {
+        self.store.has_installed()
     }
 
     /// Run a read for which the graph is enrichment: `op` receives `None` when no handle can
@@ -1376,7 +1400,7 @@ impl GraphState {
             LeaseOperationOutcome::Applied(Some(generation))
                 if generation != plan.basis.generation() =>
             {
-                return ProbeOutcome::CouldNotLook
+                return ProbeOutcome::CouldNotLook;
             }
             LeaseOperationOutcome::Applied(_) => {}
             // A failure to LOOK, not a look that found nothing.
@@ -1604,13 +1628,23 @@ impl GraphState {
         }
     }
 
+    /// Compatibility wrapper for the test-only freshness path.
+    #[cfg(test)]
     pub(super) fn current_disk_fp(&self) -> Option<(crate::graph_db::GraphFp, bool)> {
+        self.current_disk_fp_with_watermark().map(|(fingerprint, clean, _)| (fingerprint, clean))
+    }
+
+    /// The exact hub cutoff paired with the fingerprint returned by this scan. A caller may
+    /// use it to answer only facts present before the walk represented by that fingerprint.
+    pub(super) fn current_disk_fp_with_watermark(
+        &self,
+    ) -> Option<(crate::graph_db::GraphFp, bool, u64)> {
         let root = self.workspace_root.as_deref()?;
         self.invalidate_scan_on_hub_drift();
         let mut cache = lock_recover(&self.scan);
         if let Some(c) = cache.as_ref() {
             if c.at.elapsed() < self.drift_interval {
-                return Some((c.disk_fp, c.clean));
+                return Some((c.disk_fp, c.clean, c.observed_through));
             }
         }
         // Asked about OUR cursor, not about the hub at large: `invalidate_scan_on_hub_drift`
@@ -1645,7 +1679,7 @@ impl GraphState {
                         clean,
                         observed_through,
                     });
-                    return Some((fp, clean));
+                    return Some((fp, clean, observed_through));
                 }
             }
         }
@@ -1692,7 +1726,7 @@ impl GraphState {
             fp_state.clean = clean;
         }
         *cache = Some(ScanCache { at: Instant::now(), disk_fp: fp, clean, observed_through });
-        Some((fp, clean))
+        Some((fp, clean, observed_through))
     }
 
     /// Forget every cached look at disk, so the next one walks the tree again.
