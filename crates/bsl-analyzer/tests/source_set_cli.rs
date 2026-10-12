@@ -3648,6 +3648,8 @@ fn check_config_accepts_legacy_scope_warns_and_keeps_explicit_scope_quiet() {
             !String::from_utf8_lossy(&valid.stderr).contains("legacy common-attribute semantics")
         );
         let report = String::from_utf8_lossy(&valid.stdout);
+        assert!(report.contains(&format!("EXT ({EXT}, scope: {scope})")), "{report}");
+        assert!(!report.contains("Some(") && !report.contains("None"), "{report}");
         let topology = report.split("Extension topology:").nth(1).unwrap();
         assert!(topology.contains(&format!("scope: {scope}")), "{report}");
         assert!(topology.contains("EXT"), "{report}");

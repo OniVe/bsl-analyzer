@@ -278,16 +278,22 @@ fn build_check_config_report(
                 .iter()
                 .map(|decl| match decl {
                     project_model::ExtensionDecl::Path(path) => path.clone(),
-                    project_model::ExtensionDecl::Structured(entry)
-                        if entry.depends_on.is_empty() =>
-                        format!("{} ({}, scope: {:?})", entry.name, entry.path, entry.scope),
-                    project_model::ExtensionDecl::Structured(entry) => format!(
-                        "{} ({}, scope: {:?}, dependsOn: {})",
-                        entry.name,
-                        entry.path,
-                        entry.scope,
-                        entry.depends_on.join(", ")
-                    ),
+                    project_model::ExtensionDecl::Structured(entry) => {
+                        let scope = entry
+                            .scope
+                            .map(|scope| format!(", scope: {scope:?}"))
+                            .unwrap_or_default();
+                        if entry.depends_on.is_empty() {
+                            format!("{} ({}{scope})", entry.name, entry.path)
+                        } else {
+                            format!(
+                                "{} ({}{scope}, dependsOn: {})",
+                                entry.name,
+                                entry.path,
+                                entry.depends_on.join(", ")
+                            )
+                        }
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join(", "),

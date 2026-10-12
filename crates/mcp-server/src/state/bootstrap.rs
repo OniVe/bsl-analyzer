@@ -5180,6 +5180,9 @@ mod tests {
             reverse_owners.clone(),
             reverse_stop.clone(),
         );
+        assert!(crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
+            reverse_hub.active_cursor_count() == 1
+        }));
         fs::write(&project_file, config_for_scope(None)).unwrap();
         assert!(crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
             reverse_owners.is_stopped() && reverse_stop.is_cancelled()
@@ -5215,6 +5218,9 @@ mod tests {
             explicit_owners.clone(),
             explicit_stop.clone(),
         );
+        assert!(crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
+            explicit_hub.active_cursor_count() == 1
+        }));
         fs::write(&project_file, config_for_scope(Some("InfoBase"))).unwrap();
         assert!(crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
             explicit_owners.is_stopped() && explicit_stop.is_cancelled()
@@ -5247,6 +5253,9 @@ mod tests {
             data_separation_owners.clone(),
             data_separation_stop.clone(),
         );
+        assert!(crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
+            data_separation_hub.active_cursor_count() == 1
+        }));
         fs::write(&project_file, config_for_scope(Some("DataSeparation"))).unwrap();
         assert!(crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
             data_separation_owners.is_stopped() && data_separation_stop.is_cancelled()
