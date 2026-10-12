@@ -1,6 +1,16 @@
+use bsl_types::builders::Builders;
 use bsl_types::intern::TypeKernelDb;
 use bsl_types::kind::{MetadataKind, TypeId, TypeKind};
 use stdx::case::CaseExt;
+
+fn as_platform_metadata_collection(db: &dyn TypeKernelDb, ty: TypeId) -> TypeId {
+    match db.lookup_type(ty) {
+        TypeKind::MetadataObjectCollection(_) => {
+            db.platform_object("КоллекцияОбъектовМетаданных".to_string())
+        }
+        _ => ty,
+    }
+}
 
 pub fn is_assignable(db: &dyn TypeKernelDb, from: TypeId, to: TypeId) -> bool {
     if from == to {
@@ -39,21 +49,27 @@ pub fn is_assignable(db: &dyn TypeKernelDb, from: TypeId, to: TypeId) -> bool {
     // `РегламентныеЗадания.НайтиПредопределенное(Метаданные.РегламентныеЗадания.X)`) never
     // manufactures a TypeMismatch. They ARE metadata objects; a precise per-kind lattice for the
     // non-manager kinds is deliberately out of scope for this soft surface.
-    // A kind-aware metadata collection (`Метаданные.Справочники`) gets the same latitude: it
-    // was a plain platform object before it learned its element kind, and learning it must not
-    // turn into a mismatch wherever a `КоллекцияОбъектовМетаданных` is passed around.
     if matches!(
         from_kind,
-        TypeKind::MetadataReference { .. }
-            | TypeKind::MetadataReferenceCollection(_)
-            | TypeKind::MetadataObjectCollection(_)
+        TypeKind::MetadataReference { .. } | TypeKind::MetadataReferenceCollection(_)
     ) || matches!(
         to_kind,
-        TypeKind::MetadataReference { .. }
-            | TypeKind::MetadataReferenceCollection(_)
-            | TypeKind::MetadataObjectCollection(_)
+        TypeKind::MetadataReference { .. } | TypeKind::MetadataReferenceCollection(_)
     ) {
         return true;
+    }
+
+    // A kind-aware metadata collection (`Метаданные.Справочники`) is assigned exactly as the
+    // platform `КоллекцияОбъектовМетаданных` it refines: learning its element kind must neither
+    // turn into a mismatch where that platform type is expected nor hide a real one.
+    if matches!(from_kind, TypeKind::MetadataObjectCollection(_))
+        || matches!(to_kind, TypeKind::MetadataObjectCollection(_))
+    {
+        return is_assignable(
+            db,
+            as_platform_metadata_collection(db, from),
+            as_platform_metadata_collection(db, to),
+        );
     }
 
     if let TypeKind::Union(parts) = from_kind {

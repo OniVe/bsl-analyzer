@@ -2,7 +2,7 @@
 //! are checked against the configuration, the same way the manager collection
 //! (`Справочники.<объект>`) already is.
 
-use hir::{HirDatabase, InferenceDiagnostic};
+use hir::{Builders, HirDatabase, InferenceDiagnostic};
 use ide::{Analysis, DiagnosticCode, DiagnosticsConfig};
 use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
 use ide_db::RootDatabaseImpl;
@@ -168,4 +168,44 @@ fn every_manager_backed_kind_reports_a_missing_object_by_name() {
 fn the_same_misses_stay_silent_when_no_configuration_is_visible() {
     let found = unresolved_field_messages(EVERY_MANAGER_BACKED_KIND, false);
     assert!(found.is_empty(), "nothing to check a member against: {found:?}");
+}
+
+#[test]
+fn the_collection_is_assigned_as_the_platform_collection_it_refines() {
+    let fixture = format!(
+        r#"
+//- /CommonModules/ПервыйОбщийМодуль/Ext/Module.bsl
+// Параметры:
+//   П - Число - численный аргумент
+Процедура ПринимаетЧисло(П) Экспорт
+КонецПроцедуры
+
+// Параметры:
+//   П - КоллекцияОбъектовМетаданных - коллекция
+Процедура ПринимаетКоллекцию(П) Экспорт
+КонецПроцедуры
+
+//- /test.bsl
+{}"#,
+        r#"Процедура Тест()
+    ПервыйОбщийМодуль.ПринимаетЧисло(Метаданные.Справочники);
+    ПервыйОбщийМодуль.ПринимаетКоллекцию(Метаданные.Справочники);
+    ПервыйОбщийМодуль.ПринимаетКоллекцию(Метаданные.ОбщиеМодули);
+КонецПроцедуры
+"#
+    );
+    let (db, file_id) = setup(&fixture);
+    // Inference diagnostics, not the rendered ones: a rendered mismatch whose two type labels
+    // read the same is dropped, and both sides of the collection read `КоллекцияОбъектовМетаданных`.
+    let expected: Vec<_> = db
+        .infer(file_id)
+        .diagnostics
+        .iter()
+        .chain(db.arg_diagnostics(file_id).iter())
+        .filter_map(|(_, diag)| match diag {
+            InferenceDiagnostic::TypeMismatch { expected, .. } => Some(*expected),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(expected, vec![db.number(None, None)], "only the number parameter is a mismatch");
 }
