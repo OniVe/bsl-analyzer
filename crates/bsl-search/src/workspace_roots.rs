@@ -85,8 +85,19 @@ struct Root {
     id: String,
     /// The spelling the project declared, which is what exists on disk for a
     /// caller that wants to read the file back.
+    ///
+    /// Stable across a retarget — it is the link itself — which is why it is what identity is
+    /// matched by when a generation is re-stated ([`WorkspaceRoots::inheriting_root_ids`]).
     declared: PathBuf,
     /// The spelling every topology decision is made on.
+    ///
+    /// Read off the disk ONCE when this table was built, so it is a fact about the GENERATION
+    /// the table describes, not about the disk at answer time: a root reached through a link
+    /// that is later retargeted names a different directory, and an answer recomputed from a
+    /// fresh read would rank a target this generation's rows were not minted against. A retarget
+    /// is therefore a next generation, re-stated EXPLICITLY
+    /// ([`WorkspaceRoots::inheriting_root_ids`]); it is never re-read here, and nothing in
+    /// [`WorkspaceRoots::root_of`] consults the disk (github#277).
     canonical: PathBuf,
 }
 
@@ -107,6 +118,11 @@ pub struct WorkspaceRoots {
     /// because it is a fact about THIS generation — a root reached through a link that
     /// is later retargeted names a different directory, and a base read at answer time
     /// would then decode ids the generation never minted.
+    ///
+    /// A workspace that itself resolves elsewhere is not this table's next generation but
+    /// another registration sharing no key space with it: root ids are stripped against this
+    /// value, so re-stating one under the other would decode ids of the wrong base.
+    /// [`WorkspaceRoots::inheriting_root_ids`] therefore refuses it and keeps the fresh table.
     workspace_canonical: PathBuf,
     roots: Vec<Root>,
     /// Subtrees inside the roots that a scan must not descend into.
@@ -141,6 +157,13 @@ pub struct WorkspaceRoots {
 /// directories are not one registration, whatever their roots are spelled like — leaving it
 /// out would let such a pair pass as "the roots did not move" and keep serving a base the
 /// next build would not mint against.
+///
+/// A root whose DECLARED spelling is the same while its canonical directory moved compares
+/// UNEQUAL, and that is the transition this whole type is asked to drive: the canonical
+/// spelling is the generation, so a retarget is a different generation under the SAME id — the
+/// form [`WorkspaceRoots::inheriting_root_ids`] states explicitly, which is what keeps the
+/// id-keyed rows and external addresses of the old generation attributable to the root after it
+/// moved (github#277).
 impl PartialEq for WorkspaceRoots {
     fn eq(&self, other: &Self) -> bool {
         self.workspace == other.workspace
@@ -286,6 +309,43 @@ impl WorkspaceRoots {
         self.longest_match(walked, |root| &root.declared)
     }
 
+    /// The key a workspace file carries, given its two spellings and whether its canonical
+    /// target takes part in attribution: the ONE place the ROLE branch lives.
+    ///
+    /// The ROLE branch, and not attribution as a whole: [`Self::root_of`] is called directly
+    /// elsewhere, and that is allowed where the role cannot differ — on the output of the shared
+    /// walk (which admits only files whose two spellings agree by role) and on canonical paths,
+    /// which have no role at all. What no caller may do is rank a canonical target that does NOT
+    /// take part in attribution; this method and [`Self::root_of_declared`] are the only answers
+    /// to that question.
+    ///
+    /// When the target is a source, the canonical spelling ranks first — that is what makes the
+    /// answer independent of the alias the walk happened to arrive through — and the walked
+    /// spelling keeps a file that leaves every root in the universe ([`Self::root_of`]). When it
+    /// is not, a key under the target's root would be one that is FORBIDDEN to exist: the walk
+    /// drops such files, so the only spelling that could ever have indexed one is the walked one,
+    /// and ranking by the target would miss the row a removal has to reach
+    /// ([`Self::root_of_declared`]).
+    ///
+    /// Pure by construction: nothing here reads the disk, so one input answers one key however
+    /// the table was obtained. The adapters stay thin — [`crate::workspace_file_key_in`] computes
+    /// the two spellings and the role, and the baseline publisher calls that same adapter, so a
+    /// key it writes is a key the daemon reading the snapshot derives (github#278). Callers that
+    /// ask the question of a path that is not a stored document (a descriptor, a directory) have
+    /// no role to branch on and use [`Self::key_of_path`] instead.
+    pub fn file_key(
+        &self,
+        walked: &Path,
+        canonical: &Path,
+        target_is_source: bool,
+    ) -> Option<FileKey> {
+        if target_is_source {
+            self.root_of(walked, canonical)
+        } else {
+            self.root_of_declared(walked)
+        }
+    }
+
     /// The two spellings attribution ranks a path by.
     ///
     /// A relative path is read against the CONFIGURATION root: that is how every
@@ -360,6 +420,61 @@ impl WorkspaceRoots {
         self.roots.iter().any(|root| root.id == root_id)
     }
 
+    /// Whether the root registered under this id still leads where THIS table minted it.
+    ///
+    /// The canonical spelling is read off the disk once, when the table is built, and the id
+    /// survives a retarget ([`Self::inheriting_root_ids`]): a link declared as a root can afterwards
+    /// point at another directory while the id — and every row, journal spelling and external
+    /// address keyed by it — stays. A reader holding a table from an earlier generation (the
+    /// diagnostics resident holds its own across a config-only reload) therefore answers about a
+    /// directory the id no longer names, and the same `(root_id, path)` names one file to that
+    /// reader and another to the workspace.
+    ///
+    /// So the registration is re-checked before it is used, and the answer depends on HOW THE ID WAS
+    /// MINTED — what the table could not resolve when it was built leaves no target behind to
+    /// disprove:
+    ///
+    /// - **spelling-minted** (`canonical == declared`): always current, whatever the declared spelling
+    ///   resolves to now. The equality arises BOTH ways and means the same thing either way — the
+    ///   table could not canonicalise the declared spelling when it was built and fell back to that
+    ///   spelling, OR canonicalisation succeeded and returned the spelling itself (a plain directory,
+    ///   a spelling that resolves to itself). In both cases the id was minted by the SPELLING and not
+    ///   by a remembered target, so there is no target it could have left: such a root is attributed
+    ///   by its own spelling in the engine and the resident, and a reader opens it through that
+    ///   spelling again, so the root follows whatever the spelling leads to now — a link that appears
+    ///   later and leads somewhere else is a legal configuration, not a stale registration;
+    /// - **resolved-minted** and the declared spelling still canonicalises to the SAME directory:
+    ///   current — that is the directory the id was minted from;
+    /// - **resolved-minted** and the declared spelling now canonicalises ELSEWHERE, or no longer
+    ///   canonicalises at all: stale. The id names a directory that was reachable once and is not
+    ///   reachable now (a link whose target moved or vanished is exactly the retarget that must not
+    ///   be answered through), and nothing in the table can prove the binding to a reader that still
+    ///   holds it.
+    ///
+    /// A successful canonicalisation of a spelling-minted root is answered by the first clause rather
+    /// than by the comparison; the comparison would give the same answer for the spelling that
+    /// resolves to itself and the wrong one for every other.
+    ///
+    /// An id no root is registered under is not this question: callers ask [`Self::contains_id`]
+    /// first, and a table that has never heard of the id has no registration that could be stale.
+    pub fn registration_is_current(&self, id: &str) -> bool {
+        let Some(root) = self.roots.iter().find(|root| root.id == id) else {
+            return true;
+        };
+        // The spelling itself is the id, and it is followed wherever it leads: whether the equality
+        // came from a fallback or from a coincidence, there is no remembered target that could have
+        // been left.
+        if root.canonical == root.declared {
+            return true;
+        }
+        match std::fs::canonicalize(&root.declared) {
+            Ok(now) => now == root.canonical,
+            // Resolved once, unresolvable now: the remembered target is gone and nothing proves the
+            // binding the reader is holding.
+            Err(_) => false,
+        }
+    }
+
     pub fn ids(&self) -> impl Iterator<Item = &str> {
         self.roots.iter().map(|root| root.id.as_str())
     }
@@ -381,6 +496,105 @@ impl WorkspaceRoots {
             })
             .map(|root| root.id.clone())
             .collect()
+    }
+
+    /// Re-state a freshly built table as the NEXT generation of this one: the same root ids, the
+    /// fresh directories, and the fresh workspace and exclusions.
+    ///
+    /// The canonical spelling of a root is a fact about ONE generation: a root declared through a
+    /// link resolves to whatever that link points at when the table is built. Rebuilding the table
+    /// after the link is retargeted therefore mints a NEW id for the same declared root, because
+    /// [`root_id_for`] derives the id from the canonical spelling — and an id is the durable
+    /// identity: store rows, journal spellings and every external address are keyed by it, so
+    /// taking the rebuild as it stands would drop everything the old id held and add a stranger in
+    /// its place. This is the explicit re-canonicalisation github#277 asks for: attribution ranks
+    /// the FRESH canonical spelling from here on, and the root keeps its identity across its own
+    /// retarget (a REBIND, which [`Self::rebound_root_ids`] and the transition machinery already
+    /// know how to handle, and not a removal plus an addition).
+    ///
+    /// A root is matched by its DECLARED spelling, which is what a retarget does not change: the
+    /// same declaration now leads elsewhere. The match is ROLE-AWARE — a non-configuration root is
+    /// only ever matched against a non-configuration one, and the fresh configuration root never
+    /// inherits at all — so the reserved empty id can neither leave the configuration nor be taken
+    /// by an extension that merely stands where a configuration used to.
+    ///
+    /// The rule is applied to the fresh table AS A WHOLE, not root by root, because an id has to
+    /// belong unambiguously to one of the fresh roots for the answer to be independent of the order
+    /// they are declared in. A fresh root therefore inherits only if the id is
+    ///
+    /// - not [`CONFIGURATION_ROOT_ID`] — the reserved empty id belongs to the configuration and to
+    ///   nothing else, whatever the two are spelled like;
+    /// - not the NATURAL id of ANOTHER fresh root ([`root_id_for`]'s answer for that root's fresh
+    ///   canonical spelling) — such an id belongs to the root that spelled it that way, so a
+    ///   retargeted root whose former directory (or former id) was declared as a root of THIS
+    ///   generation keeps its own fresh id instead;
+    /// - not already inherited by another root of this generation.
+    ///
+    /// A refused inheritance, like everything else here, is not a panic: the fresh root keeps the
+    /// id it was built with. It IS an explicit refusal of the re-canonicalisation —
+    /// [`Self::inheriting_root_ids`] states the next generation under the old ids wherever an id is
+    /// unambiguously the same root's, and declines to guess where it is not. What the refusal costs
+    /// is NOT a removal plus an addition: the conflicting id stays with the fresh root it is natural
+    /// for, and that root keeps a REBIND — which is what the transition machinery already handles:
+    /// rows are reused where the bytes they name still match (the local mode), and rows an external
+    /// baseline no longer covers are cleaned. The root that was refused arrives under its own fresh
+    /// id, and that fresh id is the one genuinely new key space of the pair.
+    ///
+    /// A table whose WORKSPACE resolves elsewhere is another registration rather than the next
+    /// generation of this one — ids are stripped against the workspace, so the two do not share a
+    /// key space — and the fresh table is returned untouched, which is the existing behaviour
+    /// ([`Self::eq`] says the same thing).
+    pub fn inheriting_root_ids(&self, fresh: &Self) -> Self {
+        if self.workspace_canonical != fresh.workspace_canonical {
+            return fresh.clone();
+        }
+        // Every id the fresh table carries by itself, gathered BEFORE any assignment: an id that
+        // one of the fresh roots minted for itself can never be inherited by another, whatever
+        // order the two are declared in.
+        let natural: std::collections::HashSet<&str> =
+            fresh.roots.iter().map(|root| root.id.as_str()).collect();
+        let mut taken: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut roots: Vec<Root> = Vec::with_capacity(fresh.roots.len());
+        for root in &fresh.roots {
+            let inherited = if root.id == CONFIGURATION_ROOT_ID {
+                // The reserved id never moves: a configuration root keeps it wherever its
+                // directory is, and nothing else may take it.
+                None
+            } else {
+                self.roots
+                    .iter()
+                    // Role is part of identity: extension with extension only, so a base
+                    // configuration that moved onto an ex-extension's directory is not handed
+                    // that extension's id and the empty id cannot wander off the configuration.
+                    .find(|known| {
+                        known.id != CONFIGURATION_ROOT_ID && known.declared == root.declared
+                    })
+                    .map(|known| known.id.as_str())
+                    .filter(|id| !natural.contains(id) && !taken.contains(id))
+            };
+            let id = inherited.unwrap_or(root.id.as_str());
+            taken.insert(id);
+            roots.push(Root {
+                id: id.to_owned(),
+                declared: root.declared.clone(),
+                canonical: root.canonical.clone(),
+            });
+        }
+        debug_assert!(
+            {
+                let mut seen = std::collections::HashSet::new();
+                roots.iter().all(|root| seen.insert(root.id.as_str()))
+            },
+            "re-stating a generation gave two directories one key space: {:?}",
+            roots.iter().map(|root| root.id.as_str()).collect::<Vec<_>>(),
+        );
+        Self {
+            workspace: fresh.workspace.clone(),
+            workspace_canonical: fresh.workspace_canonical.clone(),
+            roots,
+            excluded: fresh.excluded.clone(),
+            user_excluded: fresh.user_excluded.clone(),
+        }
     }
 
     /// Registered roots as `(id, declared path)`, in registration order.
@@ -1179,6 +1393,571 @@ mod tests {
         assert!(!rebound.contains("ext/kept"));
         assert!(!rebound.contains("ext/removed"), "a removed id is not rebound");
         assert!(!rebound.contains("ext/added"), "an added id is not rebound");
+    }
+
+    /// A retargeted root keeps its id and takes the fresh directory (github#277).
+    ///
+    /// The canonical spelling of a root is a fact about ONE generation: a root declared through a
+    /// link resolves to whatever the link points at when the table is built. A rebuild after the
+    /// link moved mints a NEW id for the same declared root, because `root_id_for` derives the id
+    /// from the canonical spelling — and the id is the durable identity of every row and external
+    /// address keyed by the root. `inheriting_root_ids` states the next generation without moving
+    /// identity: same declared spelling, same id, fresh directory.
+    #[test]
+    fn a_retargeted_root_keeps_its_id_and_takes_the_fresh_directory() {
+        let workspace = Path::new("/ws");
+        let cf_declared = workspace.join("cf");
+        let ext_declared = workspace.join("ext");
+        let old = WorkspaceRoots::with_stated_spellings(
+            workspace,
+            vec![
+                (CONFIGURATION_ROOT_ID.to_owned(), cf_declared.clone(), cf_declared.clone()),
+                ("ext".to_owned(), ext_declared.clone(), workspace.join("A")),
+            ],
+        );
+        let fresh = WorkspaceRoots::with_stated_spellings(
+            workspace,
+            vec![
+                (CONFIGURATION_ROOT_ID.to_owned(), cf_declared.clone(), cf_declared.clone()),
+                ("/ws/B".to_owned(), ext_declared.clone(), workspace.join("B")),
+            ],
+        );
+
+        let next = old.inheriting_root_ids(&fresh);
+
+        assert_eq!(
+            next.ids().collect::<Vec<_>>(),
+            vec![CONFIGURATION_ROOT_ID, "ext"],
+            "the ids of the generation being replaced are the ids of the next one",
+        );
+        let ext = next
+            .entries_with_canonical()
+            .find(|(id, ..)| *id == "ext")
+            .expect("the declared root survived the retarget");
+        assert_eq!(ext.1, ext_declared.as_path(), "the declared spelling is the fresh one");
+        assert_eq!(ext.2, workspace.join("B").as_path(), "so is the canonical spelling");
+    }
+
+    /// What the stale snapshot does, and what re-stating the generation buys (github#277).
+    ///
+    /// The link `ext -> A` is retargeted to `B`, so one declared spelling walks to a different
+    /// file. Against the stale table both files answer ONE key — the new target's canonical
+    /// spelling is not a prefix of any registered root, so attribution falls back to the walked
+    /// spelling — and a path named by the NEW target's own canonical spelling has no key at all.
+    /// Re-stating the generation under the same id fixes the second and keeps the first: the id
+    /// keeps its key space across a rebind (that is what `rebound_root_ids` and the transition are
+    /// for), so the two files are still told apart by their CONTENT under one id, not by two ids.
+    #[test]
+    fn a_stale_generation_hides_a_retargeted_root_until_it_is_restated() {
+        let workspace = Path::new("/ws");
+        let cf_declared = workspace.join("cf");
+        let ext_declared = workspace.join("ext");
+        let old = WorkspaceRoots::with_stated_spellings(
+            workspace,
+            vec![
+                (CONFIGURATION_ROOT_ID.to_owned(), cf_declared.clone(), cf_declared.clone()),
+                ("ext".to_owned(), ext_declared.clone(), workspace.join("A")),
+            ],
+        );
+        let fresh = WorkspaceRoots::with_stated_spellings(
+            workspace,
+            vec![
+                (CONFIGURATION_ROOT_ID.to_owned(), cf_declared.clone(), cf_declared.clone()),
+                ("/ws/B".to_owned(), ext_declared.clone(), workspace.join("B")),
+            ],
+        );
+        let relative = "CommonModules/М/Ext/Module.bsl";
+        let walked = ext_declared.join(relative);
+        let was = workspace.join("A").join(relative);
+        let now = workspace.join("B").join(relative);
+
+        // The defect as the issue states it: one key stands for the old file and the new one.
+        assert_eq!(old.root_of(&walked, &was), Some(FileKey::new("ext", relative)));
+        assert_eq!(
+            old.root_of(&walked, &now),
+            Some(FileKey::new("ext", relative)),
+            "control of the defect: the stale snapshot collapses the new target onto the old key",
+        );
+        // ... and a file NAMED by the new target's canonical spelling is outside every root it
+        // knows, so the walk of the new target cannot reach its own key.
+        assert_eq!(
+            old.root_of(&now, &now),
+            None,
+            "control of the defect: the stale snapshot does not know the fresh target at all",
+        );
+
+        let next = old.inheriting_root_ids(&fresh);
+
+        assert_eq!(
+            next.root_of(&now, &now),
+            Some(FileKey::new("ext", relative)),
+            "the fresh generation attributes the retargeted root's file under the SAME id",
+        );
+        assert_eq!(
+            next.root_of(&walked, &now),
+            Some(FileKey::new("ext", relative)),
+            "and the walked spelling still reaches it, as it did before the retarget",
+        );
+        assert_eq!(
+            next.root_of(&walked, &was),
+            Some(FileKey::new("ext", relative)),
+            "the row of the old target is still attributable by the spelling it was indexed under",
+        );
+    }
+
+    /// A table whose WORKSPACE resolves elsewhere is another registration, not this one's next
+    /// generation: ids are stripped against the workspace, so the two share no key space and
+    /// re-stating one under the other would decode ids of the wrong base. The fresh table is kept
+    /// as it is.
+    ///
+    /// The two registrations mint DIFFERENT ids for the same declared root — which is what a
+    /// workspace link retarget does, since the id is drawn from the canonical spelling relative to
+    /// the workspace — and that is the control below: with the guard removed, the fresh root would
+    /// inherit `ext` from the other registration and the answer would read as a re-statement. A
+    /// fixture where both tables minted one id could not tell the two apart.
+    #[test]
+    fn a_workspace_that_resolves_elsewhere_is_not_restated() {
+        let old = WorkspaceRoots::with_stated_spellings(
+            Path::new("/ws"),
+            vec![("ext".to_owned(), PathBuf::from("/ws/ext"), PathBuf::from("/ws/A"))],
+        );
+        let elsewhere = WorkspaceRoots::with_stated_spellings(
+            Path::new("/other"),
+            vec![("/other/B".to_owned(), PathBuf::from("/ws/ext"), PathBuf::from("/other/B"))],
+        );
+
+        assert_ne!(
+            old.workspace_canonical(),
+            elsewhere.workspace_canonical(),
+            "control: the two tables strip their ids against different directories",
+        );
+        assert_ne!(
+            old.ids().collect::<Vec<_>>(),
+            elsewhere.ids().collect::<Vec<_>>(),
+            "control: and they mint different ids, so a re-statement would be visible here",
+        );
+        assert_eq!(old.inheriting_root_ids(&elsewhere), elsewhere);
+    }
+
+    /// Two fresh roots cannot inherit one id: that would give two directories one key space, the
+    /// one thing a root id may not do. The refused root keeps the id it was built with, and
+    /// nothing panics.
+    #[test]
+    fn a_second_root_may_not_inherit_an_id_that_is_already_taken() {
+        let workspace = Path::new("/ws");
+        let declared = PathBuf::from("/ws/one");
+        let old = WorkspaceRoots::with_stated_spellings(
+            workspace,
+            vec![("kept".to_owned(), declared.clone(), PathBuf::from("/ws/A"))],
+        );
+        // Both fresh roots carry the SAME declared spelling, which `build` refuses to produce but
+        // a caller of the stating constructor can: the guard is about the id, not the directory.
+        let fresh = WorkspaceRoots::with_stated_spellings(
+            workspace,
+            vec![
+                ("first".to_owned(), declared.clone(), PathBuf::from("/ws/B")),
+                ("second".to_owned(), declared, PathBuf::from("/ws/C")),
+            ],
+        );
+
+        let next = old.inheriting_root_ids(&fresh);
+
+        assert_eq!(
+            next.ids().collect::<Vec<_>>(),
+            vec!["kept", "second"],
+            "the id is inherited once; the refused root keeps its own",
+        );
+        assert_eq!(
+            next.resolve_walked(&FileKey::new("second", "M.bsl")).as_deref(),
+            Some(Path::new("/ws/C/M.bsl")),
+            "and the refused root keeps the directory it was built with",
+        );
+    }
+
+    /// A retarget whose abandoned directory is declared as a root of the SAME generation
+    /// (github#277, MAJOR-1).
+    ///
+    /// The link `ext` used to lead to `y`, so the old table minted `y` as its id. In the next
+    /// generation the link leads to `z` (its natural id is `z`) and `y` — no longer reached through
+    /// the link — is declared as a root of its own (natural id `y`). One id cannot be both: it
+    /// belongs to the root it is NATURAL for, so the abandoned directory keeps `y` and the
+    /// retargeted link keeps its fresh `z`. The re-canonicalisation of the link is refused here —
+    /// deliberately, and documented on `inheriting_root_ids` — because inheriting would put two
+    /// directories in one key space.
+    ///
+    /// Both declaration orders are built, because a rule applied root by root would hand `y` to the
+    /// first root seen and pass exactly one of these.
+    #[test]
+    fn an_id_belongs_to_the_fresh_root_it_is_natural_for_whatever_the_order() {
+        let workspace = Path::new("/ws");
+        let link = workspace.join("ext");
+        let abandoned = workspace.join("y");
+        let retargeted = workspace.join("z");
+        let old = WorkspaceRoots::with_stated_spellings(
+            workspace,
+            vec![("y".to_owned(), link.clone(), abandoned.clone())],
+        );
+        let fresh_forward = WorkspaceRoots::with_stated_spellings(
+            workspace,
+            vec![
+                ("z".to_owned(), link.clone(), retargeted.clone()),
+                ("y".to_owned(), abandoned.clone(), abandoned.clone()),
+            ],
+        );
+        let fresh_backward = WorkspaceRoots::with_stated_spellings(
+            workspace,
+            vec![
+                ("y".to_owned(), abandoned.clone(), abandoned.clone()),
+                ("z".to_owned(), link.clone(), retargeted.clone()),
+            ],
+        );
+
+        for (order, fresh) in [("retarget first", &fresh_forward), ("owner first", &fresh_backward)]
+        {
+            let next = old.inheriting_root_ids(fresh);
+            let ids: Vec<&str> = next.ids().collect();
+            assert_eq!(ids.len(), 2, "one root per declared spelling ({order}): {ids:?}",);
+            let unique: std::collections::HashSet<&str> = ids.iter().copied().collect();
+            assert_eq!(unique.len(), ids.len(), "two roots share one key space ({order}): {ids:?}",);
+            let mut bound: Vec<(String, PathBuf)> = next
+                .entries_with_canonical()
+                .map(|(id, _, canonical)| (id.to_owned(), canonical.to_path_buf()))
+                .collect();
+            bound.sort();
+            assert_eq!(
+                bound,
+                vec![("y".to_owned(), abandoned.clone()), ("z".to_owned(), retargeted.clone())],
+                "the id stays with the root it is natural for, and the retargeted link gets its \
+                 own ({order})",
+            );
+        }
+
+        // The stability control: the SAME retarget with no new owner of the old id still inherits,
+        // which is the promise `inheriting_root_ids` exists for (github#277).
+        let without_owner = WorkspaceRoots::with_stated_spellings(
+            workspace,
+            vec![("z".to_owned(), link.clone(), retargeted.clone())],
+        );
+        let next = old.inheriting_root_ids(&without_owner);
+        assert_eq!(
+            next.ids().collect::<Vec<_>>(),
+            vec!["y"],
+            "a retarget that nobody else claims still keeps the root's id",
+        );
+        assert_eq!(
+            next.entries_with_canonical().next().map(|(_, declared, canonical)| {
+                (declared.to_path_buf(), canonical.to_path_buf())
+            }),
+            Some((link, retargeted)),
+            "under the fresh declared and canonical spellings",
+        );
+    }
+
+    /// The reserved empty id never moves (MAJOR-2 of the audit round).
+    ///
+    /// A legal config edit moves the base onto the directory an extension used to be declared at.
+    /// Matching by the declared spelling alone hands the configuration the retired extension's id
+    /// — the empty id then disappears, `configuration()`, `configuration_root()` and every stored
+    /// path with the reserved id break, and the transition reads `""` as changed and clears the
+    /// whole configuration corpus.
+    #[test]
+    fn the_configuration_keeps_the_reserved_id_when_the_base_moves_onto_an_extension() {
+        let workspace = Path::new("/ws");
+        let old_base = workspace.join("src/cf");
+        let ex_extension = workspace.join("vendor/cf");
+        let old = WorkspaceRoots::with_stated_spellings(
+            workspace,
+            vec![
+                (CONFIGURATION_ROOT_ID.to_owned(), old_base.clone(), old_base.clone()),
+                ("vendor/cf".to_owned(), ex_extension.clone(), ex_extension.clone()),
+            ],
+        );
+        // The extension is gone; the base now sits where it was declared.
+        let fresh = WorkspaceRoots::with_stated_spellings(
+            workspace,
+            vec![(CONFIGURATION_ROOT_ID.to_owned(), ex_extension.clone(), ex_extension.clone())],
+        );
+
+        let next = old.inheriting_root_ids(&fresh);
+
+        assert_eq!(
+            next.ids().collect::<Vec<_>>(),
+            vec![CONFIGURATION_ROOT_ID],
+            "the reserved id stays with the configuration root and the retired extension's id is \
+             not resurrected",
+        );
+        assert_eq!(
+            next.configuration(),
+            Some(ex_extension.as_path()),
+            "so `configuration()` still names the base configuration",
+        );
+    }
+
+    /// The same invariant in the other direction: an extension declared where the BASE used to be
+    /// must not take the reserved empty id, or the configuration's rows would be read as the
+    /// extension's.
+    #[test]
+    fn an_extension_declared_where_the_base_used_to_be_does_not_take_the_reserved_id() {
+        let workspace = Path::new("/ws");
+        let old_base = workspace.join("src/cf");
+        let new_base = workspace.join("vendor/cf");
+        let extension = workspace.join("ext");
+        let old = WorkspaceRoots::with_stated_spellings(
+            workspace,
+            vec![
+                (CONFIGURATION_ROOT_ID.to_owned(), old_base.clone(), old_base.clone()),
+                ("ext".to_owned(), extension.clone(), extension.clone()),
+            ],
+        );
+        let fresh = WorkspaceRoots::with_stated_spellings(
+            workspace,
+            vec![
+                (CONFIGURATION_ROOT_ID.to_owned(), new_base.clone(), new_base.clone()),
+                ("src/cf".to_owned(), old_base.clone(), old_base.clone()),
+            ],
+        );
+
+        let next = old.inheriting_root_ids(&fresh);
+
+        let ids: Vec<&str> = next.ids().collect();
+        assert_eq!(ids.len(), 2, "every fresh root survives: {ids:?}");
+        let unique: std::collections::HashSet<&str> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), 2, "two roots share the reserved id: {ids:?}");
+        assert_eq!(
+            next.configuration(),
+            Some(new_base.as_path()),
+            "the configuration keeps the reserved id wherever its directory is",
+        );
+        assert_eq!(
+            next.entries_with_canonical()
+                .find(|(id, ..)| *id == "src/cf")
+                .map(|(_, declared, _)| declared.to_path_buf()),
+            Some(old_base.clone()),
+            "and the extension declared on the old base's directory keeps its own id",
+        );
+
+        // The same match with no configuration root in the fresh table to mask it: an
+        // extension-only generation must not resurrect the reserved id either, or `configuration()`
+        // would name an extension and the configuration's stored paths would be read under it.
+        let extension_only = WorkspaceRoots::with_stated_spellings(
+            workspace,
+            vec![("src/cf".to_owned(), old_base.clone(), old_base.clone())],
+        );
+        let next = old.inheriting_root_ids(&extension_only);
+        assert_eq!(
+            next.ids().collect::<Vec<_>>(),
+            vec!["src/cf"],
+            "an extension never takes the reserved empty id",
+        );
+        assert!(next.configuration().is_none(), "and it must not become the configuration",);
+    }
+
+    /// The registration of a reader that holds an older generation reads as stale once the declared
+    /// root leads elsewhere, and as current whenever the id was minted from a spelling that resolved
+    /// to nowhere — the fail-open half of the rule (M6/M9 of the audit round).
+    #[test]
+    fn a_registration_reads_stale_only_when_the_declared_root_leads_somewhere_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let made = dirs(&base, &["a", "b"]);
+
+        let stale = WorkspaceRoots::with_stated_spellings(
+            &base,
+            vec![("ext".to_owned(), made[0].clone(), made[1].clone())],
+        );
+        assert!(
+            !stale.registration_is_current("ext"),
+            "the declared spelling leads to `a` while the table states `b`",
+        );
+
+        let current = WorkspaceRoots::with_stated_spellings(
+            &base,
+            vec![("ext".to_owned(), made[0].clone(), std::fs::canonicalize(&made[0]).unwrap())],
+        );
+        assert!(
+            current.registration_is_current("ext"),
+            "declared and stated canonical spellings agree",
+        );
+
+        let vanished = WorkspaceRoots::with_stated_spellings(
+            &base,
+            vec![(
+                "gone".to_owned(),
+                base.join("no-such-directory"),
+                base.join("no-such-directory"),
+            )],
+        );
+        assert!(
+            vanished.registration_is_current("gone"),
+            "a spelling that never resolved cannot prove anything — nothing to disprove",
+        );
+
+        assert!(
+            current.registration_is_current("never-registered"),
+            "an id the table never registered has no registration to be stale",
+        );
+    }
+
+    /// The fail-open half of the rule, on its own so it can be mutated and read separately (M9).
+    ///
+    /// An id minted from a spelling the table could NOT resolve (`canonical == declared`) is current
+    /// while that spelling stays unresolvable — nothing was proven then, nothing is disproven now —
+    /// and stays current when the destination appears AT THAT SAME SPELLING, which is the spelling
+    /// resolving to itself. A root that is merely absent, unreadable or never created is answered
+    /// for exactly as the generation that minted it answered for it.
+    #[test]
+    fn a_registration_minted_from_an_unresolvable_spelling_stays_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+
+        // (1) The destination did not exist when the table was built: the table stored the spelling
+        // itself. Absent now, and absent then — current.
+        let appears_later = base.join("appears-later");
+        let unresolvable = WorkspaceRoots::with_stated_spellings(
+            &base,
+            vec![("late".to_owned(), appears_later.clone(), appears_later.clone())],
+        );
+        assert!(
+            unresolvable.registration_is_current("late"),
+            "the table never resolved this spelling, so its absence disproves nothing",
+        );
+        // ... and the destination appearing IS the spelling resolving to itself: still current.
+        std::fs::create_dir_all(&appears_later).unwrap();
+        assert!(
+            unresolvable.registration_is_current("late"),
+            "the spelling now resolves to the directory the id was minted from",
+        );
+
+        // (2) The same shape on a plain (non-link) root whose declared spelling simply is not there.
+        let never = WorkspaceRoots::with_stated_spellings(
+            &base,
+            vec![("never".to_owned(), base.join("never-created"), base.join("never-created"))],
+        );
+        assert!(
+            never.registration_is_current("never"),
+            "a root that was never on disk has no resolved directory to have left",
+        );
+    }
+
+    /// The two sides of the resolved/spelling split, on real links.
+    ///
+    /// An id minted from a RESOLVED directory (`canonical != declared`, i.e. a link onto a live
+    /// target) remembers that target: it is stale once the link no longer leads there, whether it was
+    /// redirected onto a live directory elsewhere or onto nothing at all (M10). An id minted from the
+    /// SPELLING (the table could not resolve it, so `canonical == declared`) remembers no target and
+    /// follows its spelling wherever it leads — a link that appears later, and even one redirected
+    /// onto a third directory, stays current (M9, the contract this round settled).
+    #[cfg(unix)]
+    #[test]
+    fn an_id_minted_from_a_resolved_directory_is_stale_once_that_directory_is_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let made = dirs(&base, &["targets/one", "targets/two"]);
+
+        // The link is live when the table is built, so the id is minted from where it resolved to.
+        let link = base.join("ext");
+        std::os::unix::fs::symlink(&made[0], &link).unwrap();
+        let resolved = WorkspaceRoots::with_stated_spellings(
+            &base,
+            vec![("ext".to_owned(), link.clone(), std::fs::canonicalize(&link).unwrap())],
+        );
+        assert!(
+            resolved.registration_is_current("ext"),
+            "control: a live link onto the directory the id was minted from is current",
+        );
+
+        // Redirected onto a target that does not exist: the declared spelling stops resolving, and
+        // the id was NOT minted from the spelling — nothing can be proven, so it is stale.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(base.join("targets/gone"), &link).unwrap();
+        assert!(
+            !resolved.registration_is_current("ext"),
+            "the id was minted from the target this link resolved to, and it no longer leads there",
+        );
+
+        // The other half of the contract, and the shape that decides it: a link the table could not
+        // resolve when the id was minted (`canonical == declared` — "spelling-minted") remembers NO
+        // target, so it is current whatever its spelling leads to now. Such a root is attributed by
+        // its own spelling and opened through it again, i.e. it FOLLOWS the spelling; a link that
+        // appears later and leads somewhere else is a legal configuration, not a stale registration.
+        let later_link = base.join("later-link");
+        std::os::unix::fs::symlink(base.join("targets/new"), &later_link).unwrap();
+        let dangling = WorkspaceRoots::with_stated_spellings(
+            &base,
+            vec![("later-link".to_owned(), later_link.clone(), later_link.clone())],
+        );
+        assert!(
+            dangling.registration_is_current("later-link"),
+            "while the target is missing the spelling is followed as it stands",
+        );
+        std::fs::create_dir_all(base.join("targets/new")).unwrap();
+        assert!(
+            dangling.registration_is_current("later-link"),
+            "and the spelling-minted id follows the target that appeared, wherever it leads",
+        );
+        // ... including when it leads somewhere OTHER than the directory that appeared first — the
+        // id has no target memory, so a redirect cannot contradict it.
+        let other = base.join("targets/other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::remove_file(&later_link).unwrap();
+        std::os::unix::fs::symlink(&other, &later_link).unwrap();
+        assert!(
+            dangling.registration_is_current("later-link"),
+            "a spelling-minted root follows its spelling: there is no remembered target to disprove",
+        );
+    }
+
+    /// The same re-statement on a real retarget: a root declared through a live link moves to
+    /// another target, and the generation built afterwards keeps the id while attribution follows
+    /// the new target. A rebuild WITHOUT re-stating is the control: it reaches for a new id,
+    /// because the id is drawn from the canonical spelling.
+    #[cfg(unix)]
+    #[test]
+    fn a_live_retarget_is_restated_under_the_same_root_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = canonical_root(&dir);
+        let made = dirs(&workspace, &["cf", "targets/one", "targets/two"]);
+        let link = workspace.join("ext");
+        std::os::unix::fs::symlink(&made[1], &link).unwrap();
+        let (old, _) = WorkspaceRoots::build(&workspace, &made[0], std::slice::from_ref(&link));
+        let ext_id = old
+            .ids()
+            .find(|id| *id != CONFIGURATION_ROOT_ID)
+            .expect("the linked root is registered")
+            .to_owned();
+        assert_eq!(ext_id, "targets/one", "the id is the canonical spelling of the target");
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&made[2], &link).unwrap();
+        let (fresh, _) = WorkspaceRoots::build(&workspace, &made[0], std::slice::from_ref(&link));
+
+        assert!(
+            !fresh.contains_id(&ext_id),
+            "control: a rebuild alone mints the new target's id and orphans the old one",
+        );
+        assert!(fresh.contains_id("targets/two"));
+
+        let next = old.inheriting_root_ids(&fresh);
+
+        assert!(next.contains_id(&ext_id), "the id survives the retarget");
+        assert!(!next.contains_id("targets/two"), "and no second id is minted for the same root");
+        let walked = link.join(MODULE);
+        let canonical = std::fs::canonicalize(&made[2]).unwrap().join(MODULE);
+        assert_eq!(
+            next.root_of(&walked, &canonical),
+            Some(FileKey::new(ext_id.clone(), MODULE.to_owned())),
+            "attribution follows the FRESH target while the key space stays the old one",
+        );
+        let named_by_target = made[2].join(MODULE);
+        assert_eq!(
+            old.root_of(&named_by_target, &named_by_target),
+            None,
+            "control: the stale snapshot does not hold the new target at all",
+        );
+        assert_eq!(
+            next.root_of(&named_by_target, &named_by_target),
+            Some(FileKey::new(ext_id, MODULE.to_owned())),
+        );
     }
 
     mod containment {

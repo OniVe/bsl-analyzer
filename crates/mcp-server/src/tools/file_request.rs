@@ -37,6 +37,13 @@ pub(crate) enum RootedPathError {
     /// resolved here at all, because the kernel collapses it only after dereferencing each
     /// component, so any answer computed here would disagree with the file that opens.
     PathIsNotPlainRelative(String),
+    /// The id is registered, but the root it names can no longer be resolved to the directory the
+    /// table minted it from. The same `(root_id, path)` then names one file to this table and
+    /// another to the workspace — an id survives a retarget — so the pair is refused rather than
+    /// answered from a directory the table cannot vouch for. The cause is deliberately not named:
+    /// a retarget is one of the ways the declared spelling stops resolving, an unreachable target
+    /// (unmounted, not yet permitted) is another, and this error reports the observation.
+    RegistrationStale(String),
 }
 
 impl RootedPathError {
@@ -48,6 +55,7 @@ impl RootedPathError {
             Self::RootNotRegistered(_) => "unknown_root",
             Self::AbsolutePathWithRootId(_) => "absolute_path_under_root",
             Self::PathIsNotPlainRelative(_) => "path_not_relative_to_root",
+            Self::RegistrationStale(_) => "stale_root_registration",
         }
     }
 }
@@ -70,6 +78,11 @@ impl std::fmt::Display for RootedPathError {
                 "a path read against root '{root_id}' has to be plain relative names — no `..`, \
                  no `.`, no leading separator and no drive; spell the file as the hit does"
             ),
+            Self::RegistrationStale(root_id) => write!(
+                f,
+                "source root '{root_id}' can no longer be resolved to the directory it was \
+                 registered with; the resident's view may be stale — reload the workspace"
+            ),
         }
     }
 }
@@ -88,6 +101,10 @@ impl std::fmt::Display for RootedPathError {
 /// today's reading. An empty `root_id` is not that — it names the configuration, and
 /// resolving it is what makes a hit's path work when the configuration sits in a
 /// subdirectory of the workspace.
+///
+/// A named root must still be registered under its id AND that registration must be current: an
+/// id survives a retarget, so a table built before one answers about the directory the id left
+/// behind ([`bsl_search::WorkspaceRoots::registration_is_current`]).
 pub(crate) fn resolve_rooted_path(
     roots: &WorkspaceRoots,
     root_id: Option<&str>,
@@ -107,6 +124,12 @@ pub(crate) fn resolve_rooted_path(
         // Asked FIRST, so a caller with two wrong halves is told about the one that will
         // still be wrong after fixing the other.
         return Err(RootedPathError::RootNotRegistered(root_id.to_owned()));
+    }
+    // A registered id is not yet a CURRENT one: the id survives a root's retarget, so a table from
+    // an earlier generation answers this pair about a directory it can no longer resolve the id to.
+    // Checked before the pair is joined, because every answer below is a file of that directory.
+    if !roots.registration_is_current(root_id) {
+        return Err(RootedPathError::RegistrationStale(root_id.to_owned()));
     }
     // One rule, and it is about the SPELLING: every component must be a plain name.
     //
@@ -220,6 +243,7 @@ mod tests {
             FileError::Rooted(RootedPathError::RootNotRegistered("a".into())),
             FileError::Rooted(RootedPathError::AbsolutePathWithRootId("a".into())),
             FileError::Rooted(RootedPathError::PathIsNotPlainRelative("a".into())),
+            FileError::Rooted(RootedPathError::RegistrationStale("a".into())),
             FileError::NotInWorkspace,
             FileError::Unreadable,
         ];
@@ -237,5 +261,49 @@ mod tests {
         let partial = FileError::Unreadable.completeness().to_value();
         assert_eq!(partial["status"], "partial");
         assert_eq!(partial["reasons"][0]["code"], "unreadable_files");
+    }
+
+    /// An id survives a root's retarget, so a table built before one would answer a
+    /// `(root_id, path)` pair about the directory the id has left — a wrong answer wearing the
+    /// shape of a right one. The pair is refused instead, before it is joined to anything, and the
+    /// refusal names what was observed — the registered directory can no longer be reached through
+    /// the spelling — rather than guessing a cause for it.
+    #[cfg(unix)]
+    #[test]
+    fn a_retargeted_registration_is_refused_before_the_pair_is_joined() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("ws");
+        let configuration = workspace.join("cf");
+        let targets = dir.path().join("targets");
+        for (target, module) in [("one", "СтараяЦель"), ("two", "НоваяЦель")] {
+            std::fs::create_dir_all(targets.join(target)).unwrap();
+            std::fs::write(targets.join(target).join("M.bsl"), module).unwrap();
+        }
+        std::fs::create_dir_all(&configuration).unwrap();
+        let link = workspace.join("ext");
+        std::os::unix::fs::symlink(targets.join("one"), &link).unwrap();
+        let (roots, _) =
+            WorkspaceRoots::build(&workspace, &configuration, std::slice::from_ref(&link));
+        let ext_id =
+            roots.ids().find(|id| !id.is_empty()).expect("the link is registered").to_owned();
+
+        assert!(
+            resolve_rooted_path(&roots, Some(&ext_id), Path::new("M.bsl")).is_ok(),
+            "control: the registration is current before the retarget",
+        );
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(targets.join("two"), &link).unwrap();
+
+        assert_eq!(
+            resolve_rooted_path(&roots, Some(&ext_id), Path::new("M.bsl")),
+            Err(RootedPathError::RegistrationStale(ext_id.clone())),
+            "the pair must not be answered from the directory the id left",
+        );
+        let refusal = RootedPathError::RegistrationStale(ext_id.clone()).to_string();
+        assert!(
+            refusal.contains(&ext_id) && refusal.contains("can no longer be resolved"),
+            "the refusal must name both the root and what was observed: {refusal}",
+        );
     }
 }
