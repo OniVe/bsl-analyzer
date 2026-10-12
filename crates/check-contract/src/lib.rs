@@ -202,7 +202,6 @@ pub enum CleanupStatus {
 }
 
 /// Required positive wire bounds supplied by the caller.
-/// Normalized response shared by callers and backends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WireLimits {

@@ -133,7 +133,7 @@
     },
     "WireLimits": {
       "additionalProperties": false,
-      "description": "Required positive wire bounds supplied by the caller.\nNormalized response shared by callers and backends.",
+      "description": "Required positive wire bounds supplied by the caller.",
       "properties": {
         "max_code_bytes": {
           "description": "Maximum source size in UTF-8 bytes.",
