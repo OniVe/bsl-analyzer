@@ -545,6 +545,15 @@ rm -f "$WORK_DIR/github/README.md.bak"
 git add -A
 if git diff --cached --quiet 2>/dev/null; then
     log_ok "Нет изменений для синхронизации"
+    if [[ "$RELEASE_TARGET" == release ]]; then
+        if git ls-remote --tags origin "$COMMIT_TAG" | grep -q "$COMMIT_TAG"; then
+            log_warn "Тег $COMMIT_TAG уже существует, пропускаем создание"
+        else
+            git tag -a "$COMMIT_TAG" -m "Release $COMMIT_TAG"
+            git push origin "$COMMIT_TAG"
+            log_ok "Тег $COMMIT_TAG создан"
+        fi
+    fi
     exit 0
 fi
 

@@ -53,7 +53,12 @@ async fn workspace_client(root: &Path, warm: bool) -> Client {
 
 async fn client_without_graph(root: &Path) -> (Client, std::fs::File) {
     // Hold before construction: startup may otherwise publish before the first request.
-    let cache = WorkspaceCacheLayout::for_workspace(root);
+    let project = mcp_server::project::at(root).unwrap();
+    let cache_base = root
+        .parent()
+        .unwrap()
+        .join(format!("{}-cache", root.file_name().unwrap().to_string_lossy()));
+    let cache = WorkspaceCacheLayout::for_project(&project, Some(&cache_base), root, None).unwrap();
     cache.ensure().unwrap();
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -165,6 +170,7 @@ fn provider_of(body: &Value, category: &str) -> Option<String> {
 
 /// И2. Dictionary providers answer while a held lease prevents graph publication.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 async fn the_configuration_and_the_platform_answer_by_name() {
     let ws = stage_workspace();
     let (client, _lock) = client_without_graph(ws.path()).await;
@@ -195,6 +201,7 @@ async fn the_configuration_and_the_platform_answer_by_name() {
 
 /// И3. An unconsulted graph is named; releasing the lease lets it answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 async fn every_source_is_named_before_and_after_the_graph_is_built() {
     let ws = stage_workspace();
     let (client, lock) = client_without_graph(ws.path()).await;
@@ -256,6 +263,7 @@ async fn an_empty_list_says_whether_it_is_a_proven_zero() {
 ///
 /// The held lease keeps the graph unavailable while the platform answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 async fn a_resident_miss_is_answered_without_the_graph() {
     let ws = stage_workspace();
     let (client, _lock) = client_without_graph(ws.path()).await;

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use crate::change_hub::{ChangeEntry, Health, SinkCursor, WorkspaceChangeHub};
+use crate::change_hub::{CarriedDebt, ChangeEntry, Health, SinkCursor, WorkspaceChangeHub};
 use crate::graph::scan::{classify_changes, FileStat, WorkspaceDiff};
 use crate::graph::universe::ScanVerdict;
 
@@ -339,6 +339,37 @@ impl DiagnosticsState {
         self.apply_scan_drift(&changes, config_changed, &scan)
     }
 
+    /// Refuse a snapshot the baseline has outrun. Says whether it was refused.
+    ///
+    /// A scan is a snapshot of disk PAIRED with the baseline it was meant to be compared
+    /// against; once that baseline moves, the two describe different worlds and their diff
+    /// runs backwards — a file added since the snapshot was taken reads as a deletion (Ф12).
+    /// Checked before ANY of the snapshot's drift is interpreted, config edits included: the
+    /// rebuild a stale `config_changed` would ask for is built over a tree this walk never
+    /// read, so answering it here would be acting on a world that no longer exists.
+    ///
+    /// The refusal RE-ARMS rather than merely dropping. The reason this scan ran — a
+    /// reconcile debt the drain already cleared, a consumed force — is spent by then, and a
+    /// healthy cursor sends every following read back down the drain path; without re-arming,
+    /// the drift the hub lost would sit unapplied, and unreported, until the watchdog tick.
+    /// The snapshot itself goes too: `throttled_scan` caches unconditionally, so one taken
+    /// before the move would otherwise be handed to every read until it cools, each one
+    /// refusing it again — and the epoch only grows, so it can never become applicable.
+    fn refuse_scan_if_stale(&self, scan: &OwnedScan) -> bool {
+        let baseline = lock_recover(&self.inner).baseline_epoch;
+        if scan.baseline_epoch == baseline {
+            return false;
+        }
+        tracing::debug!(
+            snapshot = scan.baseline_epoch,
+            baseline,
+            "dropping a scan whose baseline moved under it; the next poll rescans"
+        );
+        self.force_scan.store(true, Ordering::SeqCst);
+        *lock_recover(&self.scan) = None;
+        true
+    }
+
     fn apply_scan_drift(
         &self,
         changes: &WorkspaceDiff,
@@ -347,6 +378,12 @@ impl DiagnosticsState {
     ) -> bool {
         if changes.is_empty() && !config_changed {
             return false;
+        }
+
+        // A snapshot the baseline has outrun speaks for another world, so none of its drift
+        // — the config edit included — can be applied to this one.
+        if self.refuse_scan_if_stale(scan) {
+            return true;
         }
 
         // Only an analyzer-config edit forces a full rebuild (it can change the
@@ -848,23 +885,64 @@ impl DiagnosticsState {
         None
     }
 
-    pub(super) fn resubscribe_cursor(&self) {
-        let Some(hub) = &self.change_hub else {
-            return;
-        };
+    /// Re-subscribe this state's hub cursor, dropping any prior one, and hand back the debt
+    /// the old cursor's re-subscription carried onto the new one — the token a successful
+    /// rebuild hands to [`Self::settle_rebuild_debt`].
+    ///
+    /// `None` when there is no hub, or when the cursor owed nothing to carry.
+    pub(super) fn resubscribe_cursor(&self) -> Option<(SinkCursor, CarriedDebt)> {
+        let hub = self.change_hub.as_ref()?;
         // Whether the stream was already covering the tree when this resident is about to
         // read it. A resident built while the watch is still arming derives its state from
         // a tree nobody was watching, and no event carries the window in between: until one
         // scan runs under an armed watch, this one keeps its own eyes on disk.
         self.hub_armed.store(hub.is_watching(), Ordering::SeqCst);
         let mut slot = lock_recover(&self.hub_cursor);
-        *slot = Some(match slot.take() {
+        let (cursor, carried) = match slot.take() {
             // The rebuild this precedes can fail, and a failed rebuild leaves the OLD
             // resident serving. Its outstanding reconcile has to survive the swap, or it
             // would be settled against a baseline that was never taken.
             Some(old) => hub.resubscribe(old),
-            None => hub.subscribe(),
-        });
+            None => (hub.subscribe(), None),
+        };
+        *slot = Some(cursor);
+        carried.map(|carried| (cursor, carried))
+    }
+
+    /// Settle the debt a SUCCESSFUL rebuild answered, under the pair it was carried with —
+    /// and only against the cursor that rebuild itself took.
+    ///
+    /// Between the re-subscription and this call the slot can have moved: an eviction drops
+    /// the cursor, and a newer rebuild replaces it. Cursor ids are never reused, so identity
+    /// is the whole check — the same rule [`Self::commit_drained_cursor`] applies to a
+    /// drain. Settling under a cursor that is no longer there would be answering a reconcile
+    /// on behalf of a subscription nobody holds. The pair travels as the carry captured it:
+    /// the hub refuses the settle if the cursor's loss was renamed or its position was cut in
+    /// the meantime, and nothing here may widen that refusal into a settle.
+    ///
+    /// Called BEFORE [`Self::ensure_hub_roots`]: a re-arm can open a fresh window, and that
+    /// window is not the one this rebuild answered.
+    pub(super) fn settle_rebuild_debt(&self, carried: Option<(SinkCursor, CarriedDebt)>) {
+        let Some((cursor, carried)) = carried else {
+            return;
+        };
+        let Some(hub) = &self.change_hub else {
+            return;
+        };
+        if *lock_recover(&self.hub_cursor) != Some(cursor) {
+            return;
+        }
+        // A refusal is not an error and must not be widened into one: the hub pays only the
+        // exact pair the carry captured, and by the time the rebuild succeeded the cursor may
+        // have been renamed by a newer window or cut by `make_room`. The debt survives and the
+        // next guard pass answers it; logging the pair here is what keeps a refusal that
+        // silently reverts a read to the slow path from being invisible in the log.
+        if !hub.settle_carried_debt(cursor, &carried) {
+            tracing::debug!(
+                ?carried,
+                "rebuild did not settle the carried debt; the cursor no longer holds the pair",
+            );
+        }
     }
 
     fn config_file_paths(&self) -> std::collections::HashSet<PathBuf> {
@@ -1366,6 +1444,7 @@ mod tests {
         MIN_RECONCILE_INTERVAL, RECONCILE_INTERVAL,
     };
     use super::super::test_support::*;
+    use crate::change_hub::test_support::overflow_the_cap;
     use crate::change_hub::Health;
 
     #[test]
@@ -3165,6 +3244,159 @@ mod tests {
         );
     }
 
+    /// #188: a successful rebuild HAS answered the reconcile its fresh cursor carried. Left
+    /// unsettled, the resident goes on owing a debt the build already paid, and every read
+    /// takes the scan path — a full tree walk per window for a loss nobody can act on — until
+    /// the watchdog tick a minute and a half later.
+    #[test]
+    fn a_successful_rebuild_settles_the_debt_it_carried() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+
+        let (state, hub) = state_with_hub(root);
+        state.ensure_loading();
+        wait_ready(&state);
+
+        hub.degrade_external();
+        // The baseline this fix moves: while the debt is owed, a read walks the tree. The
+        // stand uses a zero drift interval, so a read on the scan path never reuses a cache.
+        let owed = state.scan_count();
+        let _ = state.read(|_, _| ());
+        assert!(
+            state.scan_count() > owed,
+            "an owed debt does not put reads on the scan path — nothing is measured here",
+        );
+
+        state.kick_full_reload();
+        wait_until("the rebuild finishes", || match lock_recover(&state.inner).reload {
+            ReloadState::Running => Err("the rebuild is still running"),
+            ReloadState::Failed(_) => panic!("the rebuild failed"),
+            ReloadState::Idle => Ok(()),
+        });
+
+        let cursor = lock_recover(&state.hub_cursor).expect("the rebuilt resident holds a cursor");
+        assert_eq!(
+            hub.health_for(Some(cursor)),
+            Health::Healthy,
+            "the successful rebuild paid the debt its fresh cursor carried",
+        );
+
+        let scans = state.scan_count();
+        let _ = state.read(|_, _| ());
+        let _ = state.read(|_, _| ());
+        assert_eq!(state.scan_count(), scans, "a settled debt keeps reads off the scan path");
+    }
+
+    /// #188: settling moves the debt and nothing else. An edit that lands after the fresh
+    /// subscription — the window `edit_during_rebuild_applies_after_it` models — is still
+    /// delivered by the drain and applied, even though the rebuild that settles the debt read
+    /// its baseline before the edit existed. Settling by draining would have carried the
+    /// cursor's position away with the debt and dropped that edit.
+    #[test]
+    fn an_edit_from_the_rebuild_window_survives_the_settling_of_its_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+
+        let (state, hub) = state_with_hub(root);
+        state.ensure_loading();
+        wait_ready(&state);
+
+        // A debt to carry, and the fresh cursor a rebuild takes at its start.
+        hub.degrade_external();
+        let carried = state.resubscribe_cursor();
+        // The rebuild in flight, as `edit_during_rebuild_applies_after_it` models it.
+        lock_recover(&state.inner).reload = ReloadState::Running;
+
+        let mut observer = hub.subscribe();
+        std::thread::sleep(Duration::from_millis(10));
+        let module = module_path(root, "Сервер");
+        fs::write(&module, "&НаСервере\nФункция Считать() Экспорт Возврат 11; КонецФункции\n")
+            .unwrap();
+        wait_for_delivery(&hub, &mut observer, "Module.bsl", "the hub delivered the edit");
+        hub.unsubscribe(observer);
+
+        let gen0 = raw_generation(&state);
+        // The rebuild finishes and settles the debt it carried.
+        lock_recover(&state.inner).reload = ReloadState::Idle;
+        state.settle_rebuild_debt(carried);
+
+        let cursor = lock_recover(&state.hub_cursor).expect("the resident holds its cursor");
+        assert_eq!(hub.health_for(Some(cursor)), Health::Healthy, "the debt is settled");
+
+        // The edit from the window is DELIVERED, not SCANNED. With the debt settled, reads
+        // stay on the drain path, so the generation moves while the scan counter does not. A
+        // test that only read the file text would pass even had the settle been skipped and a
+        // scan found the edit — this half is what separates delivery from a walk.
+        let scans = state.scan_count();
+        wait_until("the window's edit applies by delivery", || {
+            let _ = state.read(|_, _| ());
+            match raw_generation(&state) {
+                now if now > gen0 => Ok(()),
+                now => Err(format!("generation still {now}")),
+            }
+        });
+        assert_eq!(
+            state.scan_count(),
+            scans,
+            "the edit arrived by the drain; a scan means the settled debt was still owed",
+        );
+        let text = state.read(|r, _| {
+            let fid = r.file_id_for(&module).unwrap();
+            r.analysis().file_text(fid)
+        });
+        match text {
+            ResidentOutcome::Ready(t, _) => {
+                assert!(t.contains("Возврат 11"), "the edit from the rebuild window was lost");
+            }
+            _ => panic!("expected Ready"),
+        }
+    }
+
+    /// #188, the cut: an overflow during the rebuild window cuts the resident's FRESH cursor
+    /// out of entries its baseline scan never read, and `make_room` does NOT rename the debt
+    /// that cursor already owed — one reconcile covers the cut too. So the loss alone still
+    /// names the carried window while the position has moved: the pair is what refuses the
+    /// settle. Without it, the successful rebuild would answer a reconcile it never performed
+    /// and the cut would vanish with the resident reading as fresh.
+    #[test]
+    fn an_overflow_during_the_rebuild_window_is_not_settled_by_the_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+
+        let (state, hub) = state_with_hub(root);
+        state.ensure_loading();
+        wait_ready(&state);
+
+        // The debt the rebuild carries, and the fresh cursor it takes at its start.
+        hub.degrade_external();
+        let carried = state.resubscribe_cursor().expect("the window's debt was carried");
+        // The window is open, the rebuild in flight, and nobody drains the fresh cursor.
+        lock_recover(&state.inner).reload = ReloadState::Running;
+        overflow_the_cap(&hub);
+
+        // The rebuild succeeds and tries to settle what it carried.
+        lock_recover(&state.inner).reload = ReloadState::Idle;
+        state.settle_rebuild_debt(Some(carried));
+
+        let cursor = lock_recover(&state.hub_cursor).expect("the resident holds its cursor");
+        assert!(
+            matches!(hub.health_for(Some(cursor)), Health::Degraded(_)),
+            "the cut must not be settled into silence",
+        );
+
+        // And the resident reads the cut: an owed reconcile puts the next read on the scan
+        // path, where the baseline covers what the hub dropped.
+        let scans = state.scan_count();
+        let _ = state.read(|_, _| ());
+        assert!(
+            state.scan_count() > scans,
+            "an owed reconcile after the cut has to make reads reconcile",
+        );
+    }
+
     /// Idle eviction releases the hub cursor so an evicted resident does not pin the
     /// accumulator against reclamation.
     ///
@@ -3705,20 +3937,41 @@ mod tests {
         );
     }
 
-    /// The epoch check guards the FILE diff, which is meaningless against a moved baseline.
-    /// A config change is not a diff — it says the analyzer setup changed, which staleness
-    /// cannot make untrue — and the rebuild it triggers reads the world afresh anyway.
-    /// Gating it too would strand config drift until the next reconcile tick, since the miss
-    /// check counts file paths only and a healthy read never scans.
+    /// A snapshot the baseline has outrun describes another world, and no part of its drift —
+    /// a config edit included — may be applied to this one. The rebuild a stale
+    /// `config_changed` would ask for is built over a tree that walk never read, and arrives
+    /// on evidence that has already been invalidated: the flag comes from a comparison
+    /// against a baseline that has since moved.
+    ///
+    /// Postponing it is not losing it. The refusal re-arms the scan and drops the snapshot, so
+    /// the next walk reads the edit against the CURRENT baseline and asks for the rebuild it
+    /// really owes — the control below.
     #[test]
-    fn a_config_change_survives_a_snapshot_the_epoch_check_refuses() {
+    fn a_stale_config_snapshot_does_not_rebuild_but_re_arms_the_scan() {
+        use ide::DiagnosticCode;
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         sample_workspace(root);
 
-        let (state, _hub) = state_with_hub(root);
+        let (mut state, _hub) = state_with_hub(root);
+        // A real drift interval, so a snapshot LEFT in the cache would be served: the
+        // assertion below that the refusal drops it is about behaviour, not a field that a
+        // zero interval would never read anyway.
+        state.drift_interval = Duration::from_secs(60);
         state.ensure_loading();
         wait_ready(&state);
+
+        // The control needs a diagnostic ENABLED under the config the resident serves, so
+        // its landing is evidence that the rebuild happened at all.
+        assert!(
+            matches!(
+                state
+                    .read(|r, _| r.config().is_disabled(DiagnosticCode::CanonicalSpellingKeywords)),
+                ResidentOutcome::Ready(false, _)
+            ),
+            "the stand needs a diagnostic that is enabled by default",
+        );
 
         let snapshot = state.throttled_scan(root).expect("a scan");
         // Move the baseline out from under the snapshot.
@@ -3731,15 +3984,63 @@ mod tests {
             seq: 1,
         }]);
         lock_recover(&state.inner).reload = ReloadState::Idle;
+        // A walk that began before the move finishing after it: its snapshot is cached
+        // carrying the older epoch, exactly as `throttled_scan` caches unconditionally.
+        *lock_recover(&state.scan) = Some(ScanCache {
+            at: Instant::now(),
+            stats: snapshot.stats.clone(),
+            config_fp: snapshot.config_fp,
+            baseline_epoch: snapshot.baseline_epoch,
+            verdict: snapshot.verdict,
+        });
 
+        let rebuilds = state.rebuilds_started.load(Ordering::SeqCst);
         let no_file_drift =
             WorkspaceDiff { added: Vec::new(), removed: Vec::new(), modified: Vec::new() };
         state.apply_scan_drift(&no_file_drift, true, &snapshot);
 
-        assert_ne!(
+        assert_eq!(
             lock_recover(&state.inner).reload,
             ReloadState::Idle,
-            "config drift is answered by a rebuild even when the snapshot is stale",
+            "a stale snapshot's config drift may not start a rebuild",
+        );
+        assert_eq!(
+            state.rebuilds_started.load(Ordering::SeqCst),
+            rebuilds,
+            "and no rebuild was started at all",
+        );
+        assert!(
+            state.force_scan.load(Ordering::SeqCst),
+            "the refusal has to re-arm the scan: nothing else still remembers the obligation",
+        );
+        assert!(
+            lock_recover(&state.scan).is_none(),
+            "the refused snapshot does not stay in the cache",
+        );
+
+        // Positive control: with a real config edit on disk the re-armed scan asks for the
+        // rebuild. The config drift was postponed, never lost.
+        write(
+            root,
+            "bsl-analyzer.toml",
+            "[diagnostics.parameters]\nCanonicalSpellingKeywords = false\n",
+        );
+        let scans = state.scan_count();
+        wait_until("the re-armed scan kicks the config rebuild", || {
+            match state
+                .read(|r, _| r.config().is_disabled(DiagnosticCode::CanonicalSpellingKeywords))
+            {
+                ResidentOutcome::Ready(true, _) => Ok(()),
+                _ => Err("the config edit has not landed"),
+            }
+        });
+        assert!(
+            state.scan_count() > scans,
+            "the re-armed obligation was honoured by a real walk, not a cache hit",
+        );
+        assert!(
+            state.rebuilds_started.load(Ordering::SeqCst) > rebuilds,
+            "the fresh config scan kicks the rebuild the stale one was refused",
         );
     }
 
