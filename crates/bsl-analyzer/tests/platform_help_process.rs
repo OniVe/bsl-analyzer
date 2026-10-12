@@ -375,16 +375,17 @@ fn corpus_variable_url_is_reported_without_userinfo_or_query() {
 }
 
 #[test]
-fn corpus_variable_with_http_is_a_configuration_error_not_a_fallback() {
+fn corpus_variable_with_http_selects_the_external_url_source() {
     let dir = project("");
     let (ok, log) = analyze_with_corpus_variable(
         dir.path(),
         "http://user:secret@127.0.0.1:1/help/manifest.json?token=abc",
     );
     assert!(ok, "{log}");
-    assert!(log.contains("`http` is not accepted") && log.contains("[platform_help]"), "{log}");
+    assert!(log.contains("chosen by the environment variable"), "{log}");
+    assert!(log.contains("external (http://127.0.0.1:1/help/manifest.json)"), "{log}");
     assert!(!log.contains("secret") && !log.contains("token=abc"), "{log}");
-    assert!(!log.contains("platform help loaded"), "{log}");
+    assert!(!log.contains("is not accepted"), "{log}");
 }
 
 #[test]

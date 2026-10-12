@@ -133,8 +133,8 @@ path = "platform-help/platform_data.json"
 `auto` не подставляются. В сеть ходит только `external` с явно заданным `url`.
 
 Без секции `[platform_help]` источник может назвать переменная окружения
-`BSL_PLATFORM_HELP_CORPUS`: локальный путь или `https://`-адрес `manifest.json`
-(`http://` — ошибка конфигурации). Секция `[platform_help]` приоритетнее
+`BSL_PLATFORM_HELP_CORPUS`: локальный путь или `http://`- либо `https://`-адрес
+`manifest.json`. Секция `[platform_help]` приоритетнее
 переменной; тогда переменная игнорируется с предупреждением в журнале. Адрес в
 журнале пишется без `user:password@` и строки запроса. Подробности —
 [platform-help.md](../platform-help.md).

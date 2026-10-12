@@ -324,14 +324,10 @@ impl PlatformHelp {
             Some(value) if is_url_like(&value.to_string_lossy()) => {
                 let text = value.to_string_lossy();
                 let shown = redact_url(&text);
-                let reason = if text.trim_start().to_ascii_lowercase().starts_with("http://") {
-                    format!("{CORPUS_ENV}: `http` is not accepted ({shown}); use `https` or a path")
-                } else {
-                    format!(
-                        "{CORPUS_ENV}: a URL ({shown}) is supported only by the bsl-analyzer \
-                         application; the library accepts a path"
-                    )
-                };
+                let reason = format!(
+                    "{CORPUS_ENV}: a URL ({shown}) is supported only by the bsl-analyzer \
+                     application; the library accepts a path"
+                );
                 Self::missing(PlatformHelpRequest::Unselected, reason)
             }
             Some(path) => Self::from_corpus_file(std::path::Path::new(&path)),
