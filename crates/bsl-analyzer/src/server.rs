@@ -481,9 +481,12 @@ fn handle_lsp_msg(state: &mut GlobalState, msg: Message) -> Result<()> {
         Message::Notification(not) => {
             handle_notification(state, not)?;
         }
-        Message::Response(resp) => {
-            tracing::warn!("Unexpected response: {:?}", resp);
-        }
+        // The server's own requests (refreshes, progress creation) are fire-and-forget: a client
+        // that answers them is following the protocol, and only a refusal is worth a warning.
+        Message::Response(resp) => match &resp.error {
+            Some(error) => tracing::warn!(id = ?resp.id, ?error, "client refused a server request"),
+            None => tracing::debug!(id = ?resp.id, "client answered a server request"),
+        },
     }
     Ok(())
 }
