@@ -3,6 +3,7 @@
 //! (`Справочники.<объект>`) already is.
 
 use hir::{HirDatabase, InferenceDiagnostic};
+use ide::{Analysis, DiagnosticCode, DiagnosticsConfig};
 use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
 use ide_db::RootDatabaseImpl;
 use std::path::PathBuf;
@@ -111,4 +112,60 @@ fn collection_methods_and_untrusted_shapes_stay_silent() {
 "#,
     );
     assert!(found.is_empty(), "these shapes must stay silent: {found:?}");
+}
+
+fn unresolved_field_messages(code: &str, with_configuration: bool) -> Vec<String> {
+    let fixture = format!("//- /test.bsl\n{code}");
+    let (mut db, file_id) = setup(&fixture);
+    if !with_configuration {
+        db.set_all_config_paths(Vec::new());
+    }
+    Analysis::from_database(db)
+        .diagnostics(file_id, &DiagnosticsConfig::all_enabled())
+        .into_iter()
+        .filter(|diag| diag.code == DiagnosticCode::UnresolvedField)
+        .map(|diag| diag.message)
+        .collect()
+}
+
+const EVERY_MANAGER_BACKED_KIND: &str = r#"Процедура Тест()
+    А = Метаданные.Справочники.НетСправочника;
+    Б = Метаданные.Документы.НетДокумента;
+    В = Метаданные.РегистрыСведений.НетРегистра;
+    Г = Метаданные.Перечисления.НетПеречисления;
+    Д = Метаданные.Отчеты.НетОтчета;
+    Е = Метаданные.ПланыВидовХарактеристик.НетПлана;
+    Ж = Метаданные.ПланыОбмена.НетПланаОбмена;
+    З = Метаданные.Константы.НетКонстанты;
+    И = Метаданные.Справочники.Справочник1;
+    К = Метаданные.Документы.Документ1;
+    Л = Метаданные.РегистрыСведений.РегистрСведений1;
+    М = Метаданные.Отчеты.ТестовыйОтчёт;
+    Н = Метаданные.ПланыВидовХарактеристик.ПланВидовХарактеристик1;
+    О = Метаданные.Константы.ПроизвольныйКонст;
+КонецПроцедуры
+"#;
+
+#[test]
+fn every_manager_backed_kind_reports_a_missing_object_by_name() {
+    let expected: Vec<String> = [
+        "НетСправочника",
+        "НетДокумента",
+        "НетРегистра",
+        "НетПеречисления",
+        "НетОтчета",
+        "НетПлана",
+        "НетПланаОбмена",
+        "НетКонстанты",
+    ]
+    .iter()
+    .map(|name| format!("Поле '{name}' не найдено у типа 'КоллекцияОбъектовМетаданных'"))
+    .collect();
+    assert_eq!(unresolved_field_messages(EVERY_MANAGER_BACKED_KIND, true), expected);
+}
+
+#[test]
+fn the_same_misses_stay_silent_when_no_configuration_is_visible() {
+    let found = unresolved_field_messages(EVERY_MANAGER_BACKED_KIND, false);
+    assert!(found.is_empty(), "nothing to check a member against: {found:?}");
 }
