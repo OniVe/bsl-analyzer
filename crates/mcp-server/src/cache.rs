@@ -988,6 +988,8 @@ mod tests {
         let accepted =
             WorkspaceCacheLayout::for_project(&project, Some(&explicit), workspace.path(), None)
                 .expect("an explicit cache inside the workspace remains supported");
-        assert!(accepted.root().starts_with(workspace.path().join("explicit-cache")));
+        assert!(accepted
+            .root()
+            .starts_with(workspace.path().canonicalize().unwrap().join("explicit-cache")));
     }
 }
