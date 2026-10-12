@@ -157,3 +157,64 @@ fn cursor_after_closing_quote_is_outside_type_string() {
     assert!(!has_label(&items, "СправочникСсылка.Справочник1"), "got {:?}", labels(&items));
     assert!(!has_label(&items, "Справочник1"), "got {:?}", labels(&items));
 }
+
+const PRIMITIVE_TYPES: [&str; 6] = ["Число", "Строка", "Дата", "Булево", "Неопределено", "Null"];
+
+#[test]
+fn type_string_without_prefix_offers_primitive_types() {
+    let items = complete(
+        r#"//- /test.bsl
+Процедура ОбработатьЗначение(Значение)
+    Если ТипЗнч(Значение) = Тип("$0") Тогда
+        Возврат;
+    КонецЕсли;
+КонецПроцедуры
+"#,
+    );
+
+    for name in PRIMITIVE_TYPES {
+        let count = items.iter().filter(|i| i.label == name).count();
+        assert_eq!(count, 1, "`{name}` expected exactly once, got {:?}", labels(&items));
+    }
+}
+
+#[test]
+fn type_string_partial_primitive_name_offers_it() {
+    let items = complete(
+        r#"//- /test.bsl
+Процедура ОбработатьЗначение(Значение)
+    Если ТипЗнч(Значение) = Тип("Чи$0") Тогда
+        Возврат;
+    КонецЕсли;
+КонецПроцедуры
+"#,
+    );
+
+    let item = items
+        .iter()
+        .find(|i| i.label == "Число")
+        .unwrap_or_else(|| panic!("`Число` expected, got {:?}", labels(&items)));
+    assert_eq!(item.insert_text, "Число");
+}
+
+#[test]
+fn primitive_types_are_not_offered_after_ref_prefix() {
+    let items = complete(
+        r#"//- /test.bsl
+Процедура ОбработатьЗначение(Значение)
+    Если ТипЗнч(Значение) = Тип("СправочникСсылка.$0") Тогда
+        Возврат;
+    КонецЕсли;
+КонецПроцедуры
+"#,
+    );
+
+    assert!(has_label(&items, "Справочник1"), "got {:?}", labels(&items));
+    for name in PRIMITIVE_TYPES {
+        assert!(
+            !has_label(&items, name),
+            "`{name}` after a dotted prefix, got {:?}",
+            labels(&items)
+        );
+    }
+}

@@ -8,6 +8,9 @@ use syntax::{SyntaxKind, SyntaxNode, TextSize};
 
 use super::{CompletionItem, CompletionItemKind, CompletionPosition};
 
+const PRIMITIVE_TYPE_NAMES: [&str; 6] =
+    ["Число", "Строка", "Дата", "Булево", "Неопределено", "Null"];
+
 /// Completion inside the string argument of `Тип("…")` / `Type("…")`: offers
 /// platform type names (`ТаблицаЗначений`, `Структура`, …) and configuration
 /// reference types (`СправочникСсылка.<Имя>`, `ДокументСсылка.<Имя>`, …).
@@ -54,6 +57,14 @@ pub(super) fn type_string_completions<DB: RootDatabase>(
 
     let mut items = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+
+    // Primitive and special types are absent from the platform type list, yet
+    // `Тип()` accepts them. They have no dotted form, so only without a base.
+    if base_lower.is_empty() {
+        for name in PRIMITIVE_TYPE_NAMES {
+            consider(&mut items, &mut seen, &base_lower, name);
+        }
+    }
 
     // Platform value types. Generic templated names such as
     // `ДокументСсылка.<Имя документа>` are skipped in `consider`: the concrete
