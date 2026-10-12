@@ -214,10 +214,15 @@ impl Register {
 
     /// Whether this declaration adopts the identified register.
     pub fn adopts(&self, base: &Register) -> bool {
+        self.adopts_by_kind_and_name(base) && self.extended_configuration_object == Some(base.uuid)
+    }
+
+    /// Whether this declaration can be treated as a partial overlay when the target UUID is
+    /// missing or stale. The caller still has to mark the resulting model open.
+    pub fn adopts_by_kind_and_name(&self, base: &Register) -> bool {
         self.object_belonging == ObjectBelonging::Adopted
             && self.mdo_type == base.mdo_type
             && stdx::case::eq_ignore_case(&self.name, &base.name)
-            && self.extended_configuration_object == Some(base.uuid)
     }
 
     /// The ownership declared by the metadata export.
@@ -582,6 +587,31 @@ mod tests {
 
         let calc_reg = Register::builder().mdo_type(MdoType::CalculationRegister).build();
         assert!(calc_reg.is_calculation_register());
+    }
+
+    #[test]
+    fn strict_adoption_still_requires_the_extended_configuration_uuid() {
+        let target = Uuid::new_v4();
+        let base = Register::builder()
+            .uuid(target)
+            .name("BaseRegister")
+            .mdo_type(MdoType::InformationRegister)
+            .build();
+        let stale_overlay = Register::builder()
+            .uuid(Uuid::new_v4())
+            .extension_ownership(ObjectBelonging::Adopted, Some(Uuid::new_v4()))
+            .name("baseregister")
+            .mdo_type(MdoType::InformationRegister)
+            .build();
+        assert!(stale_overlay.adopts_by_kind_and_name(&base));
+        assert!(!stale_overlay.adopts(&base));
+        let confirmed_overlay = Register::builder()
+            .uuid(Uuid::new_v4())
+            .extension_ownership(ObjectBelonging::Adopted, Some(target))
+            .name("BaseRegister")
+            .mdo_type(MdoType::InformationRegister)
+            .build();
+        assert!(confirmed_overlay.adopts(&base));
     }
 
     #[test]

@@ -765,6 +765,11 @@ pub fn chain_configuration<'db>(
                     standalone.apply_extension_common_attributes(*scope);
                     Arc::new(standalone)
                 }
+                Some((RootKind::Extension, None)) => {
+                    let mut standalone = (*config).clone();
+                    standalone.apply_legacy_common_attributes();
+                    Arc::new(standalone)
+                }
                 _ => config,
             }
         }

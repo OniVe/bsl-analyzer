@@ -1475,7 +1475,7 @@ mod tests {
                         name: "NewExt".to_owned(),
                         path: "src/cfe/NewExt".to_owned(),
                         depends_on: Vec::new(),
-                        scope: bsl_metadata::ExtensionScope::InfoBase,
+                        scope: Some(bsl_metadata::ExtensionScope::InfoBase),
                     },
                 )]
             } else {

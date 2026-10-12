@@ -21,10 +21,12 @@ use stdx::case::fold_lower_per_char;
 /// Bumped whenever a digest of the new recipe could equal a digest of an
 /// older one for a topology with different semantics, so persisted identities
 /// derived from a fingerprint can never match across incompatible formats. A
-/// recipe change confined to nodes whose own bytes change with it (the
+/// format bump also invalidates topology-derived builds made before the
+/// extension-register overlay semantics changed.
+/// A recipe change confined to nodes whose own bytes change with it (the
 /// visibility mode of external objects) needs no bump: every such digest is
 /// new, and the unchanged nodes still digest as before.
-pub const TOPOLOGY_FORMAT_VERSION: u32 = 3;
+pub const TOPOLOGY_FORMAT_VERSION: u32 = 4;
 
 /// Index of a node inside [`ExtensionTopology`]; stable for the lifetime of
 /// the topology value it came from.
@@ -212,10 +214,6 @@ pub enum TopologyError {
         name: String,
         path: PathBuf,
     },
-    MissingScope {
-        name: String,
-        path: PathBuf,
-    },
     /// A `dependsOn` edge pointing at an external object.
     ExternalInDependency {
         from: String,
@@ -313,11 +311,6 @@ impl fmt::Display for TopologyError {
             TopologyError::StructuredNotAnExtension { name, path } => {
                 write!(f, "extension '{name}': no Configuration.xml under {}", path.display())
             }
-            TopologyError::MissingScope { name, path } => write!(
-                f,
-                "extension '{name}' at {} has no scope; declare scope = \"InfoBase\" or \"DataSeparation\"",
-                path.display()
-            ),
             TopologyError::ExternalInDependency { from, name } => write!(
                 f,
                 "'{from}' depends on '{name}', but an external data processor or report \
@@ -1048,7 +1041,7 @@ mod tests {
     #[test]
     fn fingerprint_golden_vector() {
         let topology = build(vec![spec("TESTS", &["yaxunit"]), spec("yaxunit", &[])]).unwrap();
-        expect_test::expect!["37625c9e39336b117a36f73ff37d58839a4738b7f38657924a9c70a1ed7d84d2"]
+        expect_test::expect!["3b13a041c8c11a31560c8abdeee4edff4431c42e95b97df6c95f4003a455e98c"]
             .assert_eq(&topology.fingerprint().to_hex());
     }
 }

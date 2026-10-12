@@ -78,6 +78,7 @@ impl GlobalState {
         {
             self.show_warning_message(notice);
         }
+        let legacy_scope_warning = project.legacy_extension_scope_warning();
 
         self.supersede_call_hierarchy_index(base_db::SourceRootId(0));
 
@@ -111,6 +112,10 @@ impl GlobalState {
             if !self.vfs_done {
                 db.set_workspace_load_complete(false);
             }
+        }
+
+        if let Some(warning) = legacy_scope_warning {
+            self.show_warning_message(format!("bsl-analyzer: {warning}"));
         }
 
         self.update_diagnostics_config();

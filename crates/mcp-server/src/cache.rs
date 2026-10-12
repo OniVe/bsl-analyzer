@@ -712,7 +712,7 @@ mod tests {
                     name: "A".to_owned(),
                     path: "src/cfe/A".to_owned(),
                     depends_on: Vec::new(),
-                    scope: bsl_metadata::ExtensionScope::InfoBase,
+                    scope: Some(bsl_metadata::ExtensionScope::InfoBase),
                 },
             )]),
             externals: None,
@@ -753,15 +753,22 @@ mod tests {
                 name: name.to_owned(),
                 path: path.to_owned(),
                 depends_on: Vec::new(),
-                scope: bsl_metadata::ExtensionScope::InfoBase,
+                scope: Some(bsl_metadata::ExtensionScope::InfoBase),
             })
         };
+        let legacy =
+            project_model::ExtensionDecl::Structured(project_model::StructuredExtensionDecl {
+                name: "A".to_owned(),
+                path: "src/cfe/A".to_owned(),
+                depends_on: Vec::new(),
+                scope: None,
+            });
         let scoped = |scope| {
             project_model::ExtensionDecl::Structured(project_model::StructuredExtensionDecl {
                 name: "A".to_owned(),
                 path: "src/cfe/A".to_owned(),
                 depends_on: Vec::new(),
-                scope,
+                scope: Some(scope),
             })
         };
         let first = layout(vec![independent("A", "src/cfe/A"), independent("B", "src/cfe/B")]);
@@ -772,6 +779,8 @@ mod tests {
             independent("B", "src/cfe/B"),
         ]);
         assert_ne!(first.root(), different_scope.root(), "extension Scope changes cache identity");
+        let legacy = layout(vec![legacy, independent("B", "src/cfe/B")]);
+        assert_ne!(first.root(), legacy.root(), "legacy scope has its own cache identity");
 
         let dependency = layout(vec![
             independent("A", "src/cfe/A"),
@@ -779,7 +788,7 @@ mod tests {
                 name: "B".to_owned(),
                 path: "src/cfe/B".to_owned(),
                 depends_on: vec!["A".to_owned()],
-                scope: bsl_metadata::ExtensionScope::InfoBase,
+                scope: Some(bsl_metadata::ExtensionScope::InfoBase),
             }),
         ]);
         assert_ne!(first.root(), dependency.root(), "dependency visibility changes cache identity");

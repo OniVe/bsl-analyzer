@@ -8,6 +8,7 @@ use vfs::{FileId, FileSet, Vfs, VfsPath};
 const READER_B: FileId = FileId(1_000_001);
 const READER_C: FileId = FileId(1_000_002);
 const READER_CONTROL: FileId = FileId(1_000_003);
+const READER_D: FileId = FileId(1_000_004);
 const CODE: &str = r#"Процедура Проверить()
     Ссылка = Справочники.NativeCatalog.ПустаяСсылка();
     Число = Ссылка.OtherUse;
@@ -441,6 +442,795 @@ fn extension_only_workspace_does_not_treat_its_first_root_as_the_base() {
 }
 
 #[test]
+fn legacy_unknown_separator_uses_the_extension_roots_legacy_projection() {
+    let fixture = fixture_root();
+    let temp = tempfile::tempdir().expect("temporary fixture root");
+    let extension = temp.path().join("Extension");
+    copy_tree(&fixture.join("extensions/no-common"), &extension);
+    let attributes = extension.join("CommonAttributes");
+    fs::create_dir_all(&attributes).unwrap();
+    fs::write(
+        attributes.join("LegacyUnknown.xml"),
+        r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable">
+<CommonAttribute uuid="11111111-1111-1111-1111-111111111111"><Properties>
+<ObjectBelonging>Own</ObjectBelonging><Name>LegacyUnknown</Name><AutoUse>Use</AutoUse>
+<DataSeparation>Separate</DataSeparation>
+</Properties></CommonAttribute></MetaDataObject>"#,
+    )
+    .unwrap();
+
+    let roots = vec![(Some("Legacy".into()), extension.clone())];
+    let reader = extension.join("CommonModules/Probe/Ext/Module.bsl");
+    let readers = [(READER_B, reader, "Процедура Проверить()\nКонецПроцедуры")];
+    let mut workspace = WorkspaceConfigsSnapshot::from_paths(roots);
+    workspace.extension_scopes = vec![None];
+    let (fallback, _) = host_for(workspace.clone(), &readers, false);
+    let (bootstrapped, _) = host_for(workspace, &readers, true);
+
+    let assert_legacy = |register: &bsl_metadata::Register| {
+        assert!(register.common_attributes().iter().any(|field| {
+            field.name == "LegacyUnknown"
+                && field.attr_type == bsl_metadata::AttributeType::Unknown
+                && field.separator
+        }));
+        assert!(!register.common_attributes_open());
+    };
+    for db in [fallback.raw_database(), bootstrapped.raw_database()] {
+        let register = db
+            .resolve_register_for_file(
+                READER_B,
+                bsl_metadata::MdoType::InformationRegister,
+                "NativeRegister",
+            )
+            .expect("file-bound register");
+        assert_legacy(&register);
+    }
+    let inventory_register = bootstrapped
+        .raw_database()
+        .resolve_register_across_designer_roots(
+            bsl_metadata::MdoType::InformationRegister,
+            "NativeRegister",
+        )
+        .expect("designer-wide register");
+    assert_legacy(&inventory_register);
+}
+
+#[test]
+fn partial_register_overlays_merge_by_kind_and_name_with_owner_scoped_metadata() {
+    let fixture = fixture_root();
+    let temp = tempfile::tempdir().expect("temporary fixture roots");
+    let base = temp.path().join("base");
+    let a = temp.path().join("A");
+    let b = temp.path().join("B");
+    let c = temp.path().join("C");
+    let d = temp.path().join("D");
+    let hidden = temp.path().join("Hidden");
+    copy_tree(&fixture.join("base"), &base);
+    let base_register_path = base.join("InformationRegisters/BaseRegister.xml");
+    let base_register_xml = fs::read_to_string(&base_register_path).unwrap();
+    fs::write(
+        base_register_path,
+        base_register_xml.replace(
+            "</ChildObjects>",
+            "<Attribute uuid=\"f0000000-0000-0000-0000-000000000001\"><Properties><Name>BaseAttribute</Name><Type><v8:Type>xs:boolean</v8:Type></Type></Properties></Attribute></ChildObjects>",
+        ),
+    )
+    .unwrap();
+    for (name, root) in [("A", &a), ("B", &b), ("C", &c), ("D", &d)] {
+        copy_tree(&fixture.join("extensions/explicit-use"), root);
+        let register = root.join("InformationRegisters/BaseRegister.xml");
+        let mut xml = fs::read_to_string(&register).unwrap();
+        match name {
+            "A" => xml = xml.replace(
+                "0974fddb-727e-5ee2-bbb2-f9896e3c8862</ExtendedConfigurationObject>",
+                "11111111-1111-1111-1111-111111111111</ExtendedConfigurationObject>",
+            ),
+            "B" => xml = xml.replace(
+                "<ExtendedConfigurationObject>0974fddb-727e-5ee2-bbb2-f9896e3c8862</ExtendedConfigurationObject>",
+                "",
+            ),
+            "C" => xml = xml.replace(
+                "0974fddb-727e-5ee2-bbb2-f9896e3c8862</ExtendedConfigurationObject>",
+                "not-a-uuid</ExtendedConfigurationObject>",
+            ),
+            "D" => {}
+            _ => unreachable!(),
+        }
+        let (dimension, resource, attribute) = match name {
+            "A" => ("AKey", "AAmount", "AFlag"),
+            "B" => ("BKey", "BAmount", "BFlag"),
+            "C" => ("CKey", "CAmount", "CFlag"),
+            "D" => ("DKey", "DAmount", "DFlag"),
+            _ => unreachable!(),
+        };
+        let children = format!(
+            "<Dimension uuid=\"{name}0000000-0000-0000-0000-000000000001\"><Properties><Name>{dimension}</Name><Type><v8:Type>xs:string</v8:Type><v8:StringQualifiers><v8:Length>20</v8:Length><v8:AllowedLength>Variable</v8:AllowedLength></v8:StringQualifiers></Type></Properties></Dimension>\
+<Resource uuid=\"{name}0000000-0000-0000-0000-000000000002\"><Properties><Name>{resource}</Name><Type><v8:Type>xs:decimal</v8:Type><v8:NumberQualifiers><v8:Digits>10</v8:Digits><v8:FractionDigits>0</v8:FractionDigits><v8:AllowedSign>Any</v8:AllowedSign></v8:NumberQualifiers></Type></Properties></Resource>\
+<Attribute uuid=\"{name}0000000-0000-0000-0000-000000000003\"><Properties><Name>{attribute}</Name><Type><v8:Type>xs:boolean</v8:Type></Type></Properties></Attribute>"
+        );
+        xml = xml.replace("<ChildObjects/>", &format!("<ChildObjects>{children}</ChildObjects>"));
+        fs::write(register, xml).unwrap();
+    }
+    copy_reader_extension_root(&fixture.join("extensions/no-common"), &hidden, true);
+
+    // A uses InfoBase, B deliberately has no scope, and C uses DataSeparation. This pins
+    // owner-local scope selection across the mixed chain instead of applying C's scope globally.
+    // A and C contribute scoped Own fields. B follows
+    // the old e3c05f5e AutoUse/Content projection, including unknown types and raw separator.
+    write_common_attribute(
+        &a,
+        "ACommon",
+        "Own",
+        "Use",
+        "<DataSeparation>DontUse</DataSeparation>",
+        "",
+    );
+    write_common_attribute(
+        &b,
+        "LegacyAuto",
+        "Adopted",
+        "Use",
+        "<DataSeparation>Separate</DataSeparation>",
+        "<Content><xr:Item><xr:Metadata>InformationRegister.BaseRegister</xr:Metadata><xr:Use>Auto</xr:Use></xr:Item></Content>",
+    );
+    write_common_attribute(
+        &b,
+        "LegacyUse",
+        "Adopted",
+        "DontUse",
+        "<DataSeparation>DontUse</DataSeparation>",
+        "<Content><xr:Item><xr:Metadata>InformationRegister.BaseRegister</xr:Metadata><xr:Use>Use</xr:Use></xr:Item></Content>",
+    );
+    write_common_attribute(
+        &b,
+        "LegacyDontUse",
+        "Adopted",
+        "Use",
+        "<DataSeparation>DontUse</DataSeparation>",
+        "<Content><xr:Item><xr:Metadata>InformationRegister.BaseRegister</xr:Metadata><xr:Use>DontUse</xr:Use></xr:Item></Content>",
+    );
+    write_common_attribute(
+        &b,
+        "LegacyIndependent",
+        "Adopted",
+        "Use",
+        "<DataSeparation>Separate</DataSeparation><SeparatedDataUse>Independently</SeparatedDataUse>",
+        "<Content><xr:Item><xr:Metadata>InformationRegister.BaseRegister</xr:Metadata><xr:Use>Use</xr:Use></xr:Item></Content>",
+    );
+    write_common_attribute(
+        &c,
+        "CCommon",
+        "Own",
+        "Use",
+        "<DataSeparation>DontUse</DataSeparation>",
+        "",
+    );
+    write_common_attribute(
+        &d,
+        "DCommon",
+        "Own",
+        "Use",
+        "<DataSeparation>DontUse</DataSeparation>",
+        "",
+    );
+    let legacy_auto = b.join("CommonAttributes/LegacyAuto.xml");
+    let legacy_xml = fs::read_to_string(&legacy_auto).unwrap();
+    fs::write(legacy_auto, legacy_xml.replace("<Type><v8:Type>xs:boolean</v8:Type></Type>", ""))
+        .unwrap();
+
+    let roots = vec![
+        (None, base.clone()),
+        (Some("A".into()), a.clone()),
+        (Some("B".into()), b.clone()),
+        (Some("C".into()), c.clone()),
+        (Some("D".into()), d.clone()),
+    ];
+    let mut workspace = WorkspaceConfigsSnapshot::from_paths(roots);
+    workspace.extension_scopes = vec![
+        None,
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+        None,
+        Some(bsl_metadata::ExtensionScope::DataSeparation),
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    ];
+    workspace.closures = vec![vec![], vec![], vec![1], vec![1, 2], vec![1, 2, 3]];
+    workspace.topological_order = vec![0, 1, 2, 3, 4];
+    let code = "Процедура Проверить()\n    Набор = РегистрыСведений.BaseRegister.СоздатьНаборЗаписей();\n    Запись = Набор.Добавить();\n    Значение = Запись.DCommon;\n    ОшибкаОткрытойМодели = Запись.DefinitelyMissing379;\n    Запрос = Новый Запрос(\"ВЫБРАТЬ Р.DCommon, Р.DefinitelyMissing379 ИЗ РегистрСведений.BaseRegister КАК Р\");\nКонецПроцедуры";
+    let reader_b = b.join("CommonModules/Probe/Ext/Module.bsl");
+    let reader_d = d.join("CommonModules/Probe/Ext/Module.bsl");
+    let readers = [(READER_B, reader_b, code), (READER_D, reader_d, code)];
+    let (fallback, _) = host_for(workspace.clone(), &readers, false);
+    let (mut bootstrapped, _) = host_for(workspace, &readers, true);
+
+    let fields = |register: &bsl_metadata::Register| {
+        (
+            register.dimensions().iter().map(|f| f.name().to_string()).collect::<Vec<_>>(),
+            register.resources().iter().map(|f| f.name().to_string()).collect::<Vec<_>>(),
+            register.attributes().iter().map(|f| f.name().to_string()).collect::<Vec<_>>(),
+        )
+    };
+    let contains =
+        |fields: &[String], expected: &str| fields.iter().any(|field| field.as_str() == expected);
+    let c_full = fallback
+        .raw_database()
+        .resolve_register_for_file(
+            READER_D,
+            bsl_metadata::MdoType::InformationRegister,
+            "BaseRegister",
+        )
+        .unwrap();
+    let c_full_named = fallback
+        .raw_database()
+        .resolve_register_by_name_for_file(READER_D, "BaseRegister")
+        .unwrap();
+    let c_typed = bootstrapped
+        .raw_database()
+        .resolve_register_for_file(
+            READER_D,
+            bsl_metadata::MdoType::InformationRegister,
+            "BaseRegister",
+        )
+        .unwrap();
+    let c_named = bootstrapped
+        .raw_database()
+        .resolve_register_by_name_for_file(READER_D, "BaseRegister")
+        .unwrap();
+    let c_all = bootstrapped
+        .raw_database()
+        .resolve_register_across_roots(bsl_metadata::MdoType::InformationRegister, "BaseRegister")
+        .unwrap();
+    let c_designer = bootstrapped
+        .raw_database()
+        .resolve_register_across_designer_roots(
+            bsl_metadata::MdoType::InformationRegister,
+            "BaseRegister",
+        )
+        .unwrap();
+    assert_eq!(c_typed.as_ref(), c_full.as_ref(), "bootstrap equals full chain fallback");
+    assert_eq!(c_full_named.as_ref(), c_full.as_ref(), "fallback typed and by-name lookups agree");
+    assert_eq!(c_named.as_ref(), c_typed.as_ref(), "typed and by-name file resolvers agree");
+    assert_eq!(
+        c_all.as_ref(),
+        c_typed.as_ref(),
+        "all-root projection uses each declaration owner's scope"
+    );
+    assert_eq!(
+        c_designer.as_ref(),
+        c_typed.as_ref(),
+        "designer-root projection uses each declaration owner's scope"
+    );
+    let (dimensions, resources, attributes) = fields(&c_typed);
+    for expected in ["Key", "AKey", "BKey", "CKey", "DKey"] {
+        assert!(contains(&dimensions, expected), "dimensions={dimensions:?}");
+    }
+    for expected in ["Amount", "AAmount", "BAmount", "CAmount", "DAmount"] {
+        assert!(contains(&resources, expected), "resources={resources:?}");
+    }
+    for expected in ["BaseAttribute", "AFlag", "BFlag", "CFlag", "DFlag"] {
+        assert!(contains(&attributes, expected), "attributes={attributes:?}");
+    }
+    assert!(c_typed.common_attributes_open(), "each partial Adopted overlay preserves uncertainty");
+    let register_a = bootstrapped
+        .raw_database()
+        .resolve_register_for_file(
+            READER_B,
+            bsl_metadata::MdoType::InformationRegister,
+            "BaseRegister",
+        )
+        .unwrap();
+    let (a_dimensions, a_resources, a_attributes) = fields(&register_a);
+    assert!(contains(&a_dimensions, "AKey") && contains(&a_dimensions, "BKey"));
+    assert!(!contains(&a_dimensions, "CKey"), "B cannot see C's dependent overlay");
+    assert!(
+        contains(&a_resources, "Amount")
+            && contains(&a_resources, "AAmount")
+            && contains(&a_resources, "BAmount")
+    );
+    assert!(contains(&a_attributes, "AFlag") && contains(&a_attributes, "BFlag"));
+    assert!(!contains(&a_attributes, "CFlag"));
+    assert!(register_a.common_attributes_open());
+    assert!(register_a.common_attributes().iter().any(|field| field.name == "ACommon"));
+    assert!(!register_a.common_attributes().iter().any(|field| field.name == "CCommon"));
+    let legacy = c_typed.common_attributes();
+    for expected in ["LegacyAuto", "LegacyUse", "LegacyIndependent"] {
+        assert!(legacy.iter().any(|field| field.name == expected), "legacy={legacy:?}");
+    }
+    assert!(!legacy.iter().any(|field| field.name == "LegacyDontUse"), "legacy={legacy:?}");
+    assert!(legacy.iter().any(|field| field.name == "LegacyAuto"
+        && field.attr_type == bsl_metadata::AttributeType::Unknown
+        && field.separator));
+    assert!(legacy.iter().any(|field| field.name == "LegacyIndependent" && field.separator));
+    assert!(register_a.common_attributes().iter().any(|field| field.name == "LegacyUse"));
+    assert!(c_typed.common_attributes().iter().any(|field| field.name == "CCommon"));
+
+    // Hidden is independent, so keep it out of the D-chain parity snapshot above. It still
+    // sees the main configuration: its valid adopted UUID closes the model and contributes
+    // only the fields declared by its own copy of BaseRegister.
+    let mut hidden_workspace = WorkspaceConfigsSnapshot::from_paths(vec![
+        (None, base.clone()),
+        (Some("A".into()), a.clone()),
+        (Some("B".into()), b.clone()),
+        (Some("C".into()), c.clone()),
+        (Some("D".into()), d.clone()),
+        (Some("Hidden".into()), hidden.clone()),
+    ]);
+    hidden_workspace.extension_scopes = vec![
+        None,
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+        None,
+        Some(bsl_metadata::ExtensionScope::DataSeparation),
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    ];
+    hidden_workspace.closures = vec![vec![], vec![], vec![1], vec![1, 2], vec![1, 2, 3], vec![]];
+    hidden_workspace.topological_order = vec![0, 1, 2, 3, 4, 5];
+    let reader_hidden = hidden.join("CommonModules/Probe/Ext/Module.bsl");
+    let hidden_readers = [(READER_CONTROL, reader_hidden, code)];
+    let (hidden_host, _) = host_for(hidden_workspace, &hidden_readers, true);
+    let hidden_register = hidden_host
+        .raw_database()
+        .resolve_register_by_name_for_file(READER_CONTROL, "BaseRegister")
+        .unwrap();
+    assert!(
+        hidden_register.dimensions().iter().any(|f| f.name() == "Key"),
+        "the main register remains visible to the independent extension"
+    );
+    assert!(!hidden_register.dimensions().iter().any(|f| f.name() == "AKey"));
+    assert!(
+        !hidden_register.common_attributes_open(),
+        "the matching adopted UUID closes the model"
+    );
+
+    assert!(c_typed.common_attributes().iter().any(|field| field.name == "DCommon"));
+    let analysis = bootstrapped.analysis();
+    let diagnostics = analysis.diagnostics(READER_D, &DiagnosticsConfig::all_enabled());
+    assert!(
+        !diagnostics.iter().any(|d| d.message.contains("DefinitelyMissing379")),
+        "the partial register is open, so unlisted fields cannot be called unresolved"
+    );
+    assert!(!diagnostics.iter().any(|d| d.message.contains("DCommon")
+        && matches!(
+            d.code,
+            DiagnosticCode::UnresolvedField | DiagnosticCode::UnknownFieldInQuery
+        )));
+    let offset = code.find("Запись.DCommon").unwrap() as u32 + "Запись.".len() as u32;
+    let hover = analysis.hover(READER_D, offset, Locale::Ru).expect("known register field hover");
+    assert!(hover.markup.contains("Булево"), "{}", hover.markup);
+    drop(analysis);
+    let completion_code = "Процедура Подсказка()\n    Набор = РегистрыСведений.BaseRegister.СоздатьНаборЗаписей();\n    Запись = Набор.Добавить();\n    Запись.D\nКонецПроцедуры";
+    bootstrapped.raw_database_mut().set_file_text(READER_D, completion_code);
+    let completion = bootstrapped.analysis().completions(
+        READER_D,
+        completion_code.find("Запись.D").unwrap() as u32 + "Запись.D".len() as u32,
+        None,
+        Locale::Ru,
+    );
+    let c_flag = completion
+        .iter()
+        .find(|item| item.label == "DCommon")
+        .expect("known register field completion");
+    assert!(c_flag.detail.as_deref().unwrap_or_default().contains("Булево"), "{c_flag:?}");
+}
+
+#[test]
+fn legacy_and_scoped_own_objects_use_their_owner_scope_for_base_area_separators() {
+    let fixture = fixture_root();
+    let base_fixture = fixture.join("base");
+    let no_common_fixture = fixture.join("extensions/no-common");
+    let make_area_separators_application_visible = |base: &std::path::Path| {
+        for name in ["AreaUse", "AreaNoAuto"] {
+            let path = base.join(format!("CommonAttributes/{name}.xml"));
+            let xml = fs::read_to_string(&path).unwrap();
+            let simultaneous = xml.replace(
+                "<SeparatedDataUse>Independently</SeparatedDataUse>",
+                "<SeparatedDataUse>IndependentlyAndSimultaneously</SeparatedDataUse>",
+            );
+            assert_ne!(xml, simultaneous, "{name} fixture precondition changed");
+            fs::write(path, simultaneous).unwrap();
+        }
+    };
+
+    // no-common contains extension-owned objects but no local CommonAttributes/Content.
+    // The base fixture has AreaUse and AreaNoAuto as extension-separated area separators.
+    // A missing scope uses the old projection and must not infer membership from those base
+    // declarations; a scoped DataSeparation owner does, while InfoBase is the negative control.
+    for (root_name, scope, inherits_area_separators) in [
+        ("Legacy", None, false),
+        ("AreaScoped", Some(bsl_metadata::ExtensionScope::DataSeparation), true),
+        ("InfoBaseScoped", Some(bsl_metadata::ExtensionScope::InfoBase), false),
+    ] {
+        let temp = tempfile::tempdir().expect("temporary roots");
+        let base = temp.path().join("base");
+        let extension = temp.path().join(root_name);
+        copy_tree(&base_fixture, &base);
+        make_area_separators_application_visible(&base);
+        copy_tree(&no_common_fixture, &extension);
+        let own_catalog_path = extension.join("Catalogs/NativeCatalog.xml");
+        let own_catalog_xml = fs::read_to_string(&own_catalog_path).unwrap();
+        fs::write(
+            own_catalog_path,
+            own_catalog_xml.replacen(
+                "<Properties>",
+                "<Properties><ObjectBelonging>Own</ObjectBelonging>",
+                1,
+            ),
+        )
+        .unwrap();
+        let extension_reader = extension.join("CommonModules/Probe/Ext/Module.bsl");
+        let code = "Процедура Проверить()\nКонецПроцедуры";
+        let readers = [(READER_B, extension_reader, code)];
+        let mut workspace = WorkspaceConfigsSnapshot::from_paths(vec![
+            (None, base.clone()),
+            (Some(root_name.into()), extension.clone()),
+        ]);
+        workspace.extension_scopes = vec![None, scope];
+        workspace.closures = vec![vec![], vec![]];
+        workspace.topological_order = vec![0, 1];
+        let (fallback, _) = host_for(workspace.clone(), &readers, false);
+        let (bootstrapped, _) = host_for(workspace, &readers, true);
+
+        let base_configuration = bootstrapped.raw_database().configuration_for_root(&base);
+        let base_set = base_configuration.common_attribute_set();
+        for name in ["AreaUse", "AreaNoAuto"] {
+            let area = base_set
+                .attributes
+                .iter()
+                .find(|attribute| attribute.name == name)
+                .expect("raw base area-separator declaration");
+            assert_eq!(area.data_separation, Some(true), "{name}");
+            assert_eq!(
+                area.configuration_extensions_separation,
+                Some(bsl_metadata::common_attribute::ConfigurationExtensionsSeparation::Separate),
+                "{name}"
+            );
+            assert_eq!(
+                area.separated_data_use,
+                Some(bsl_metadata::common_attribute::SeparatedDataUse::IndependentlyAndSimultaneously),
+                "{name} test copy makes inherited field visibility observable"
+            );
+        }
+
+        let actual = bootstrapped
+            .raw_database()
+            .resolve_metadata_object_for_file(
+                READER_B,
+                bsl_metadata::MdoType::Catalog,
+                "NativeCatalog",
+            )
+            .expect("extension-owned catalog");
+        assert_eq!(actual.object_belonging(), bsl_metadata::ObjectBelonging::Own);
+        let expected = fallback
+            .raw_database()
+            .resolve_metadata_object_for_file(
+                READER_B,
+                bsl_metadata::MdoType::Catalog,
+                "NativeCatalog",
+            )
+            .expect("full fallback catalog");
+        assert_eq!(actual.as_ref(), expected.as_ref(), "{root_name}: bootstrap/fallback parity");
+        assert!(!actual.common_attributes_open, "{root_name}: no local ambiguity");
+        for name in ["AreaUse", "AreaNoAuto"] {
+            assert_eq!(
+                actual.common_attributes.iter().any(|field| field.name == name),
+                inherits_area_separators,
+                "{root_name}: {name} membership follows this object's owner scope"
+            );
+        }
+    }
+
+    // C reads the same visible base+A+B+C roots through the full fallback, incremental
+    // file resolver, all-roots view, and designer-roots view. Distinct Own objects let each
+    // declaration retain the scope of its owner: A=InfoBase, B=legacy None, C=DataSeparation.
+    let temp = tempfile::tempdir().expect("temporary mixed-scope roots");
+    let base = temp.path().join("base");
+    let a = temp.path().join("A");
+    let b = temp.path().join("B");
+    let c = temp.path().join("C");
+    copy_tree(&base_fixture, &base);
+    make_area_separators_application_visible(&base);
+    for root in [&a, &b, &c] {
+        copy_reader_extension_root(&no_common_fixture, root, false);
+    }
+    let native_catalog = fs::read_to_string(no_common_fixture.join("Catalogs/NativeCatalog.xml"))
+        .expect("Own catalog source fixture");
+    for (root, name, uuid) in [
+        (&a, "OwnerA", "a0000000-0000-0000-0000-000000000001"),
+        (&b, "OwnerB", "b0000000-0000-0000-0000-000000000001"),
+        (&c, "OwnerC", "c0000000-0000-0000-0000-000000000001"),
+    ] {
+        let own_catalog = native_catalog
+            .replace("NativeCatalog", name)
+            .replace("399f8343-4746-561e-afd0-5ffac27ea5f7", uuid)
+            .replacen("<Properties>", "<Properties><ObjectBelonging>Own</ObjectBelonging>", 1);
+        let path = root.join(format!("Catalogs/{name}.xml"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, own_catalog).unwrap();
+    }
+    write_common_attribute(
+        &a,
+        "ACommon",
+        "Own",
+        "Use",
+        "<DataSeparation>DontUse</DataSeparation>",
+        "",
+    );
+    write_common_attribute(
+        &b,
+        "LegacyAuto",
+        "Own",
+        "Use",
+        "<DataSeparation>Separate</DataSeparation>",
+        "",
+    );
+    write_common_attribute(
+        &c,
+        "CCommon",
+        "Own",
+        "Use",
+        "<DataSeparation>DontUse</DataSeparation>",
+        "",
+    );
+
+    let roots = vec![
+        (None, base.clone()),
+        (Some("A".into()), a.clone()),
+        (Some("B".into()), b.clone()),
+        (Some("C".into()), c.clone()),
+    ];
+    let mut workspace = WorkspaceConfigsSnapshot::from_paths(roots);
+    workspace.extension_scopes = vec![
+        None,
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+        None,
+        Some(bsl_metadata::ExtensionScope::DataSeparation),
+    ];
+    workspace.closures = vec![vec![], vec![], vec![1], vec![1, 2]];
+    workspace.topological_order = vec![0, 1, 2, 3];
+    let reader = c.join("CommonModules/Probe/Ext/Module.bsl");
+    let readers = [(READER_C, reader, "Процедура Проверить()\nКонецПроцедуры")];
+    let (fallback, _) = host_for(workspace.clone(), &readers, false);
+    let (bootstrapped, _) = host_for(workspace, &readers, true);
+
+    let mixed_base = bootstrapped.raw_database().configuration_for_root(&base);
+    for name in ["AreaUse", "AreaNoAuto"] {
+        let area = mixed_base
+            .common_attribute_set()
+            .attributes
+            .iter()
+            .find(|attribute| attribute.name == name)
+            .expect("raw mixed-chain base area separator");
+        assert_eq!(area.data_separation, Some(true), "{name}");
+        assert_eq!(
+            area.configuration_extensions_separation,
+            Some(bsl_metadata::common_attribute::ConfigurationExtensionsSeparation::Separate),
+            "{name}"
+        );
+        assert_eq!(
+            area.separated_data_use,
+            Some(bsl_metadata::common_attribute::SeparatedDataUse::IndependentlyAndSimultaneously),
+            "{name}"
+        );
+    }
+
+    for (name, local_field, expect_area_separators) in
+        [("OwnerA", "ACommon", false), ("OwnerB", "LegacyAuto", false), ("OwnerC", "CCommon", true)]
+    {
+        let actual = bootstrapped
+            .raw_database()
+            .resolve_metadata_object_for_file(READER_C, bsl_metadata::MdoType::Catalog, name)
+            .expect("C sees each dependency-owned Own object");
+        let full = fallback
+            .raw_database()
+            .resolve_metadata_object_for_file(READER_C, bsl_metadata::MdoType::Catalog, name)
+            .expect("full fallback resolves the same Own object");
+        let all = bootstrapped
+            .raw_database()
+            .resolve_metadata_object_across_roots(bsl_metadata::MdoType::Catalog, name)
+            .expect("all-roots projection");
+        let designer = bootstrapped
+            .raw_database()
+            .resolve_metadata_object_across_designer_roots(bsl_metadata::MdoType::Catalog, name)
+            .expect("designer-roots projection");
+        assert_eq!(actual.as_ref(), full.as_ref(), "{name}: full fallback parity");
+        assert_eq!(actual.object_belonging(), bsl_metadata::ObjectBelonging::Own);
+        assert_eq!(all.as_ref(), actual.as_ref(), "{name}: same roots across all-roots view");
+        assert_eq!(
+            designer.as_ref(),
+            actual.as_ref(),
+            "{name}: same roots across designer-roots view"
+        );
+        assert!(actual.common_attributes.iter().any(|field| field.name == local_field));
+        assert!(!actual.common_attributes_open, "{name}: complete Own projection");
+        for area_field in ["AreaUse", "AreaNoAuto"] {
+            assert_eq!(
+                actual.common_attributes.iter().any(|field| field.name == area_field),
+                expect_area_separators,
+                "{name}: inherited area membership follows its declaration owner's scope"
+            );
+        }
+    }
+}
+
+#[test]
+fn register_overlay_controls_keep_own_unknown_and_other_kinds_separate() {
+    let fixture = fixture_root();
+    for (case, belonging) in [("own", "Own"), ("unknown", "Unexpected"), ("confirmed", "Adopted")] {
+        let temp = tempfile::tempdir().expect("temporary fixture roots");
+        let base = temp.path().join("base");
+        let extension = temp.path().join("extension");
+        copy_tree(&fixture.join("base"), &base);
+        copy_tree(&fixture.join("extensions/explicit-use"), &extension);
+        let register_path = extension.join("InformationRegisters/BaseRegister.xml");
+        let mut xml = fs::read_to_string(&register_path).unwrap();
+        xml = xml.replace(
+            "<ObjectBelonging>Adopted</ObjectBelonging>",
+            &format!("<ObjectBelonging>{belonging}</ObjectBelonging>"),
+        );
+        if belonging != "Adopted" {
+            xml = xml.replace(
+                "<ExtendedConfigurationObject>0974fddb-727e-5ee2-bbb2-f9896e3c8862</ExtendedConfigurationObject>",
+                "",
+            );
+        }
+        xml = xml.replace(
+            "<ChildObjects/>",
+            "<ChildObjects><Dimension uuid=\"d0000000-0000-0000-0000-000000000001\"><Properties><Name>LocalOnly</Name><Type><v8:Type>xs:boolean</v8:Type></Type></Properties></Dimension></ChildObjects>",
+        );
+        fs::write(register_path, xml).unwrap();
+        let reader_path = extension.join("CommonModules/Probe/Ext/Module.bsl");
+        let code = if case == "confirmed" {
+            "Процедура Проверить()\n    Набор = РегистрыСведений.BaseRegister.СоздатьНаборЗаписей();\n    Запись = Набор.Добавить();\n    Ошибка = Запись.MissingCompat379;\n    Запрос = Новый Запрос(\"ВЫБРАТЬ Р.MissingCompat379 ИЗ РегистрСведений.BaseRegister КАК Р\");\nКонецПроцедуры"
+        } else {
+            "Процедура Проверить()\nКонецПроцедуры"
+        };
+        let readers = [(READER_B, reader_path, code)];
+        let mut workspace = WorkspaceConfigsSnapshot::from_paths(vec![
+            (None, base.clone()),
+            (Some("E".into()), extension.clone()),
+        ]);
+        workspace.extension_scopes = vec![None, Some(bsl_metadata::ExtensionScope::InfoBase)];
+        workspace.closures = vec![vec![], vec![]];
+        workspace.topological_order = vec![0, 1];
+        let (fallback, _) = host_for(workspace.clone(), &readers, false);
+        let (bootstrapped, _) = host_for(workspace, &readers, true);
+        let actual = bootstrapped
+            .raw_database()
+            .resolve_register_for_file(
+                READER_B,
+                bsl_metadata::MdoType::InformationRegister,
+                "BaseRegister",
+            )
+            .unwrap();
+        let expected = fallback
+            .raw_database()
+            .resolve_register_for_file(
+                READER_B,
+                bsl_metadata::MdoType::InformationRegister,
+                "BaseRegister",
+            )
+            .unwrap();
+        assert_eq!(actual.as_ref(), expected.as_ref(), "{case}: bootstrap/fallback parity");
+        assert!(actual.dimensions().iter().any(|field| field.name() == "LocalOnly"));
+        if case == "confirmed" {
+            assert!(actual.dimensions().iter().any(|field| field.name() == "Key"));
+            assert!(actual.resources().iter().any(|field| field.name() == "Amount"));
+            assert!(!actual.common_attributes_open(), "confirmed target UUID remains closed");
+            let diagnostics =
+                bootstrapped.analysis().diagnostics(READER_B, &DiagnosticsConfig::all_enabled());
+            assert!(diagnostics.iter().any(|d| d.code == DiagnosticCode::UnresolvedField
+                && d.message.contains("MissingCompat379")));
+            assert!(diagnostics.iter().any(|d| d.code == DiagnosticCode::UnknownFieldInQuery
+                && d.message.contains("MissingCompat379")));
+        } else {
+            assert!(
+                !actual.dimensions().iter().any(|field| field.name() == "Key"),
+                "{case}: independent declarations replace base instead of partial-merging"
+            );
+        }
+    }
+
+    // A different-kind namesake is independent. A later adopted information-register overlay
+    // still folds into the base InfoRegister and becomes the effective same-name winner.
+    let temp = tempfile::tempdir().expect("temporary fixture roots");
+    let base = temp.path().join("base");
+    let extension = temp.path().join("kind-extension");
+    let later_extension = temp.path().join("later-extension");
+    copy_tree(&fixture.join("base"), &base);
+    copy_tree(&fixture.join("extensions/explicit-use"), &extension);
+    let source = fs::read_to_string(
+        fixture.join("extensions/explicit-use/InformationRegisters/BaseRegister.xml"),
+    )
+    .unwrap();
+    fs::remove_file(extension.join("InformationRegisters/BaseRegister.xml")).unwrap();
+    let other_kind = source
+        .replace("<InformationRegister ", "<AccumulationRegister ")
+        .replace("</InformationRegister>", "</AccumulationRegister>")
+        .replace("<ObjectBelonging>Adopted</ObjectBelonging>", "<ObjectBelonging>Own</ObjectBelonging>")
+        .replace("<ExtendedConfigurationObject>0974fddb-727e-5ee2-bbb2-f9896e3c8862</ExtendedConfigurationObject>", "")
+        .replace("<ChildObjects/>", "<ChildObjects><Dimension uuid=\"e0000000-0000-0000-0000-000000000001\"><Properties><Name>OtherKindKey</Name></Properties></Dimension></ChildObjects>");
+    let other_kind_path = extension.join("AccumulationRegisters/BaseRegister.xml");
+    fs::create_dir_all(other_kind_path.parent().unwrap()).unwrap();
+    fs::write(other_kind_path, other_kind).unwrap();
+    copy_tree(&fixture.join("extensions/explicit-use"), &later_extension);
+    let later_register_path = later_extension.join("InformationRegisters/BaseRegister.xml");
+    let later_xml = fs::read_to_string(&later_register_path).unwrap();
+    fs::write(
+        later_register_path,
+        later_xml.replace(
+            "<ChildObjects/>",
+            "<ChildObjects><Dimension uuid=\"e1000000-0000-0000-0000-000000000001\"><Properties><Name>LaterInfoKey</Name><Type><v8:Type>xs:boolean</v8:Type></Type></Properties></Dimension></ChildObjects>",
+        ),
+    )
+    .unwrap();
+    let reader_path = later_extension.join("CommonModules/Probe/Ext/Module.bsl");
+    let readers = [(READER_B, reader_path, "Процедура Проверить()\nКонецПроцедуры")];
+    let mut workspace = WorkspaceConfigsSnapshot::from_paths(vec![
+        (None, base.clone()),
+        (Some("E".into()), extension.clone()),
+        (Some("F".into()), later_extension.clone()),
+    ]);
+    workspace.extension_scopes = vec![
+        None,
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    ];
+    workspace.closures = vec![vec![], vec![], vec![1]];
+    workspace.topological_order = vec![0, 1, 2];
+    let (fallback, _) = host_for(workspace.clone(), &readers, false);
+    let (bootstrapped, _) = host_for(workspace, &readers, true);
+    let full_typed = fallback
+        .raw_database()
+        .resolve_register_for_file(
+            READER_B,
+            bsl_metadata::MdoType::InformationRegister,
+            "BaseRegister",
+        )
+        .unwrap();
+    let full_named = fallback
+        .raw_database()
+        .resolve_register_by_name_for_file(READER_B, "BaseRegister")
+        .unwrap();
+    let typed = bootstrapped
+        .raw_database()
+        .resolve_register_for_file(
+            READER_B,
+            bsl_metadata::MdoType::InformationRegister,
+            "BaseRegister",
+        )
+        .unwrap();
+    let named = bootstrapped
+        .raw_database()
+        .resolve_register_by_name_for_file(READER_B, "BaseRegister")
+        .unwrap();
+    assert_eq!(
+        typed.as_ref(),
+        full_typed.as_ref(),
+        "full fallback typed lookup selects the later same-kind overlay"
+    );
+    assert_eq!(
+        full_named.as_ref(),
+        full_typed.as_ref(),
+        "full fallback by-name and typed lookup agree"
+    );
+    assert_eq!(named.as_ref(), typed.as_ref(), "incremental by-name and typed lookup agree");
+    assert_eq!(typed.mdo_type(), bsl_metadata::MdoType::InformationRegister);
+    assert!(typed.dimensions().iter().any(|field| field.name() == "Key"));
+    assert!(typed.dimensions().iter().any(|field| field.name() == "LaterInfoKey"));
+    assert!(!typed.dimensions().iter().any(|field| field.name() == "OtherKindKey"));
+    assert_eq!(named.mdo_type(), bsl_metadata::MdoType::InformationRegister);
+    let accumulation = bootstrapped
+        .raw_database()
+        .resolve_register_for_file(
+            READER_B,
+            bsl_metadata::MdoType::AccumulationRegister,
+            "BaseRegister",
+        )
+        .unwrap();
+    assert_eq!(accumulation.mdo_type(), bsl_metadata::MdoType::AccumulationRegister);
+    assert!(accumulation.dimensions().iter().any(|field| field.name() == "OtherKindKey"));
+}
+
+#[test]
 fn refresh_matches_fresh_full_fallback_and_repairs_partial_common_metadata() {
     let temp = tempfile::tempdir().expect("temporary fixture roots");
     let base = temp.path().join("base");
@@ -665,4 +1455,37 @@ fn copy_reader_extension_root(
             fs::copy(source.join(relative), target).expect("copy adopted base object");
         }
     }
+}
+
+fn write_common_attribute(
+    root: &std::path::Path,
+    name: &str,
+    belonging: &str,
+    auto_use: &str,
+    separation: &str,
+    content: &str,
+) {
+    let path = root.join(format!("CommonAttributes/{name}.xml"));
+    let uuid = match name {
+        "ACommon" => "a1000000-0000-0000-0000-000000000001",
+        "CCommon" => "c1000000-0000-0000-0000-000000000001",
+        "DCommon" => "d1000000-0000-0000-0000-000000000001",
+        "LegacyAuto" => "b1000000-0000-0000-0000-000000000001",
+        "LegacyUse" => "b2000000-0000-0000-0000-000000000002",
+        "LegacyDontUse" => "b3000000-0000-0000-0000-000000000003",
+        "LegacyIndependent" => "b4000000-0000-0000-0000-000000000004",
+        _ => unreachable!("test fixture name must have a stable UUID"),
+    };
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        path,
+        format!(
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema">
+<CommonAttribute uuid="{uuid}"><Properties>
+<ObjectBelonging>{belonging}</ObjectBelonging><Name>{name}</Name><AutoUse>{auto_use}</AutoUse>
+{separation}<Type><v8:Type>xs:boolean</v8:Type></Type>{content}
+</Properties></CommonAttribute></MetaDataObject>"#
+        ),
+    )
+    .unwrap();
 }

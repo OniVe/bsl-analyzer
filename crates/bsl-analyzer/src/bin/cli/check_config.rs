@@ -85,6 +85,12 @@ pub fn check_config(
         .into());
     }
 
+    if let Some(warning) =
+        project.as_ref().ok().and_then(project_model::Project::legacy_extension_scope_warning)
+    {
+        eprintln!("warning: {warning}");
+    }
+
     Ok(())
 }
 

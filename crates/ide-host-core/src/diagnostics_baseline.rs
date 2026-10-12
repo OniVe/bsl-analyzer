@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use ide::diagnostics_baseline::{
     parse_diagnostics_baseline, DiagnosticsBaseline, DiagnosticsBaselineError,
-    DiagnosticsBaselineErrorSummary, DiagnosticsBaselineExtension, DiagnosticsBaselineScope,
-    DiagnosticsBaselineState, DiagnosticsBaselineSummary,
+    DiagnosticsBaselineErrorSummary, DiagnosticsBaselineScope, DiagnosticsBaselineState,
+    DiagnosticsBaselineSummary,
 };
 use ide::partitioned_diagnostics_baseline::{
     load_diagnostics_baseline_set, load_diagnostics_baseline_set_reusing,
@@ -631,15 +631,7 @@ fn project_scope(
 ) -> DiagnosticsBaselineScope {
     DiagnosticsBaselineScope {
         source_root: scope.source_root.clone(),
-        extensions: scope
-            .extensions
-            .iter()
-            .map(|extension| DiagnosticsBaselineExtension {
-                name: extension.name.clone(),
-                path: extension.path.clone(),
-                depends_on: extension.depends_on.clone(),
-            })
-            .collect(),
+        extensions: scope.extensions.clone(),
     }
 }
 

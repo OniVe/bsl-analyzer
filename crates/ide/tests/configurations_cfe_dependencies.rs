@@ -207,7 +207,7 @@ fn project_built_snapshot_resolves_a_transitive_chain() {
             name: name.to_string(),
             path: format!("../bsl-metadata/fixtures/cfe_dependencies/{dir}"),
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
-            scope: bsl_metadata::ExtensionScope::InfoBase,
+            scope: Some(bsl_metadata::ExtensionScope::InfoBase),
         })
     };
     let config = ProjectConfig {

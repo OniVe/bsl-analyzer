@@ -749,10 +749,10 @@ impl RootDatabaseImpl {
         );
         assert!(
             snapshot.kinds.iter().zip(&snapshot.extension_scopes).all(|(kind, scope)| {
-                matches!((kind, scope), (metadata::RootKind::Extension, Some(_)))
+                matches!((kind, scope), (metadata::RootKind::Extension, _))
                     || (*kind != metadata::RootKind::Extension && scope.is_none())
             }),
-            "workspace-configs snapshot: every extension requires an explicit Scope"
+            "workspace-configs snapshot: base and external roots cannot declare an extension Scope"
         );
         assert!(
             snapshot.closures.iter().flatten().all(|&dep| dep < snapshot.paths.len()),
@@ -1081,11 +1081,12 @@ impl RootDatabaseImpl {
         if snapshot.kinds[owner] != metadata::RootKind::Extension {
             return None;
         }
-        let scope = snapshot.extension_scopes[owner]
-            .expect("registered extension requires an explicit Scope");
         let local = metadata::common_attribute_set(self, listing);
         let main = main_listing.map(|listing| metadata::common_attribute_set(self, listing));
-        Some(local.for_extension_object(main.as_deref(), scope, mdo_type, name))
+        Some(match snapshot.extension_scopes[owner] {
+            Some(scope) => local.for_extension_object(main.as_deref(), scope, mdo_type, name),
+            None => local.for_legacy_object(mdo_type, name),
+        })
     }
 
     /// Resolve a single metadata object visible to `file_id` at per-MDO Salsa
@@ -1190,7 +1191,9 @@ impl RootDatabaseImpl {
                 overlay.set_common_attributes(common);
             }
             match &mut merged {
-                Some(base) if overlay.adopts(base) => base.apply_extension_overlay(&overlay),
+                Some(base) if overlay.adopts_by_kind_and_name(base) => {
+                    base.apply_extension_overlay(&overlay)
+                }
                 Some(base) => *base = overlay,
                 None => merged = Some(overlay),
             }
@@ -1251,7 +1254,9 @@ impl RootDatabaseImpl {
                 overlay.set_common_attributes(common);
             }
             match &mut merged {
-                Some(base) if overlay.adopts(base) => base.apply_extension_overlay(&overlay),
+                Some(base) if overlay.adopts_by_kind_and_name(base) => {
+                    base.apply_extension_overlay(&overlay)
+                }
                 Some(base) => *base = overlay,
                 None => merged = Some(overlay),
             }
@@ -2044,16 +2049,38 @@ impl RootDatabaseImpl {
         mdo_type: bsl_metadata::MdoType,
         name: &str,
     ) -> Option<Arc<bsl_metadata::MetadataObject>> {
+        let snapshot = self.workspace_configs_snapshot();
+        let main_listing =
+            snapshot.paths.iter().zip(&snapshot.kinds).find_map(|((_, path), kind)| {
+                (*kind == metadata::RootKind::Base)
+                    .then(|| self.metadata_listing(&path.to_string_lossy()))
+                    .flatten()
+            });
         let mut acc: Option<bsl_metadata::MetadataObject> = None;
         for root in roots {
             let Some(listing) = self.metadata_listing(&root) else { continue };
             if let Some(found) =
                 metadata::resolve_metadata_object(self, listing, mdo_type, name.to_string())
             {
+                let mut overlay = (*found).clone();
+                if let Some(mut common) = self.extension_common_attributes_for_listing(
+                    listing,
+                    main_listing,
+                    mdo_type,
+                    name,
+                ) {
+                    if bsl_metadata::kind_takes_common_attributes(mdo_type)
+                        && overlay.object_belonging == bsl_metadata::ObjectBelonging::Adopted
+                        && !acc.as_ref().is_some_and(|base| overlay.adopts(base))
+                    {
+                        common.open = true;
+                    }
+                    overlay.set_common_attributes(common);
+                }
                 match &mut acc {
-                    None => acc = Some((*found).clone()),
-                    Some(base) if found.adopts(base) => base.apply_extension_overlay(&found),
-                    Some(base) => *base = (*found).clone(),
+                    None => acc = Some(overlay),
+                    Some(base) if overlay.adopts(base) => base.apply_extension_overlay(&overlay),
+                    Some(base) => *base = overlay,
                 }
             }
         }
@@ -2086,15 +2113,39 @@ impl RootDatabaseImpl {
         mdo_type: bsl_metadata::MdoType,
         name: &str,
     ) -> Option<Arc<bsl_metadata::Register>> {
+        let snapshot = self.workspace_configs_snapshot();
+        let main_listing =
+            snapshot.paths.iter().zip(&snapshot.kinds).find_map(|((_, path), kind)| {
+                (*kind == metadata::RootKind::Base)
+                    .then(|| self.metadata_listing(&path.to_string_lossy()))
+                    .flatten()
+            });
         let mut acc: Option<bsl_metadata::Register> = None;
         for root in roots {
             let Some(listing) = self.metadata_listing(&root) else { continue };
             if let Some(found) =
                 metadata::resolve_register(self, listing, mdo_type, name.to_string())
             {
+                let mut overlay = (*found).clone();
+                if let Some(mut common) = self.extension_common_attributes_for_listing(
+                    listing,
+                    main_listing,
+                    mdo_type,
+                    name,
+                ) {
+                    if overlay.object_belonging() == bsl_metadata::ObjectBelonging::Adopted
+                        && !acc.as_ref().is_some_and(|base| overlay.adopts(base))
+                    {
+                        common.open = true;
+                    }
+                    overlay.set_common_attributes(common);
+                }
                 match &mut acc {
-                    None => acc = Some((*found).clone()),
-                    Some(base) => base.apply_extension_overlay(&found),
+                    None => acc = Some(overlay),
+                    Some(base) if overlay.adopts_by_kind_and_name(base) => {
+                        base.apply_extension_overlay(&overlay)
+                    }
+                    Some(base) => *base = overlay,
                 }
             }
         }

@@ -747,7 +747,7 @@ fn cache_layout(
             name: extension.to_owned(),
             path: extension_path.into(),
             depends_on: Vec::new(),
-            scope: bsl_metadata::ExtensionScope::InfoBase,
+            scope: Some(bsl_metadata::ExtensionScope::InfoBase),
         })]),
         externals: None,
     }
@@ -2280,7 +2280,7 @@ fn workspace_cache_scope_optional_journal_overlap_keeps_source_clean() {
                 name: "EXT_A".into(),
                 path: journal_root.to_string_lossy().into_owned(),
                 depends_on: Vec::new(),
-                scope: bsl_metadata::ExtensionScope::InfoBase,
+                scope: Some(bsl_metadata::ExtensionScope::InfoBase),
             },
         )]),
         externals: None,
@@ -3594,23 +3594,39 @@ fn no_extensions_drops_the_configured_list() {
 }
 
 #[test]
-fn cli_extension_override_cannot_inherit_scope_from_the_replaced_config() {
+fn cli_extension_override_drops_replaced_scope_and_loads_as_legacy() {
     let dir = workspace();
     workspace_calling_main_configuration(dir.path());
     write_scoped_extensions(dir.path(), &[("EXT", EXT, &[])]);
 
-    let error =
-        analyze_refuses(dir.path(), &["--configuration-root", MAIN, "--extension", "EXT=a/b/ext"]);
-    assert!(error.contains("Scope is required"), "expected missing scope: {error}");
+    let run = analyze(dir.path(), &["--configuration-root", MAIN, "--extension", "EXT=a/b/ext"]);
     assert!(
-        error.contains("structured [source].extensions TOML"),
-        "error gives the migration path: {error}"
+        run.stderr.contains("legacy common-attribute semantics"),
+        "the override is legacy and warns: {}",
+        run.stderr
     );
-    assert!(error.contains("EXT"), "the error names the extension root: {error}");
+    assert!(run.stderr.contains("EXT") && run.stderr.contains("a/b/ext"), "{}", run.stderr);
+    assert!(
+        run.unresolved_modules(EXT_MODULE).contains(&MISSING_MODULE.to_string()),
+        "the requested extension source was analyzed"
+    );
+
+    let named =
+        analyze(dir.path(), &["--configuration-root", MAIN, "--extension", &format!("EXT={EXT}")]);
+    assert!(
+        named.stderr.contains("legacy common-attribute semantics"),
+        "named overrides without an explicit scope also retain the legacy mode: {}",
+        named.stderr
+    );
+    assert!(named.stderr.contains("EXT") && named.stderr.contains(EXT), "{}", named.stderr);
+    assert!(
+        named.unresolved_modules(EXT_MODULE).contains(&MISSING_MODULE.to_string()),
+        "the named extension path was analyzed"
+    );
 }
 
 #[test]
-fn check_config_requires_explicit_scope_and_reports_the_resolved_owner() {
+fn check_config_accepts_legacy_scope_warns_and_keeps_explicit_scope_quiet() {
     let dir = workspace();
     workspace_calling_main_configuration(dir.path());
     let config_path = dir.path().join("bsl-analyzer.toml");
@@ -3628,16 +3644,54 @@ fn check_config_requires_explicit_scope_and_reports_the_resolved_owner() {
         )).unwrap();
         let valid = check(&[]);
         assert!(valid.status.success(), "{}", String::from_utf8_lossy(&valid.stderr));
+        assert!(
+            !String::from_utf8_lossy(&valid.stderr).contains("legacy common-attribute semantics")
+        );
         let report = String::from_utf8_lossy(&valid.stdout);
         let topology = report.split("Extension topology:").nth(1).unwrap();
         assert!(topology.contains(&format!("scope: {scope}")), "{report}");
         assert!(topology.contains("EXT"), "{report}");
         let replaced = check(&["--extension", EXT]);
-        assert!(!replaced.status.success(), "an override must not reuse TOML Scope");
-        assert!(String::from_utf8_lossy(&replaced.stderr).contains("has no scope"));
+        assert!(replaced.status.success(), "{}", String::from_utf8_lossy(&replaced.stderr));
+        let warning = String::from_utf8_lossy(&replaced.stderr);
+        assert!(warning.contains("ext") && warning.contains(EXT), "{warning}");
+        assert!(warning.contains("legacy common-attribute semantics"), "{warning}");
+        assert!(warning.contains("scope = \"InfoBase\""), "{warning}");
+        let named = check(&["--extension", &format!("EXT={EXT}")]);
+        assert!(named.status.success(), "{}", String::from_utf8_lossy(&named.stderr));
+        let warning = String::from_utf8_lossy(&named.stderr);
+        assert!(warning.contains("EXT") && warning.contains(EXT), "{warning}");
+        assert!(warning.contains("legacy common-attribute semantics"), "{warning}");
     }
+    std::fs::write(
+        &config_path,
+        format!(
+            "[source]\nroot = \"{MAIN}\"\nextensions = [{{ name = \"EXT\", path = \"{EXT}\" }}]\n"
+        ),
+    )
+    .unwrap();
+    let legacy = check(&[]);
+    assert!(legacy.status.success(), "{}", String::from_utf8_lossy(&legacy.stderr));
+    let warning = String::from_utf8_lossy(&legacy.stderr);
+    assert!(warning.contains("EXT") && warning.contains(EXT), "{warning}");
+    assert!(warning.contains("legacy common-attribute semantics"), "{warning}");
+    assert!(warning.contains("scope = \"InfoBase\""), "{warning}");
+    assert_eq!(warning.matches("legacy common-attribute semantics").count(), 1, "{warning}");
+    let legacy_run = analyze(dir.path(), &[]);
+    assert!(
+        legacy_run.stderr.contains("legacy common-attribute semantics"),
+        "{}",
+        legacy_run.stderr
+    );
+    assert_eq!(legacy_run.stderr.matches("legacy common-attribute semantics").count(), 1);
+
+    std::fs::write(&config_path, format!(
+        "[source]\nroot = \"{MAIN}\"\nextensions = [{{ name = \"EXT\", path = \"{EXT}\", scope = \"InfoBase\" }}]\n"
+    )).unwrap();
+    let run = analyze(dir.path(), &[]);
+    assert!(!run.stderr.contains("legacy common-attribute semantics"), "{}", run.stderr);
     for scope in [
-        "",
+        ", scope = \"\"",
         ", scope = \"Invalid\"",
         ", scope = 1",
         ", scope = \"InfoBase\", scope = \"DataSeparation\"",

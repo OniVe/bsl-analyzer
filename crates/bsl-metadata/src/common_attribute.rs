@@ -231,6 +231,31 @@ impl CommonAttributeSet {
         out
     }
 
+    /// The scope-unaware common-attribute projection used by projects without an extension
+    /// scope. It preserves the pre-scope field model, including unknown field types.
+    pub fn for_legacy_object(
+        &self,
+        mdo_type: MdoType,
+        object_name: &str,
+    ) -> ObjectCommonAttributes {
+        if !kind_takes_common_attributes(mdo_type) {
+            return ObjectCommonAttributes::default();
+        }
+        let mut out = ObjectCommonAttributes { fields: Vec::new(), open: self.unreadable };
+        for attribute in &self.attributes {
+            match attribute.includes(mdo_type, object_name) {
+                Some(true) => out.fields.push(CommonAttributeField {
+                    name: attribute.name.clone(),
+                    attr_type: attribute.attr_type.clone(),
+                    separator: attribute.data_separation == Some(true),
+                }),
+                Some(false) => {}
+                None => out.open = true,
+            }
+        }
+        out
+    }
+
     /// Resolve fields for an extension-owned object using its local declarations and a
     /// confirmed main-configuration set. The returned fields are the application-visible
     /// projection; raw membership remains represented by the source sets.

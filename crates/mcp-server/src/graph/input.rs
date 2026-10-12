@@ -436,7 +436,7 @@ mod tests {
                         name: "Расш".to_owned(),
                         path: "src/cfe/Расш".to_owned(),
                         depends_on: Vec::new(),
-                        scope: bsl_metadata::ExtensionScope::InfoBase,
+                        scope: Some(bsl_metadata::ExtensionScope::InfoBase),
                     },
                 )]),
                 ..project_model::ProjectConfig::default()
@@ -452,7 +452,7 @@ mod tests {
                         name: "Расш".to_owned(),
                         path: "src/cfe/Расш".to_owned(),
                         depends_on: Vec::new(),
-                        scope: bsl_metadata::ExtensionScope::InfoBase,
+                        scope: Some(bsl_metadata::ExtensionScope::InfoBase),
                     },
                 )]),
                 source_exclude: vec!["src/cf/CommonModules/Hidden".to_owned()],
