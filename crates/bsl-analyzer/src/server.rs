@@ -118,6 +118,8 @@ pub fn main_loop(connection: Connection) -> Result<()> {
         && client_supports_pull_diagnostics(&initialize_params.capabilities);
     state.supports_workspace_diagnostic_refresh =
         client_supports_workspace_diagnostic_refresh(&raw_capabilities);
+    state.supports_semantic_tokens_refresh =
+        client_supports_semantic_tokens_refresh(&initialize_params.capabilities);
 
     state.init_empty_source_root();
 
@@ -200,6 +202,16 @@ fn client_folding_range_limit(caps: &lsp_types::ClientCapabilities) -> Option<u3
 /// suppresses push to avoid double-reporting open buffers.
 fn client_supports_pull_diagnostics(caps: &lsp_types::ClientCapabilities) -> bool {
     caps.text_document.as_ref().and_then(|td| td.diagnostic.as_ref()).is_some()
+}
+
+/// Whether the client advertised `workspace.semanticTokens.refreshSupport`, the only grant the
+/// spec gives the server to send `workspace/semanticTokens/refresh`.
+fn client_supports_semantic_tokens_refresh(caps: &lsp_types::ClientCapabilities) -> bool {
+    caps.workspace
+        .as_ref()
+        .and_then(|w| w.semantic_tokens.as_ref())
+        .and_then(|st| st.refresh_support)
+        .unwrap_or(false)
 }
 
 /// Whether the client advertised `workspace.diagnostics.refreshSupport`, so the server may ask it

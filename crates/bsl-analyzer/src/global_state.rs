@@ -358,6 +358,9 @@ pub struct GlobalState {
     /// ask it to re-pull workspace diagnostics once background state changes (e.g. after the
     /// initial workspace load finishes and results first become available).
     pub supports_workspace_diagnostic_refresh: bool,
+    /// Whether the client advertised `workspace.semanticTokens.refreshSupport`, so the server may
+    /// ask it to re-pull semantic tokens; a client that did not would reject the request.
+    pub supports_semantic_tokens_refresh: bool,
     /// Per-URI publish generation. Each scheduled diagnostics computation gets the
     /// next generation for ITS uri; a completed task publishes only if it is still
     /// the latest for that uri. Keyed per-uri (not a single global counter) so
@@ -538,6 +541,7 @@ impl GlobalState {
             folding_range_limit: None,
             pull_diagnostics_active: false,
             supports_workspace_diagnostic_refresh: false,
+            supports_semantic_tokens_refresh: false,
             diagnostics_generation: HashMap::new(),
             pending_diagnostics_uris: Vec::new(),
             active_workspace_diagnostic: None,
@@ -815,6 +819,10 @@ impl GlobalState {
 
     pub fn request_semantic_tokens_refresh(&mut self) {
         use lsp_server::Request;
+
+        if !self.supports_semantic_tokens_refresh {
+            return;
+        }
 
         let id = self.next_request_id.fetch_add(1, Ordering::SeqCst);
         let request = Request::new(
