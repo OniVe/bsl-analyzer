@@ -15,7 +15,9 @@
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use stdx::case::CaseExt;
+use uuid::Uuid;
 
+use crate::enums::{ExtensionScope, ObjectBelonging};
 use crate::metadata_object::{AttributeType, MdoType};
 
 /// One object's setting in a common attribute's `Content` (`Состав`).
@@ -26,15 +28,35 @@ pub enum CommonAttributeUse {
     Auto,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigurationExtensionsSeparation {
+    Separate,
+    DontUse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeparatedDataUse {
+    Independently,
+    IndependentlyAndSimultaneously,
+}
+
 /// A parsed `CommonAttributes/<Name>.xml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommonAttribute {
     pub name: String,
+    pub uuid: Option<Uuid>,
+    pub object_belonging: ObjectBelonging,
+    pub extended_configuration_object: Option<Uuid>,
     pub attr_type: AttributeType,
+    pub attr_type_present: bool,
     /// `AutoUse = Use`: objects without an explicit setting are members.
     pub auto_use: bool,
-    /// `DataSeparation = Separate`: the attribute is a data separator.
-    pub separator: bool,
+    /// `DataSeparation = Separate/DontUse`; malformed or omitted values remain unknown.
+    pub data_separation: Option<bool>,
+    pub data_separation_present: bool,
+    pub configuration_extensions_separation: Option<ConfigurationExtensionsSeparation>,
+    pub separated_data_use: Option<SeparatedDataUse>,
+    pub separated_data_use_present: bool,
     /// Explicit settings keyed by `(kind, folded object name)`.
     pub content: FxHashMap<(MdoType, String), CommonAttributeUse>,
     /// A `Content` entry this reader could not attach to an object while it could still have
@@ -43,6 +65,32 @@ pub struct CommonAttribute {
     /// `AutoUse = Use` an unreadable entry can only remove the field, and over-reporting a
     /// field silences a diagnostic rather than inventing one.
     pub unattributed_members: bool,
+}
+
+impl CommonAttribute {
+    pub fn estimated_heap_size(&self) -> usize {
+        self.name.capacity()
+            + self.attr_type.estimated_heap_size()
+            + stdx::heap::map_table_bytes::<(MdoType, String), CommonAttributeUse>(
+                self.content.len(),
+            )
+            + self.content.keys().map(|(_, name)| name.capacity()).sum::<usize>()
+    }
+
+    /// Raw membership under this declaration's own AutoUse/Content rules.
+    pub fn includes(&self, mdo_type: MdoType, object_name: &str) -> Option<bool> {
+        if !kind_takes_common_attributes(mdo_type) {
+            return Some(false);
+        }
+        let explicit = self.content.get(&(mdo_type, object_name.fold_lower())).copied();
+        match explicit {
+            Some(CommonAttributeUse::Use) => Some(true),
+            Some(CommonAttributeUse::DontUse) => Some(false),
+            Some(CommonAttributeUse::Auto) | None if self.auto_use => Some(true),
+            Some(CommonAttributeUse::Auto) | None if self.unattributed_members => None,
+            Some(CommonAttributeUse::Auto) | None => Some(false),
+        }
+    }
 }
 
 /// A field a common attribute contributes to one object.
@@ -140,24 +188,6 @@ pub(crate) fn classify_content_reference(reference: &str) -> ContentTarget {
     }
 }
 
-impl CommonAttribute {
-    /// `Some(true/false)` when the platform rule decides membership, `None` when it cannot be
-    /// decided from what was read.
-    pub fn includes(&self, mdo_type: MdoType, object_name: &str) -> Option<bool> {
-        if !kind_takes_common_attributes(mdo_type) {
-            return Some(false);
-        }
-        let explicit = self.content.get(&(mdo_type, object_name.fold_lower())).copied();
-        match explicit {
-            Some(CommonAttributeUse::Use) => Some(true),
-            Some(CommonAttributeUse::DontUse) => Some(false),
-            Some(CommonAttributeUse::Auto) | None if self.auto_use => Some(true),
-            Some(CommonAttributeUse::Auto) | None if self.unattributed_members => None,
-            Some(CommonAttributeUse::Auto) | None => Some(false),
-        }
-    }
-}
-
 /// All common attributes of one configuration root.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CommonAttributeSet {
@@ -180,8 +210,34 @@ impl CommonAttributeSet {
         }
     }
 
+    pub fn estimated_heap_size(&self) -> usize {
+        stdx::heap::vec_bytes::<CommonAttribute>(self.attributes.len())
+            + self.attributes.iter().map(CommonAttribute::estimated_heap_size).sum::<usize>()
+    }
+
     /// The common-attribute fields of one object, and whether that list may be short.
     pub fn for_object(&self, mdo_type: MdoType, object_name: &str) -> ObjectCommonAttributes {
+        if !kind_takes_common_attributes(mdo_type) {
+            return ObjectCommonAttributes::default();
+        }
+        let mut out = ObjectCommonAttributes { fields: Vec::new(), open: self.unreadable };
+        for attribute in &self.attributes {
+            match attribute.includes(mdo_type, object_name) {
+                Some(true) => add_visible_attribute(&mut out, attribute),
+                Some(false) => {}
+                None => out.open = true,
+            }
+        }
+        out
+    }
+
+    /// The scope-unaware common-attribute projection used by projects without an extension
+    /// scope. It preserves the pre-scope field model, including unknown field types.
+    pub fn for_legacy_object(
+        &self,
+        mdo_type: MdoType,
+        object_name: &str,
+    ) -> ObjectCommonAttributes {
         if !kind_takes_common_attributes(mdo_type) {
             return ObjectCommonAttributes::default();
         }
@@ -191,7 +247,7 @@ impl CommonAttributeSet {
                 Some(true) => out.fields.push(CommonAttributeField {
                     name: attribute.name.clone(),
                     attr_type: attribute.attr_type.clone(),
-                    separator: attribute.separator,
+                    separator: attribute.data_separation == Some(true),
                 }),
                 Some(false) => {}
                 None => out.open = true,
@@ -199,6 +255,193 @@ impl CommonAttributeSet {
         }
         out
     }
+
+    /// Resolve fields for an extension-owned object using its local declarations and a
+    /// confirmed main-configuration set. The returned fields are the application-visible
+    /// projection; raw membership remains represented by the source sets.
+    pub fn for_extension_object(
+        &self,
+        base: Option<&CommonAttributeSet>,
+        scope: ExtensionScope,
+        mdo_type: MdoType,
+        object_name: &str,
+    ) -> ObjectCommonAttributes {
+        if !kind_takes_common_attributes(mdo_type) {
+            return ObjectCommonAttributes::default();
+        }
+        let mut out = ObjectCommonAttributes { fields: Vec::new(), open: self.unreadable };
+
+        for local in &self.attributes {
+            if local.object_belonging == ObjectBelonging::Own {
+                match local.includes(mdo_type, object_name) {
+                    Some(true) => add_visible_attribute(&mut out, local),
+                    Some(false) => {}
+                    None => out.open = true,
+                }
+            } else if local.object_belonging == ObjectBelonging::Unknown
+                && (adopted_content_may_include(local, mdo_type, object_name) || local.auto_use)
+            {
+                out.open = true;
+            }
+        }
+
+        let Some(base) = base else {
+            if self.attributes.iter().any(|attribute| {
+                attribute.object_belonging == ObjectBelonging::Adopted
+                    && adopted_content_may_include(attribute, mdo_type, object_name)
+            }) {
+                out.open = true;
+            }
+            return out;
+        };
+
+        if base.unreadable {
+            out.open = true;
+        }
+
+        if scope == ExtensionScope::DataSeparation {
+            for main in &base.attributes {
+                match automatic_area_membership(main, scope) {
+                    Some(true) => add_visible_attribute(&mut out, main),
+                    Some(false) => {}
+                    None => out.open = true,
+                }
+            }
+        }
+
+        for local in &self.attributes {
+            if local.object_belonging != ObjectBelonging::Adopted
+                || !adopted_content_may_include(local, mdo_type, object_name)
+            {
+                continue;
+            }
+            let Some(extended_uuid) = local.extended_configuration_object else {
+                out.open = true;
+                continue;
+            };
+            let Some(main) =
+                base.attributes.iter().find(|attribute| attribute.uuid == Some(extended_uuid))
+            else {
+                out.open = true;
+                continue;
+            };
+
+            let automatic_area_member = automatic_area_membership(main, scope) == Some(true);
+            let explicit_member = match local.content.get(&(mdo_type, object_name.fold_lower())) {
+                Some(CommonAttributeUse::Use) => Some(true),
+                Some(CommonAttributeUse::DontUse) => Some(false),
+                Some(CommonAttributeUse::Auto) => None,
+                None if local.unattributed_members => None,
+                None => Some(false),
+            };
+            let included = if automatic_area_member { Some(true) } else { explicit_member };
+            match included {
+                Some(false) => {}
+                None => out.open = true,
+                Some(true) => {
+                    add_inherited_attribute(&mut out, local, main);
+                }
+            }
+        }
+        out
+    }
+}
+
+fn automatic_area_membership(attribute: &CommonAttribute, scope: ExtensionScope) -> Option<bool> {
+    if scope != ExtensionScope::DataSeparation {
+        return Some(false);
+    }
+    match attribute.data_separation {
+        Some(true) => match attribute.configuration_extensions_separation {
+            Some(ConfigurationExtensionsSeparation::Separate) => Some(true),
+            Some(ConfigurationExtensionsSeparation::DontUse) => Some(false),
+            None => None,
+        },
+        Some(false) => Some(false),
+        None => None,
+    }
+}
+
+fn adopted_content_may_include(
+    attribute: &CommonAttribute,
+    mdo_type: MdoType,
+    object_name: &str,
+) -> bool {
+    matches!(
+        attribute.content.get(&(mdo_type, object_name.fold_lower())),
+        Some(CommonAttributeUse::Use | CommonAttributeUse::DontUse | CommonAttributeUse::Auto)
+    ) || attribute.unattributed_members
+}
+
+fn add_visible_attribute(out: &mut ObjectCommonAttributes, attribute: &CommonAttribute) {
+    let Some(separator) = attribute.data_separation else {
+        out.open = true;
+        return;
+    };
+    if separator {
+        match attribute.separated_data_use {
+            Some(SeparatedDataUse::Independently) => return,
+            Some(SeparatedDataUse::IndependentlyAndSimultaneously) => {}
+            None if !attribute.separated_data_use_present => return,
+            None => {
+                out.open = true;
+                return;
+            }
+        }
+    }
+    if attribute.attr_type == AttributeType::Unknown {
+        out.open = true;
+        return;
+    }
+    merge_common_attribute_fields(
+        &mut out.fields,
+        &[CommonAttributeField {
+            name: attribute.name.clone(),
+            attr_type: attribute.attr_type.clone(),
+            separator,
+        }],
+    );
+}
+
+fn add_inherited_attribute(
+    out: &mut ObjectCommonAttributes,
+    local: &CommonAttribute,
+    main: &CommonAttribute,
+) {
+    let inherited = CommonAttribute {
+        name: local.name.clone(),
+        uuid: local.uuid,
+        object_belonging: local.object_belonging,
+        extended_configuration_object: local.extended_configuration_object,
+        attr_type: if local.attr_type_present {
+            local.attr_type.clone()
+        } else {
+            main.attr_type.clone()
+        },
+        attr_type_present: local.attr_type_present,
+        auto_use: local.auto_use,
+        data_separation: if local.data_separation_present {
+            local.data_separation
+        } else {
+            main.data_separation
+        },
+        data_separation_present: local.data_separation_present,
+        configuration_extensions_separation: local
+            .configuration_extensions_separation
+            .or(main.configuration_extensions_separation),
+        separated_data_use: if local.separated_data_use_present {
+            local.separated_data_use
+        } else if main.separated_data_use_present {
+            main.separated_data_use
+        } else {
+            Some(SeparatedDataUse::Independently)
+        },
+        separated_data_use_present: local.separated_data_use_present
+            || main.separated_data_use_present,
+        content: local.content.clone(),
+        unattributed_members: local.unattributed_members,
+    };
+    add_visible_attribute(out, &inherited);
 }
 
 /// Fold `overlay` into `base` the way an extension overlay folds members: a same-named field is
@@ -211,6 +454,7 @@ pub(crate) fn merge_common_attribute_fields(
         base.retain(|existing| existing.name.fold_lower() != field.name.fold_lower());
         base.push(field.clone());
     }
+    base.sort_by_key(|field| field.name.fold_lower());
 }
 
 #[cfg(test)]
@@ -223,9 +467,17 @@ mod tests {
     ) -> CommonAttribute {
         CommonAttribute {
             name: "Организация".to_string(),
+            uuid: None,
+            object_belonging: ObjectBelonging::Own,
+            extended_configuration_object: None,
             attr_type: AttributeType::String { length: Some(10) },
+            attr_type_present: true,
             auto_use,
-            separator: false,
+            data_separation: Some(false),
+            data_separation_present: true,
+            configuration_extensions_separation: None,
+            separated_data_use: Some(SeparatedDataUse::Independently),
+            separated_data_use_present: true,
             content: content
                 .iter()
                 .map(|(kind, name, usage)| ((*kind, name.fold_lower()), *usage))
@@ -350,5 +602,237 @@ mod tests {
         let set = CommonAttributeSet { attributes: Vec::new(), unreadable: true };
         assert!(set.for_object(MdoType::Catalog, "А").open);
         assert!(!set.for_object(MdoType::Enum, "П").open);
+    }
+
+    fn fixture_set(path: &str) -> CommonAttributeSet {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+        let directory = path.join("CommonAttributes");
+        if !directory.is_dir() {
+            return CommonAttributeSet::default();
+        }
+        let mut files = std::fs::read_dir(directory)
+            .expect("fixture CommonAttributes directory")
+            .map(|entry| entry.expect("fixture entry").path())
+            .collect::<Vec<_>>();
+        files.sort();
+        let mut set = CommonAttributeSet::default();
+        for file in files {
+            let xml = std::fs::read_to_string(file).expect("fixture XML");
+            set.push_parsed(crate::xml_parser::parse_common_attribute_xml(&xml).ok());
+        }
+        set
+    }
+
+    fn field_names(fields: &[CommonAttributeField]) -> Vec<&str> {
+        let mut names = fields.iter().map(|field| field.name.as_str()).collect::<Vec<_>>();
+        names.sort_unstable();
+        names
+    }
+
+    #[test]
+    fn separator_membership_and_simultaneous_visibility_are_both_preserved() {
+        let set = fixture_set("fixtures/common_attribute_separator");
+        let separator = set
+            .attributes
+            .iter()
+            .find(|attribute| attribute.name == "ОбластьДанныхВспомогательныеДанные")
+            .unwrap();
+        assert_eq!(
+            separator.includes(MdoType::InformationRegister, "РазделенныеНастройки"),
+            Some(true)
+        );
+        assert_eq!(separator.data_separation, Some(true));
+        assert_eq!(
+            set.for_object(MdoType::InformationRegister, "РазделенныеНастройки")
+                .fields
+                .iter()
+                .find(|field| field.name == separator.name)
+                .map(|field| field.separator),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn independently_separator_is_a_member_but_not_an_application_field() {
+        let set = fixture_set("fixtures/extension_common_attributes/base");
+        let separator =
+            set.attributes.iter().find(|attribute| attribute.name == "AreaUse").unwrap();
+        assert_eq!(separator.includes(MdoType::Catalog, "BaseCatalog"), Some(true));
+        assert_eq!(separator.separated_data_use, Some(SeparatedDataUse::Independently));
+        assert_eq!(
+            automatic_area_membership(separator, ExtensionScope::DataSeparation),
+            Some(true)
+        );
+        let projected = set.for_object(MdoType::Catalog, "BaseCatalog");
+        assert!(!projected.fields.iter().any(|field| field.name == "AreaUse"));
+        assert!(!projected.open);
+    }
+
+    #[test]
+    fn scope_data_separation_adds_only_base_area_separators_regardless_of_auto_use() {
+        let base = fixture_set("fixtures/extension_common_attributes/base");
+        let area_use =
+            base.attributes.iter().find(|attribute| attribute.name == "AreaUse").unwrap();
+        let area_no_auto =
+            base.attributes.iter().find(|attribute| attribute.name == "AreaNoAuto").unwrap();
+        let other_use =
+            base.attributes.iter().find(|attribute| attribute.name == "OtherUse").unwrap();
+        assert!(area_use.auto_use);
+        assert!(!area_no_auto.auto_use);
+        assert_eq!(
+            area_use.configuration_extensions_separation,
+            Some(ConfigurationExtensionsSeparation::Separate)
+        );
+        assert_eq!(
+            area_no_auto.configuration_extensions_separation,
+            Some(ConfigurationExtensionsSeparation::Separate)
+        );
+        assert_eq!(
+            other_use.configuration_extensions_separation,
+            Some(ConfigurationExtensionsSeparation::DontUse)
+        );
+        assert_eq!(automatic_area_membership(area_use, ExtensionScope::DataSeparation), Some(true));
+        assert_eq!(
+            automatic_area_membership(area_no_auto, ExtensionScope::DataSeparation),
+            Some(true)
+        );
+        assert_eq!(
+            automatic_area_membership(other_use, ExtensionScope::DataSeparation),
+            Some(false)
+        );
+
+        let no_common = fixture_set("fixtures/extension_common_attributes/extensions/no-common");
+        let projected = no_common.for_extension_object(
+            Some(&base),
+            ExtensionScope::DataSeparation,
+            MdoType::Catalog,
+            "NativeCatalog",
+        );
+        assert!(projected.fields.is_empty());
+        assert!(!projected.open);
+    }
+
+    #[test]
+    fn extension_matrix_separates_area_membership_from_field_visibility() {
+        let base = fixture_set("fixtures/extension_common_attributes/base");
+        let no_common = fixture_set("fixtures/extension_common_attributes/extensions/no-common");
+        let explicit_use =
+            fixture_set("fixtures/extension_common_attributes/extensions/explicit-use");
+        let explicit_dont_use =
+            fixture_set("fixtures/extension_common_attributes/extensions/explicit-dont-use");
+
+        let automatic = no_common.for_extension_object(
+            Some(&base),
+            ExtensionScope::DataSeparation,
+            MdoType::Catalog,
+            "NativeCatalog",
+        );
+        assert!(automatic.fields.is_empty());
+        assert!(!automatic.open);
+
+        let global = no_common.for_extension_object(
+            Some(&base),
+            ExtensionScope::InfoBase,
+            MdoType::Catalog,
+            "NativeCatalog",
+        );
+        assert!(global.fields.is_empty());
+        assert!(!global.open);
+
+        let explicit = explicit_use.for_extension_object(
+            Some(&base),
+            ExtensionScope::InfoBase,
+            MdoType::Catalog,
+            "NativeCatalog",
+        );
+        assert_eq!(field_names(&explicit.fields), ["OrdinaryAuto", "OtherUse"]);
+        assert!(explicit
+            .fields
+            .iter()
+            .all(|field| field.attr_type == (AttributeType::Number { precision: 7, scale: 0 })));
+        assert!(!explicit.fields.iter().any(|field| field.name == "AreaUse"));
+        assert!(!explicit.open);
+
+        let area_explicit = explicit_use.for_extension_object(
+            Some(&base),
+            ExtensionScope::DataSeparation,
+            MdoType::Catalog,
+            "NativeCatalog",
+        );
+        assert_eq!(field_names(&area_explicit.fields), ["OrdinaryAuto", "OtherUse"]);
+        assert!(!area_explicit.fields.iter().any(|field| field.name == "AreaUse"));
+        assert!(!area_explicit.open);
+
+        let excluded = explicit_dont_use.for_extension_object(
+            Some(&base),
+            ExtensionScope::InfoBase,
+            MdoType::Catalog,
+            "NativeCatalog",
+        );
+        assert!(excluded.fields.is_empty());
+        assert!(!excluded.open);
+    }
+
+    #[test]
+    fn missing_base_and_same_name_uuid_mismatch_remain_open_without_a_fake_field() {
+        let base = fixture_set("fixtures/extension_common_attributes/base");
+        let explicit = fixture_set("fixtures/extension_common_attributes/extensions/explicit-use");
+        let missing_base = explicit.for_extension_object(
+            None,
+            ExtensionScope::InfoBase,
+            MdoType::Catalog,
+            "NativeCatalog",
+        );
+        assert!(missing_base.fields.is_empty());
+        assert!(missing_base.open);
+
+        let mut wrong_base = base.clone();
+        let target = wrong_base
+            .attributes
+            .iter_mut()
+            .find(|attribute| attribute.name == "OtherUse")
+            .unwrap();
+        target.uuid = Some(Uuid::new_v4());
+        let mismatched = explicit.for_extension_object(
+            Some(&wrong_base),
+            ExtensionScope::InfoBase,
+            MdoType::Catalog,
+            "NativeCatalog",
+        );
+        assert!(!mismatched.fields.iter().any(|field| field.name == "OtherUse"));
+        assert!(mismatched.open);
+    }
+
+    #[test]
+    fn constants_and_enums_never_acquire_extension_common_fields_or_open() {
+        let base = fixture_set("fixtures/extension_common_attributes/base");
+        let mut local = fixture_set("fixtures/extension_common_attributes/extensions/explicit-use");
+        local.unreadable = true;
+        for scope in [ExtensionScope::InfoBase, ExtensionScope::DataSeparation] {
+            for kind in [MdoType::Constant, MdoType::Enum] {
+                let applied = local.for_extension_object(Some(&base), scope, kind, "NativeCatalog");
+                assert!(applied.fields.is_empty());
+                assert!(!applied.open);
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_inherited_visibility_keeps_known_fields_and_does_not_assume_default() {
+        let mut base = fixture_set("fixtures/extension_common_attributes/base");
+        let area =
+            base.attributes.iter_mut().find(|attribute| attribute.name == "AreaUse").unwrap();
+        area.separated_data_use = None;
+        area.separated_data_use_present = true;
+        let explicit_use =
+            fixture_set("fixtures/extension_common_attributes/extensions/explicit-use");
+        let projected = explicit_use.for_extension_object(
+            Some(&base),
+            ExtensionScope::InfoBase,
+            MdoType::Catalog,
+            "NativeCatalog",
+        );
+        assert_eq!(field_names(&projected.fields), ["OrdinaryAuto", "OtherUse"]);
+        assert!(projected.open);
     }
 }

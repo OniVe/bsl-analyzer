@@ -5,7 +5,10 @@ use crate::register::{
     AccumulationRegisterType, Register, RegisterAttribute, RegisterPeriodicity, RegisterResource,
 };
 
-use super::helpers::{child_bool, child_text, find_child, find_mdo_element, parse_uuid, parse_xml};
+use super::helpers::{
+    child_bool, child_text, find_child, find_mdo_element, parse_extension_ownership, parse_uuid,
+    parse_xml,
+};
 use super::standard_attributes::{
     add_accumulation_register_standard_attrs, add_information_register_standard_attrs,
 };
@@ -42,6 +45,7 @@ fn parse_register_xml(xml: &str, mdo_type: MdoType) -> Result<Register> {
         .ok_or_else(|| MetadataError::InvalidFormat("Register missing Properties".to_string()))?;
 
     let object_name = child_text(props, "Name").unwrap_or("").to_string();
+    let (belonging, target) = parse_extension_ownership(props);
     let periodicity_str =
         child_text(props, "InformationRegisterPeriodicity").map(|s| s.to_string());
     let recorder_subordinate = mdo_type == MdoType::InformationRegister
@@ -90,6 +94,7 @@ fn parse_register_xml(xml: &str, mdo_type: MdoType) -> Result<Register> {
 
     let register = Register::builder()
         .uuid(uuid)
+        .extension_ownership(belonging, target)
         .name(object_name)
         .mdo_type(mdo_type)
         .dimensions(dimensions)

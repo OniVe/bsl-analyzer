@@ -935,7 +935,7 @@ mod tests {
         std::fs::write(&hidden_module, "Процедура Скрытая()\nКонецПроцедуры").unwrap();
 
         let mut host = AnalysisHost::default();
-        host.raw_database_mut().set_all_config_paths(vec![(None, root.clone())]);
+        host.raw_database_mut().set_all_config_paths(vec![(None, root.clone())], None);
         let mut snapshot =
             ide_db::metadata::WorkspaceConfigsSnapshot::from_paths(vec![(None, root.clone())]);
         snapshot.source_exclusions =
@@ -1004,7 +1004,7 @@ mod tests {
         write("Товары", "00000000-0000-0000-0000-000000000002");
 
         let mut host = AnalysisHost::default();
-        host.raw_database_mut().set_all_config_paths(vec![(None, root.clone())]);
+        host.raw_database_mut().set_all_config_paths(vec![(None, root.clone())], None);
         let vfs = TestVfs(RefCell::new(Vfs::default()));
         host.bootstrap_metadata_substrate(&vfs);
 
@@ -1111,7 +1111,7 @@ mod tests {
         let _: Option<RoleEntry> = None;
 
         let mut host = AnalysisHost::default();
-        host.raw_database_mut().set_all_config_paths(vec![(None, root.clone())]);
+        host.raw_database_mut().set_all_config_paths(vec![(None, root.clone())], None);
         let vfs = TestVfs(RefCell::new(Vfs::default()));
         host.bootstrap_metadata_substrate(&vfs);
 
@@ -1197,7 +1197,7 @@ mod tests {
         std::fs::write(&child_xml, subsystem_xml("Дочерняя")).unwrap();
 
         let mut host = AnalysisHost::default();
-        host.raw_database_mut().set_all_config_paths(vec![(None, root.clone())]);
+        host.raw_database_mut().set_all_config_paths(vec![(None, root.clone())], None);
         let vfs = TestVfs(RefCell::new(Vfs::default()));
         host.bootstrap_metadata_substrate(&vfs);
 
@@ -1270,7 +1270,7 @@ mod tests {
         }
 
         let mut host = AnalysisHost::default();
-        host.raw_database_mut().set_all_config_paths(vec![(None, root.clone())]);
+        host.raw_database_mut().set_all_config_paths(vec![(None, root.clone())], None);
         let vfs = TestVfs(RefCell::new(Vfs::default()));
         host.bootstrap_metadata_substrate(&vfs);
 

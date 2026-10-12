@@ -35,6 +35,9 @@ fn plan(selection: DiagnosticsBaselineSelection) -> DiagnosticsBaselinePartition
         identity: DiagnosticsBaselinePartitionIdentity::Extension {
             name: "Ext".to_owned(),
             path: "ext".to_owned(),
+            scope: Some(bsl_metadata::ExtensionScope::InfoBase),
+            legacy_scope: None,
+            dependency_scopes: vec![],
             depends_on: vec![],
         },
     };
@@ -44,6 +47,9 @@ fn plan(selection: DiagnosticsBaselineSelection) -> DiagnosticsBaselinePartition
             extensions: vec![DiagnosticsBaselineProjectExtension {
                 name: "Ext".to_owned(),
                 path: "ext".to_owned(),
+                scope: Some(bsl_metadata::ExtensionScope::InfoBase),
+                legacy_scope: None,
+                dependency_scopes: vec![],
                 depends_on: vec![],
             }],
             externals: vec![],

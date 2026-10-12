@@ -187,6 +187,20 @@ mod tests {
         std::fs::write(path, body).unwrap();
     }
 
+    fn write_source_config(root: &Path, configuration: &str, extensions: &[(&str, &str)]) {
+        let entries = extensions
+            .iter()
+            .map(|(name, path)| {
+                format!("  {{ name = {name:?}, path = {path:?}, scope = \"InfoBase\" }}")
+            })
+            .collect::<Vec<_>>()
+            .join(",\n");
+        write(
+            &root.join("bsl-analyzer.toml"),
+            &format!("[source]\nroot = {configuration:?}\nextensions = [\n{entries}\n]\n"),
+        );
+    }
+
     fn module(name: &str) -> String {
         format!("Процедура {name}()\n    Сообщить(\"{name}\");\nКонецПроцедуры\n")
     }
@@ -251,6 +265,11 @@ mod tests {
             write(&owner_root.join("Configuration.xml"), "<MetaDataObject/>");
             write(&owner_root.join(relative), &module(&owner.replace('/', "_")));
         }
+        write_source_config(
+            &root,
+            "src/cf",
+            &[("Первое", "src/cfe/Первое"), ("Второе", "src/cfe/Второе")],
+        );
         root
     }
 
@@ -393,11 +412,7 @@ mod tests {
         if std::fs::read_dir(&closed).is_ok() {
             return;
         }
-        std::fs::write(
-            root.join("bsl-analyzer.toml"),
-            "[source]\nroot = \"src/cf\"\nextensions = [\"src/cf/Вложенное\"]\n",
-        )
-        .unwrap();
+        write_source_config(&root, "src/cf", &[("Вложенное", "src/cf/Вложенное")]);
 
         let corpus = build_workspace_code(&project_at(&root)).unwrap();
 
@@ -424,11 +439,7 @@ mod tests {
         let nested = root.join("src/cf/Вложенное");
         write(&nested.join("Configuration.xml"), "<MetaDataObject/>");
         write(&nested.join("CommonModules/Вложенный/Ext/Module.bsl"), &module("Вложенный"));
-        std::fs::write(
-            root.join("bsl-analyzer.toml"),
-            "[source]\nroot = \"src/cf\"\nextensions = [\"src/cf/Вложенное\"]\n",
-        )
-        .unwrap();
+        write_source_config(&root, "src/cf", &[("Вложенное", "src/cf/Вложенное")]);
 
         let published = published_keys(&root);
 
@@ -461,14 +472,20 @@ mod tests {
         let root = dir.path().join("project");
         write(&root.join("src/cf/Configuration.xml"), "<MetaDataObject/>");
         write(&root.join("src/cf/CommonModules/Общий/Ext/Module.bsl"), &module("Общий"));
-        // The identifier is a lossy rendering of the path, so two names differing only in
-        // bytes no `str` can hold render identically. Discovered rather than declared,
-        // because a config entry is a `String` and could not spell them apart either.
-        for tail in [vec![b'a', 0x80], vec![b'a', 0x81]] {
+        // Structured declarations give both roots a Scope through UTF-8 symlinks. Their
+        // canonical target names differ only in bytes that the root ID cannot retain.
+        for (name, tail) in [("Первое", vec![b'a', 0x80]), ("Второе", vec![b'a', 0x81])]
+        {
             let extension = root.join("src/cfe").join(OsString::from_vec(tail));
             write(&extension.join("Configuration.xml"), "<MetaDataObject/>");
             write(&extension.join("CommonModules/Расш/Ext/Module.bsl"), &module("Расш"));
+            std::os::unix::fs::symlink(&extension, root.join("src/cfe").join(name)).unwrap();
         }
+        write_source_config(
+            &root,
+            "src/cf",
+            &[("Первое", "src/cfe/Первое"), ("Второе", "src/cfe/Второе")],
+        );
 
         let error = match build_workspace_code(&project_at(&root)) {
             Ok(corpus) => panic!(

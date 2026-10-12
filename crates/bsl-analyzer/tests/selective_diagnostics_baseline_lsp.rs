@@ -23,7 +23,7 @@ fn selective_project() -> tempfile::TempDir {
         dir.path().join("bsl-analyzer.toml"),
         r#"[source]
 root = "src/cf"
-extensions = [{ name = "Ext", path = "src/cfe/Ext" }]
+extensions = [{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }]
 [diagnostics.baseline]
 directory = "baselines"
 include = ["main"]
@@ -54,7 +54,7 @@ fn full_manifest_selective_project() -> tempfile::TempDir {
             format!(
                 r#"[source]
 root = "src/cf"
-extensions = [{{ name = "Ext", path = "src/cfe/Ext" }}]
+extensions = [{{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }}]
 [diagnostics.baseline]
 directory = "baselines"
 {include}"#
@@ -221,7 +221,7 @@ fn select_both(root: &std::path::Path) {
         root.join("bsl-analyzer.toml"),
         r#"[source]
 root = "src/cf"
-extensions = [{ name = "Ext", path = "src/cfe/Ext" }]
+extensions = [{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }]
 [diagnostics.baseline]
 directory = "baselines"
 include = ["main", "extension:Ext"]

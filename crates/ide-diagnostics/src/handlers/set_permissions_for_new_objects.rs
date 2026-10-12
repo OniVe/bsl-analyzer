@@ -198,7 +198,7 @@ mod tests {
 </Rights>"#,
         );
 
-        db.set_all_config_paths(vec![(None, workspace_root.clone())]);
+        db.set_all_config_paths(vec![(None, workspace_root.clone())], None);
         db.set_metadata_listing(
             &workspace_root.to_string_lossy(),
             MetadataListingData {

@@ -80,7 +80,7 @@ fn check_token_stream(code: &str, expect: Expect) {
 
 fn check_token_stream_with_config(code: &str, expect: Expect) {
     let (mut db, file_id) = create_db_with_file(code);
-    db.set_all_config_paths(vec![(None, designer_fixture_path())]);
+    db.set_all_config_paths(vec![(None, designer_fixture_path())], None);
     let result = highlight(&db, file_id);
     expect.assert_eq(&render_token_stream(code, &result.highlights));
 }

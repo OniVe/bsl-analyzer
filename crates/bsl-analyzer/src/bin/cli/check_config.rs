@@ -89,6 +89,12 @@ pub fn check_config(
         .into());
     }
 
+    if let Some(warning) =
+        project.as_ref().ok().and_then(project_model::Project::legacy_extension_scope_warning)
+    {
+        eprintln!("warning: {warning}");
+    }
+
     Ok(())
 }
 
@@ -272,15 +278,22 @@ fn build_check_config_report(
                 .iter()
                 .map(|decl| match decl {
                     project_model::ExtensionDecl::Path(path) => path.clone(),
-                    project_model::ExtensionDecl::Structured(entry)
-                        if entry.depends_on.is_empty() =>
-                        format!("{} ({})", entry.name, entry.path),
-                    project_model::ExtensionDecl::Structured(entry) => format!(
-                        "{} ({}, dependsOn: {})",
-                        entry.name,
-                        entry.path,
-                        entry.depends_on.join(", ")
-                    ),
+                    project_model::ExtensionDecl::Structured(entry) => {
+                        let scope = entry
+                            .scope
+                            .map(|scope| format!(", scope: {scope:?}"))
+                            .unwrap_or_default();
+                        if entry.depends_on.is_empty() {
+                            format!("{} ({}{scope})", entry.name, entry.path)
+                        } else {
+                            format!(
+                                "{} ({}{scope}, dependsOn: {})",
+                                entry.name,
+                                entry.path,
+                                entry.depends_on.join(", ")
+                            )
+                        }
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join(", "),
@@ -356,7 +369,14 @@ fn build_check_config_report(
                                 .join(", ")
                         )
                     };
-                    let _ = writeln!(out, "  {} — {} ({deps})", node.name(), node.path().display());
+                    let scope =
+                        node.scope().map(|scope| format!(", scope: {scope:?}")).unwrap_or_default();
+                    let _ = writeln!(
+                        out,
+                        "  {} — {} ({deps}{scope})",
+                        node.name(),
+                        node.path().display()
+                    );
                 }
                 let _ = writeln!(
                     out,

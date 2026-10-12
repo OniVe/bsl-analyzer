@@ -50,7 +50,7 @@ fn setup_at_with_config(
     db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
     db.set_file_source_root(file_id, SourceRootId(0));
     db.set_file_text(file_id, text);
-    db.set_all_config_paths(vec![(None, config_path)]);
+    db.set_all_config_paths(vec![(None, config_path)], None);
     (db, file_id)
 }
 

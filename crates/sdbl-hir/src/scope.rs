@@ -11,8 +11,8 @@ use crate::types::SdblType;
 ///
 /// `Config` owns an `Arc<Configuration>` so a scope built for completion can be
 /// returned by value (no borrow escapes). `Resolver` borrows a db-backed
-/// per-MDO resolver used transiently during query lowering — that scope is never
-/// returned, so the borrow stays local.
+/// per-MDO resolver used during query lowering or completion; the caller keeps
+/// the resolver alive while using the scope.
 #[derive(Debug)]
 enum MetaSource<'a> {
     Config(Arc<bsl_metadata::Configuration>),

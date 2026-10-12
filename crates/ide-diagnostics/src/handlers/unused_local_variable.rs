@@ -617,10 +617,10 @@ mod tests {
         std::fs::create_dir_all(&ext_root).unwrap();
 
         let mut db = RootDatabaseImpl::new();
-        db.set_all_config_paths(vec![
-            (None, main_root.clone()),
-            (Some("X".to_string()), ext_root.clone()),
-        ]);
+        db.set_all_config_paths(
+            vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+        );
 
         let main_file = FileId(0);
         let ext_file = FileId(1);

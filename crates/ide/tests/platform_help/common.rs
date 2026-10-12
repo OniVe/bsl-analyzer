@@ -48,7 +48,7 @@ pub fn database(target: Option<&str>) -> (RootDatabaseImpl, FileId, test_fixture
     db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
     db.set_file_source_root(file_id, SourceRootId(0));
     db.set_file_text(file_id, MODULE);
-    db.set_all_config_paths(fixture.config_paths());
+    db.set_all_config_paths(fixture.config_paths(), Some(bsl_metadata::ExtensionScope::InfoBase));
     db.set_target_platform_version(target.map(Arc::<str>::from));
     (db, file_id, fixture)
 }

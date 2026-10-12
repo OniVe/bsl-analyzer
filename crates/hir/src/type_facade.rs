@@ -556,7 +556,7 @@ mod tests {
 
     fn db_with_configuration(config_path: PathBuf) -> (RootDatabaseImpl, FileId) {
         let (mut db, file_id) = empty_db();
-        db.set_all_config_paths(vec![(None, config_path)]);
+        db.set_all_config_paths(vec![(None, config_path)], None);
         (db, file_id)
     }
 
@@ -571,7 +571,7 @@ mod tests {
         db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
         db.set_file_source_root(file_id, SourceRootId(0));
         db.set_file_text(file_id, "");
-        db.set_all_config_paths(vec![(None, config_path)]);
+        db.set_all_config_paths(vec![(None, config_path)], None);
         (db, file_id)
     }
 

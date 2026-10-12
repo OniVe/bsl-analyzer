@@ -45,7 +45,7 @@ fn findings(register: &str) -> (Vec<String>, Vec<String>) {
     let file_id = FileId(0);
     let path = root.join("CommonModules/Настройки/Ext/Module.bsl");
     let mut db = RootDatabaseImpl::new();
-    db.set_all_config_paths(vec![(None, root)]);
+    db.set_all_config_paths(vec![(None, root)], None);
     let mut file_set = FileSet::default();
     file_set.insert(file_id, VfsPath::new(path.to_string_lossy().as_ref()));
     db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));

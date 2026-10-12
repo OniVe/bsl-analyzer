@@ -180,6 +180,7 @@ fn call_hierarchy_index_overlay_keeps_root_kinds_and_closures() {
     db.set_file_revision_from_disk(file_id, content_revision("Процедура П() КонецПроцедуры"));
     let paths = vec![(None, cf), (Some("EXT".to_owned()), ext), (Some("EPF".to_owned()), epf)];
     db.set_workspace_configs_snapshot(ide::WorkspaceConfigsSnapshot {
+        extension_scopes: vec![None, Some(bsl_metadata::ExtensionScope::InfoBase), None],
         canonical_paths: paths.iter().map(|(_, path)| path.clone()).collect(),
         kinds: vec![
             ide::WorkspaceRootKind::Base,
