@@ -6,6 +6,7 @@ mod new_expr_completion;
 mod platform_completion;
 mod sdbl;
 mod templates;
+mod type_string_completion;
 
 use ide_db::base_db::Locale;
 use ide_db::RootDatabase;
@@ -72,6 +73,13 @@ pub enum CompletionItemKind {
 
 pub fn completions<DB: RootDatabase>(db: &DB, position: CompletionPosition) -> Vec<CompletionItem> {
     let _p = tracing::info_span!("completions", ?position).entered();
+
+    // Inside the string argument of `Тип("…")`. Checked first: it is disjoint from
+    // the query-string and dotted-member contexts below.
+    if let Some(items) = type_string_completion::type_string_completions(db, position.clone()) {
+        tracing::debug!(items = items.len(), "returning Тип(\"…\") type-name completions");
+        return items;
+    }
 
     if let Some(items) = sdbl::sdbl_completions(db, position.clone()) {
         tracing::debug!(items = items.len(), "returning SDBL completions");
