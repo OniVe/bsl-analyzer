@@ -661,6 +661,8 @@ fn handle_loader_msg(state: &mut GlobalState, msg: vfs::loader::Message) -> Resu
                     for uri in uris {
                         crate::handlers::notification::schedule_diagnostics(state, &uri);
                     }
+                    // The cancellation above dropped in-flight semantic-tokens requests.
+                    state.request_semantic_tokens_refresh();
                 }
                 if baseline_changed {
                     state.mark_workspace_batch_dirty();
@@ -687,6 +689,7 @@ fn handle_loader_msg(state: &mut GlobalState, msg: vfs::loader::Message) -> Resu
                     for uri in state.opened_document_uris() {
                         crate::handlers::notification::schedule_diagnostics(state, &uri);
                     }
+                    state.request_semantic_tokens_refresh();
                 }
                 tracing::info!(removed_paths = n, "processed removed directory subtree");
             }
