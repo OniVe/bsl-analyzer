@@ -118,6 +118,8 @@ pub fn main_loop(connection: Connection) -> Result<()> {
         && client_supports_pull_diagnostics(&initialize_params.capabilities);
     state.supports_workspace_diagnostic_refresh =
         client_supports_workspace_diagnostic_refresh(&raw_capabilities);
+    state.supports_semantic_tokens_refresh =
+        client_supports_semantic_tokens_refresh(&initialize_params.capabilities);
 
     state.init_empty_source_root();
 
@@ -200,6 +202,16 @@ fn client_folding_range_limit(caps: &lsp_types::ClientCapabilities) -> Option<u3
 /// suppresses push to avoid double-reporting open buffers.
 fn client_supports_pull_diagnostics(caps: &lsp_types::ClientCapabilities) -> bool {
     caps.text_document.as_ref().and_then(|td| td.diagnostic.as_ref()).is_some()
+}
+
+/// Whether the client advertised `workspace.semanticTokens.refreshSupport`, the only grant the
+/// spec gives the server to send `workspace/semanticTokens/refresh`.
+fn client_supports_semantic_tokens_refresh(caps: &lsp_types::ClientCapabilities) -> bool {
+    caps.workspace
+        .as_ref()
+        .and_then(|w| w.semantic_tokens.as_ref())
+        .and_then(|st| st.refresh_support)
+        .unwrap_or(false)
 }
 
 /// Whether the client advertised `workspace.diagnostics.refreshSupport`, so the server may ask it
@@ -469,9 +481,12 @@ fn handle_lsp_msg(state: &mut GlobalState, msg: Message) -> Result<()> {
         Message::Notification(not) => {
             handle_notification(state, not)?;
         }
-        Message::Response(resp) => {
-            tracing::warn!("Unexpected response: {:?}", resp);
-        }
+        // The server's own requests (refreshes, progress creation) are fire-and-forget: a client
+        // that answers them is following the protocol, and only a refusal is worth a warning.
+        Message::Response(resp) => match &resp.error {
+            Some(error) => tracing::warn!(id = ?resp.id, ?error, "client refused a server request"),
+            None => tracing::debug!(id = ?resp.id, "client answered a server request"),
+        },
     }
     Ok(())
 }
@@ -661,6 +676,8 @@ fn handle_loader_msg(state: &mut GlobalState, msg: vfs::loader::Message) -> Resu
                     for uri in uris {
                         crate::handlers::notification::schedule_diagnostics(state, &uri);
                     }
+                    // The cancellation above dropped in-flight semantic-tokens requests.
+                    state.request_semantic_tokens_refresh();
                 }
                 if baseline_changed {
                     state.mark_workspace_batch_dirty();
@@ -687,6 +704,7 @@ fn handle_loader_msg(state: &mut GlobalState, msg: vfs::loader::Message) -> Resu
                     for uri in state.opened_document_uris() {
                         crate::handlers::notification::schedule_diagnostics(state, &uri);
                     }
+                    state.request_semantic_tokens_refresh();
                 }
                 tracing::info!(removed_paths = n, "processed removed directory subtree");
             }
@@ -1224,6 +1242,10 @@ fn handle_vfs_msg(
         if outcome.diagnostics_baseline_changed {
             state.request_workspace_diagnostic_refresh();
         }
+        // Semantic-tokens requests issued during the reindex were declined or
+        // cancelled; ask the client to pull them again, as the initial-load
+        // finalize does.
+        state.request_semantic_tokens_refresh();
     }
 
     Ok(())
