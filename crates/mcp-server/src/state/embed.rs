@@ -4291,7 +4291,9 @@ mod tests {
 
         // The directory and search DB are writable, but an un-writable lease lock leaves
         // this managed default cache unclaimed. The worker must not treat that as unmanaged.
-        std::os::unix::fs::symlink("/proc/self/status", cache.lease_lock_path()).unwrap();
+        // A directory cannot be opened for writing by anyone, root included; a read-only
+        // file would be opened by root, which is how CI runs.
+        std::os::unix::fs::symlink(cache_parent.path(), cache.lease_lock_path()).unwrap();
         let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
         assert!(lease.is_managed());
         assert!(!lease.owns_caches(), "the denied claim owns no cache");

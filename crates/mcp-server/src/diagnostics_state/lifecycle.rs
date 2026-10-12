@@ -588,7 +588,12 @@ impl DiagnosticsState {
         // Snapshot the hub cursor at build start: the build's baseline scan captures the
         // disk as of now, so only events landing after this point need replaying onto the
         // published resident.
-        self.resubscribe_cursor();
+        //
+        // `run_load` spawns only from `Idle`, with the cursor slot empty, so `resubscribe_cursor`
+        // takes the `hub.subscribe()` branch and `carried` is always `None` here. Taking it and
+        // settling below is defensiveness for a future reuse of this path, not the carried-debt
+        // story `run_reload` tells.
+        let carried = self.resubscribe_cursor();
         tracing::info!(?root, "diagnostics resident db build started");
         match Self::catch_build(|| Self::build_resident(&root, &self.excluded)) {
             Ok(built) => {
@@ -606,6 +611,10 @@ impl DiagnosticsState {
                     inner.status = DiagnosticsStatus::Ready { files };
                 }
                 *lock_recover(&self.scan) = None;
+                // The build read the tree whole, so the reconcile its fresh cursor carried
+                // is answered. Settled BEFORE the hub re-arm below: that re-arm can raise a
+                // window of its own, and that one is nobody's to pay here.
+                self.settle_rebuild_debt(carried);
                 tracing::info!(files, "diagnostics resident db ready");
                 self.ensure_hub_roots(
                     &built.scan_roots,
@@ -650,7 +659,7 @@ impl DiagnosticsState {
         self.rebuilds_started.fetch_add(1, Ordering::SeqCst);
         // Fresh cursor snapshot at rebuild start; events during the rebuild replay onto
         // the new resident, events before it are covered by the rebuild's baseline scan.
-        self.resubscribe_cursor();
+        let carried = self.resubscribe_cursor();
         match Self::catch_build(|| Self::build_resident(&root, &self.excluded)) {
             Ok(built) => {
                 // A swap states outright which files exist, so a build that could not read
@@ -693,6 +702,10 @@ impl DiagnosticsState {
                 inner.status = DiagnosticsStatus::Ready { files };
                 drop(inner);
                 *lock_recover(&self.scan) = None;
+                // The swap states this build read the tree whole, so the reconcile its
+                // fresh cursor carried is answered here — before the hub re-arm below,
+                // whose window would be a new debt and nobody's to settle.
+                self.settle_rebuild_debt(carried);
                 tracing::info!(files, "diagnostics resident db reloaded");
                 self.ensure_hub_roots(
                     &built.scan_roots,
@@ -773,9 +786,10 @@ impl DiagnosticsState {
         // canonical `.bsl` universe the scan produces.
         let configs = snapshot.configs.clone();
         let diagnostics = project.config.diagnostics.rules_json();
-        let mut config = ide::DiagnosticsConfig::from_project_json(
+        let mut config = ide::DiagnosticsConfig::from_project_file(
             &diagnostics,
             project.config.output.resolve_locale().unwrap_or_default(),
+            project.config.config_file_path(),
         );
         // `[analysis].diff_base`: restrict diagnostics to the vendor diff. Computed
         // synchronously — the resident build is already the heavy bootstrap phase —

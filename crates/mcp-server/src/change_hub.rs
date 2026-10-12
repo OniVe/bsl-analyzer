@@ -537,6 +537,27 @@ pub(crate) struct SinkCursor {
     id: u64,
 }
 
+/// The debt [`WorkspaceChangeHub::resubscribe`] carried from one cursor onto a fresh one, named
+/// by the PAIR that must still hold for a later successful rebuild to settle it: the loss the
+/// cursor was issued, and the POSITION the fresh cursor was put at when the carry happened.
+///
+/// The position is the half a loss alone cannot speak for. `make_room` advances a cursor's
+/// position to cut it out of entries it never read, and it does so WITHOUT renaming a debt the
+/// cursor already owes — one reconcile covers the cut too. A settle that answered to the loss
+/// alone would then pay a rebuild whose baseline scan never contained the cut entries, and they
+/// would vanish with no debt left on the cursor: any movement of the position while a debt is
+/// live is the signature of a cut, and such a debt is not the settle's to close.
+///
+/// That refusal is conservative, and deliberately so: it also covers a cut that happened
+/// BEFORE the baseline scan, whose facts that scan nevertheless read. Such a debt is simply
+/// not settled here and is cleared by the next guard pass — the price being a possible extra
+/// full scan on the reads until then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CarriedDebt {
+    loss: u64,
+    pos: u64,
+}
+
 /// A subscription whose release does not depend on remembering to release it.
 ///
 /// A cursor is subscribed before the consumer that will read it exists, and the code
@@ -778,6 +799,42 @@ impl Accumulator {
             cursor.loss = Some(loss);
         }
         cursor.delivered = delivered;
+    }
+
+    /// Settle the debt carried onto `id` by [`Self::carry_debt`], provided the cursor still
+    /// holds EXACTLY that debt — the pair the carry captured. Says whether it did.
+    ///
+    /// A rebuild that took a fresh cursor and then succeeded has answered the reconcile the
+    /// carried debt was for: its baseline scan read the tree. Settling it is what keeps the
+    /// following reads on the event stream rather than paying a full walk, window after
+    /// window, for a loss the build already covered.
+    ///
+    /// The pair is the whole guard, and each half refuses a different world:
+    ///
+    /// - a cursor that owes nothing or one the accumulator never issued holds no pair at all;
+    /// - a cursor whose debt has since been REPLACED (a lag, a dropped event, blindness) no
+    ///   longer carries the loss — the token names a window this call knows nothing about, and
+    ///   settling on it would answer a reconcile nobody performed;
+    /// - a cursor whose POSITION has moved is one `make_room` cut out of entries it never read,
+    ///   without renaming the debt it already owed. The rebuild's baseline scan cannot contain
+    ///   those entries, so this settle is not the one they were owed: it refuses and the debt
+    ///   survives.
+    ///
+    /// Only the debt moves. `pos` stays where the re-subscription put it, so an entry that
+    /// landed after the fresh cursor was taken is still delivered by the next drain, and
+    /// `delivered` stays as the consumer's hand left it.
+    fn settle_carried_debt(&mut self, id: u64, carried: &CarriedDebt) -> bool {
+        let Some(cursor) = self.cursors.get_mut(&id) else { return false };
+        if cursor.pending.is_none()
+            || cursor.loss != Some(carried.loss)
+            || cursor.pos != carried.pos
+        {
+            return false;
+        }
+        cursor.pending = None;
+        cursor.loss = None;
+        self.close_window_if_settled();
+        true
     }
 
     fn loss_horizon(&self) -> LossHorizon {
@@ -2626,14 +2683,24 @@ impl WorkspaceChangeHub {
         SinkCursor { id }
     }
 
-    /// Replace one consumer's cursor, carrying whatever it still owes onto the new one.
+    /// Replace one consumer's cursor, carrying whatever it still owes onto the new one, and
+    /// report the PAIR that names that debt when there was one.
     ///
     /// Re-subscribing is not leaving. A consumer does it to take a fresh baseline — the
     /// resident does exactly this at the start of a rebuild — and that rebuild can fail,
     /// leaving the old state still being served. Letting the debt die with the old cursor
     /// would be settling it against a baseline that was never taken: the events the window
     /// was opened for are gone, and the only record that they were missed would go with it.
-    pub(crate) fn resubscribe(&self, cursor: SinkCursor) -> SinkCursor {
+    ///
+    /// The token is what a caller that DID take the baseline hands to
+    /// [`Self::settle_carried_debt`] once its build succeeds. It is captured under the SAME
+    /// hold of the accumulator that performs the carry: the loss is the number `carry_debt`
+    /// wrote onto the fresh cursor, and the position is the one the fresh subscription gave
+    /// it. Read back after `drop(acc)` instead, the loss could be renamed by a window raised
+    /// in the gap, and the token would name a window this rebuild never answered; the second
+    /// blind re-arm below moves neither (it writes only when nothing is owed), so it does not
+    /// disturb the captured pair.
+    pub(crate) fn resubscribe(&self, cursor: SinkCursor) -> (SinkCursor, Option<CarriedDebt>) {
         // Read before taking the accumulator, so no path holds one of the two locks while
         // asking for the other.
         let blind = self.inner.is_blind_and_announced().then_some(DegradeReason::RewatchFailed);
@@ -2644,13 +2711,38 @@ impl WorkspaceChangeHub {
         let (reason, loss) = carried.map_or((None, None), |(reason, loss)| (Some(reason), loss));
         let id = acc.subscribe(reason.or(blind.clone()));
         acc.carry_debt(id, loss, delivered);
+        // Captured HERE, under the same hold as the carry: `loss` is what `carry_debt` wrote
+        // and `pos` is where the fresh subscription put the cursor. Taking either back after
+        // `drop(acc)` would let a window raised in the gap rename the loss and turn the token
+        // into one for a reconcile this rebuild never answered.
+        // Infallible: `subscribe` above inserted this cursor under the same hold, so the
+        // `None` arm of a silent fallback (a fabricated position) is unreachable — and were
+        // it ever reached, a fabricated position would make the token read as settled against
+        // a baseline that never covered it: a false SETTLE, the direction that loses events.
+        let pos = acc.cursors.get(&id).map(|cursor| cursor.pos).expect("just subscribed");
+        let token = loss.map(|loss| CarriedDebt { loss, pos });
         drop(acc);
         // The same second read as in [`Self::subscribe`], for the same gap between the two
-        // locks.
+        // locks. It moves neither half of the captured pair: a blind re-arm writes only onto a
+        // cursor that owes nothing, and this one carries a debt.
         if blind.is_none() && self.inner.is_blind_and_announced() {
             self.inner.lock_acc().force_rescan(id, DegradeReason::RewatchFailed);
         }
-        SinkCursor { id }
+        (SinkCursor { id }, token)
+    }
+
+    /// Settle a debt [`Self::resubscribe`] carried onto `cursor`, if that cursor still holds
+    /// exactly that PAIR — the loss AND the position the carry captured. Says whether it was
+    /// settled.
+    ///
+    /// For the caller whose re-subscription has since been justified — a rebuild that read the
+    /// tree whole. The pair is the guard: a loss names the window, and the position says no cut
+    /// has widened it since (any movement of the position while a debt is live is a `make_room`
+    /// cut, and that debt is not this settle's to close); a window raised after the carry under
+    /// a new loss is refused too. Conditional on purpose: see
+    /// [`Accumulator::settle_carried_debt`].
+    pub(crate) fn settle_carried_debt(&self, cursor: SinkCursor, carried: &CarriedDebt) -> bool {
+        self.inner.lock_acc().settle_carried_debt(cursor.id, carried)
     }
 
     /// Drop a cursor and reclaim any entries it was the last to hold back. For a consumer
@@ -5651,8 +5743,9 @@ fn apply_rearm(
 /// standing-degraded, and that stand can only be built here, next to what it exercises.
 #[cfg(test)]
 pub(crate) mod test_support {
+    use super::{ChangeKind, WorkspaceChangeHub};
     #[cfg(unix)]
-    use super::{RefusedWatches, WatchTarget, WorkspaceChangeHub};
+    use super::{RefusedWatches, WatchTarget};
     use std::time::{Duration, Instant};
     #[cfg(unix)]
     use std::{path::PathBuf, sync::Arc};
@@ -5693,6 +5786,19 @@ pub(crate) mod test_support {
         assert!(hub.wait_until_watching(Duration::from_secs(5)), "the live root still arms");
         hub.wait_until_blindness_announced();
         (dir, a, b, hub, refusals)
+    }
+
+    /// Push the accumulator past its cap, so the hub `make_room`s its slowest cursor out of
+    /// entries it never read. Opaque to a caller in another module: the cut can only be
+    /// provoked next to the cap, and the cap is private here. The paths are synthetic — no
+    /// event has to reach the watcher for the accumulator to hold them undrained.
+    pub(crate) fn overflow_the_cap(hub: &WorkspaceChangeHub) {
+        let mut acc = hub.inner.lock_acc();
+        let count = acc.cap + 1;
+        for i in 0..count {
+            let path = std::path::PathBuf::from(format!("overflow/{i}.bsl"));
+            acc.record(path.clone(), path, ChangeKind::MaybeChanged);
+        }
     }
 }
 
@@ -7471,7 +7577,7 @@ mod tests {
         let before = hub.materialize(cursor);
         assert!(before.rescan_required, "the stand needs a debt to carry");
 
-        let replaced = hub.resubscribe(cursor);
+        let (replaced, _) = hub.resubscribe(cursor);
         let after = hub.materialize(replaced);
         hub.shutdown();
         assert!(after.rescan_required, "the debt did not survive re-subscribing");
@@ -7620,12 +7726,253 @@ mod tests {
         hub.degrade_external();
         assert!(hub.drain(sink).rescan_required, "the sink acknowledges the window");
 
-        let diagnostics = hub.resubscribe(diagnostics);
+        let (diagnostics, _) = hub.resubscribe(diagnostics);
 
         assert!(
             hub.drain(diagnostics).rescan_required,
             "a rebuild that has not happened yet cannot have settled the debt",
         );
+    }
+
+    /// Settling pays the carried debt — and nothing else. The cursor's POSITION is where the
+    /// re-subscription put it, so an entry that landed afterwards is still delivered by the
+    /// next drain. Settling by draining would have consumed the position with the debt and
+    /// dropped that entry in the rebuild's own window.
+    #[test]
+    fn settling_a_carried_debt_closes_it_without_swallowing_later_entries() {
+        let dir = tempdir().unwrap();
+        let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+
+        let cursor = hub.subscribe();
+        hub.degrade_external();
+        let (replaced, carried) = hub.resubscribe(cursor);
+        let carried = carried.expect("the window's debt was carried onto the fresh cursor");
+
+        // An entry that lands after the re-subscription: it belongs to the window the
+        // rebuild's own baseline scan cannot contain.
+        let after = dir.path().join("After.bsl");
+        hub.inner.lock_acc().record(after.clone(), after.clone(), ChangeKind::MaybeChanged);
+
+        assert!(hub.settle_carried_debt(replaced, &carried), "the carried debt was not settled");
+        assert_eq!(hub.health(), Health::Healthy, "and the window it belonged to is closed");
+
+        let batch = hub.drain(replaced);
+        assert!(
+            batch.entries.iter().any(|entry| entry.raw == after),
+            "settling the debt swallowed an entry that landed after the re-subscription",
+        );
+        assert!(!batch.rescan_required, "the settled debt is not owed again");
+    }
+
+    /// A settlement names ONE loss. A window raised after the re-subscription is a different
+    /// loss, and the old token must not pay it: the rebuild that earned the settle happened
+    /// before that loss existed.
+    #[test]
+    fn a_debt_replaced_after_resubscribing_is_not_settled_by_the_old_token() {
+        let dir = tempdir().unwrap();
+        let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+
+        let cursor = hub.subscribe();
+        hub.degrade_external();
+        let (replaced, first) = hub.resubscribe(cursor);
+        let first = first.expect("the first window's debt was carried onto the fresh cursor");
+
+        // A second loss lands between the re-subscription and the rebuild's success.
+        hub.degrade_external();
+
+        assert!(
+            !hub.settle_carried_debt(replaced, &first),
+            "a superseded identity settled the window that replaced it",
+        );
+        assert!(
+            matches!(hub.health(), Health::Degraded(_)),
+            "the newer window is still owed and must still read as degraded",
+        );
+        let batch = hub.drain(replaced);
+        assert!(batch.rescan_required, "and it is still demanded of the consumer");
+        assert_ne!(batch.loss_token(), Some(first.loss), "under an identity of its own");
+    }
+
+    /// The token a re-subscription hands back is captured UNDER the accumulator hold that does
+    /// the carry, never read back from the fresh cursor afterwards. A read-back token is taken
+    /// after `drop(acc)`, so a window raised in between renames the loss it names — and the
+    /// rebuild that later settles that token answers a reconcile it never performed.
+    ///
+    /// The interleaving is provoked through a lock the gap itself already takes, not through a
+    /// production hook: this thread holds the accumulator and spawns the worker, which blocks
+    /// on it; while still holding it, this thread takes `blind_targets` — the lock the SECOND
+    /// blindness read takes, which the worker (stuck on the accumulator) can not reach yet.
+    /// On release the worker carries the debt, drops `acc` and stops on that second read,
+    /// holding nothing; this thread waits for the old cursor to leave the map and raises a
+    /// fresh window right there, with the worker still in the gap.
+    #[test]
+    fn resubscribing_captures_the_debt_it_carried_before_a_window_can_replace_it() {
+        let dir = tempdir().unwrap();
+        let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+
+        let cursor = hub.subscribe();
+        hub.degrade_external();
+
+        let guard = hub.inner.lock_acc();
+        let carried_loss = guard
+            .cursors
+            .get(&cursor.id)
+            .and_then(|cursor| cursor.loss)
+            .expect("the stand needs an owed window to carry");
+        let old_id = cursor.id;
+        let hub2 = hub.clone();
+        let worker = std::thread::spawn(move || hub2.resubscribe(cursor));
+        // The worker passes the first blindness read and stops on the accumulator this thread
+        // holds. It cannot reach the second one yet, so taking that lock here is safe.
+        std::thread::sleep(Duration::from_millis(50));
+        let blind = hub.inner.blind_targets.lock().unwrap_or_else(|e| e.into_inner());
+        drop(guard);
+        // The carry is done the moment the old cursor leaves the map; raise the window then,
+        // while the worker waits on `blind` just past `drop(acc)`.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut acc = hub.inner.lock_acc();
+            if !acc.cursors.contains_key(&old_id) {
+                acc.enter_rescan(false, DegradeReason::RuntimeError);
+                break;
+            }
+            drop(acc);
+            assert!(std::time::Instant::now() < deadline, "the carry never happened");
+            std::thread::yield_now();
+        }
+        drop(blind);
+        let (replaced, token) = worker.join().unwrap();
+        let token = token.expect("the carry reported a token");
+        assert_eq!(token.loss, carried_loss, "the token named a loss the carry did not write");
+        hub.unsubscribe(replaced);
+        hub.shutdown();
+    }
+
+    /// The token a re-subscription hands back names the debt the OLD cursor carried, captured
+    /// from the carry itself — not a number read back from the fresh cursor afterwards. A
+    /// cursor already owing a window keeps that loss through the re-subscription, and the
+    /// token IS that loss; the pair then settles exactly the carried window.
+    #[test]
+    fn resubscribing_captures_the_debt_it_carried() {
+        let dir = tempdir().unwrap();
+        let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+
+        let cursor = hub.subscribe();
+        hub.degrade_external();
+        // The loss the old cursor owes, read from the accumulator before the re-subscription.
+        let before = hub.inner.lock_acc().cursors.get(&cursor.id).and_then(|c| c.loss);
+        assert!(before.is_some(), "the stand needs an owed window");
+
+        let (replaced, carried) = hub.resubscribe(cursor);
+        let carried = carried.expect("the window's debt was carried onto the fresh cursor");
+        assert_eq!(Some(carried.loss), before, "the token renames the debt that was carried");
+        assert!(
+            hub.settle_carried_debt(replaced, &carried),
+            "the captured pair settles the window it was carried for",
+        );
+        hub.shutdown();
+    }
+
+    /// Settlement is by the PAIR, so a debt is paid only by the cursor that still holds both
+    /// halves. A cursor carrying a debt of its own, one the accumulator never issued, one that
+    /// owes nothing at all, and — the half a loss cannot speak for — one whose position has
+    /// moved since the carry are all refusals; the alternative being a rebuild that answers a
+    /// reconcile it never performed.
+    #[test]
+    fn settling_a_debt_is_refused_for_a_cursor_that_does_not_hold_it() {
+        let mut acc = Accumulator::new(4);
+        let debtor = acc.subscribe(None);
+        acc.enter_rescan(false, DegradeReason::RuntimeError);
+        let (shared, debtor_pos) = {
+            let cursor = acc.cursors.get(&debtor).expect("the debtor");
+            (cursor.loss.expect("the window was issued an identity"), cursor.pos)
+        };
+        let held = CarriedDebt { loss: shared, pos: debtor_pos };
+
+        // A cursor carrying a debt of its OWN: same accumulator, a different loss.
+        let forced = acc.subscribe(Some(DegradeReason::WatcherSetup));
+        let (own, forced_pos) = {
+            let cursor = acc.cursors.get(&forced).expect("the forced cursor");
+            (cursor.loss.expect("the forced cursor was issued one of its own"), cursor.pos)
+        };
+        assert_ne!(own, shared, "the stand needs two distinct debts");
+        assert!(
+            !acc.settle_carried_debt(forced, &held),
+            "another cursor's loss was settled against this one",
+        );
+
+        assert!(
+            !acc.settle_carried_debt(u64::MAX, &held),
+            "a cursor the accumulator never issued owes nothing",
+        );
+
+        // The other half of the pair: the loss still names the carried window, but the
+        // position moved — the signature of a `make_room` cut this settle may not pay.
+        let moved = CarriedDebt { loss: shared, pos: debtor_pos + 1 };
+        assert!(
+            !acc.settle_carried_debt(debtor, &moved),
+            "a cursor whose position moved was settled as if nothing had been cut",
+        );
+
+        assert!(acc.settle_carried_debt(debtor, &held), "the debtor pays its own pair");
+        let forced_held = CarriedDebt { loss: own, pos: forced_pos };
+        assert!(acc.settle_carried_debt(forced, &forced_held), "and the forced cursor its own");
+        let healthy = acc.subscribe(None);
+        assert!(
+            !acc.settle_carried_debt(healthy, &held),
+            "a cursor that owes nothing is not a debtor",
+        );
+    }
+
+    /// A cut does not RENAME a debt, it moves the position out from under it. `make_room`
+    /// advances a cursor already owing a reconcile to `max`, and leaves the loss as it was —
+    /// one reconcile covers the cut too. So the old token still carries the right loss while
+    /// the position has moved past entries the rebuild's baseline scan never read: a settle
+    /// that answered to the loss alone would pay that reconcile and the cut entries would
+    /// vanish with no debt left on the cursor.
+    #[test]
+    fn a_cut_during_a_carried_debt_is_not_settled_by_the_old_pair() {
+        let dir = tempdir().unwrap();
+        let hub = WorkspaceChangeHub::start_with_capacity(
+            vec![WatchTarget::recursive(dir.path().to_path_buf())],
+            4,
+            COVERAGE_TICK_PERIOD,
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+
+        let cursor = hub.subscribe();
+        hub.degrade_external();
+        let (replaced, carried) = hub.resubscribe(cursor);
+        let carried = carried.expect("the window's debt was carried onto the fresh cursor");
+
+        // The rebuild is running and the accumulator overflows: `make_room` cuts the fresh
+        // cursor forward. It already owes a reconcile, so the cut does not give it a new loss.
+        {
+            let mut acc = hub.inner.lock_acc();
+            for i in 0..6 {
+                let path = dir.path().join(format!("Cut{i}.bsl"));
+                acc.record(path.clone(), path, ChangeKind::MaybeChanged);
+            }
+        }
+
+        assert!(
+            !hub.settle_carried_debt(replaced, &carried),
+            "a cut was settled against a baseline scan that never read the cut entries",
+        );
+        assert!(
+            matches!(hub.health_for(Some(replaced)), Health::Degraded(_)),
+            "the cut still owes a reconcile",
+        );
+        let batch = hub.drain(replaced);
+        assert!(
+            batch.rescan_required,
+            "the consumer is told to reconcile over the cut, not left believing the stream is whole",
+        );
+        hub.shutdown();
     }
 
     /// The backend dropping events is the loss that belongs to everyone: the paths were
@@ -9268,7 +9615,7 @@ mod tests {
         let (_dir, _b, hub, _gate, barrier, _refusals, cursors) =
             parked_announcement(AnnouncePoint::AfterIssue, 1);
         let held = hub.materialize(cursors[0]);
-        let replaced = hub.resubscribe(cursors[0]);
+        let (replaced, _) = hub.resubscribe(cursors[0]);
         finish_announcement(&hub, &barrier);
         let carried = hub.materialize(replaced);
         hub.shutdown();
