@@ -21,6 +21,7 @@ parser.workspace = true
 project-model.workspace = true
 sdbl-hir.workspace = true
 syntax.workspace = true
+profile.workspace = true
 line-index.workspace = true
 ide.workspace = true
 base-db.workspace = true
@@ -77,6 +78,7 @@ libc = "0.2"
 tempfile.workspace = true
 widestring = "1.0"
 win-security-identifier = "0.1.1"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 # Safe introspection of a connected named-pipe server: lets us read the
 # server PID's image path and owner SID without project-local unsafe or
 # handwritten Win32 FFI. `system` feature is Process/System/Users only —
@@ -107,3 +109,6 @@ jsonschema = { version = "0.51.0", default-features = false }
 # The one-implementation gate parses Rust sources: a text scan would count the word
 # inside comments and doc examples, and this gate exists to be believed.
 syn.workspace = true
+
+[lints]
+workspace = true

@@ -39,8 +39,7 @@ const MANAGED_FORM_EXTENSION_TYPE_NAMES: &[&str] = &[
 /// The platform types whose methods a managed form module calls without a
 /// receiver: the form itself plus the extension its main attribute mixes in.
 ///
-/// A main attribute of a type that was not read (an information register record
-/// manager — the metadata parser does not model it — a defined type, a composite)
+/// A main attribute of a type that was not read (a defined type, a composite)
 /// cannot name its extension, so every extension is included: a bare name that
 /// misses even that union is absent on any reading of the attribute.
 pub(crate) fn managed_form_self_method_types(form: &Form) -> Vec<&'static str> {
@@ -99,6 +98,9 @@ fn managed_form_extension_type_name(attr_type: &AttributeType) -> Option<&'stati
                 }
                 _ => "Расширение формы клиентского приложения для объектов",
             })
+        }
+        AttributeType::InformationRegisterRecordManager { .. } => {
+            Some("Расширение формы клиентского приложения для записи регистра сведений")
         }
         AttributeType::Platform(PlatformValueType::ConstantsSet) => {
             Some("Расширение формы клиентского приложения для констант")
@@ -171,6 +173,7 @@ mod tests {
     /// The union stands in for an unread main attribute only while it holds every
     /// extension the catalog knows; a new platform extension must join it.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn the_extension_union_is_the_catalog_extension_set() {
         let data = PlatformDataInner::instance();
         let mut catalog: Vec<String> = data
@@ -209,6 +212,30 @@ mod tests {
     }
 
     #[test]
+    fn a_record_form_gets_the_record_extension_alone() {
+        let record = form_with_main_type(AttributeType::InformationRegisterRecordManager {
+            name: "Курсы".to_string(),
+        });
+        assert_eq!(
+            managed_form_self_method_types(&record),
+            [
+                FORM_TYPE_NAME,
+                "Расширение формы клиентского приложения для записи регистра сведений"
+            ]
+        );
+
+        let record_set = form_with_main_type(AttributeType::Ref {
+            mdo_type: MdoType::InformationRegister,
+            name: "Курсы".to_string(),
+        });
+        assert_eq!(
+            managed_form_self_method_types(&record_set),
+            [FORM_TYPE_NAME, "Расширение формы клиентского приложения для набора записей"]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn is_form_self_property_name_recognizes_known_russian_props() {
         for name in &["Элементы", "Команды", "Параметры", "ТекущийЭлемент", "Заголовок"]
         {
@@ -220,6 +247,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn is_form_self_property_name_is_bilingual() {
         for name in &["Items", "Commands", "Title"] {
             assert!(is_form_self_property_name(name), "expected English alias {name:?} to resolve");
@@ -227,6 +255,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn is_form_self_property_name_is_case_insensitive() {
         assert!(is_form_self_property_name("элементы"));
         assert!(is_form_self_property_name("ЭЛЕМЕНТЫ"));

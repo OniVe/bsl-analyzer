@@ -418,6 +418,23 @@ impl DiagnosticsState {
     where
         F: FnOnce(&DiagnosticsResident, u64) -> R,
     {
+        self.read_mut_impl(|resident, generation| f(&*resident, generation))
+    }
+
+    /// [`Self::read`] for a reader that trims the resident's own memo caches as it
+    /// goes (the workspace sweep): the same lock, the same drift reconciliation and
+    /// the same freshness verdict, with the resident borrowed mutably.
+    pub(crate) fn read_mut<F, R>(&self, f: F) -> ResidentOutcome<R>
+    where
+        F: FnOnce(&mut DiagnosticsResident, u64) -> R,
+    {
+        self.read_mut_impl(f)
+    }
+
+    fn read_mut_impl<F, R>(&self, f: F) -> ResidentOutcome<R>
+    where
+        F: FnOnce(&mut DiagnosticsResident, u64) -> R,
+    {
         *lock_recover(&self.last_access) = Instant::now();
         // Freshness is handled before taking the lock: an incremental apply needs the
         // same mutex and it is non-reentrant. A full rebuild runs off-thread and this
@@ -449,17 +466,23 @@ impl DiagnosticsState {
             None
         };
 
-        let inner = lock_recover(&self.inner);
+        let mut inner = lock_recover(&self.inner);
+        let inner: &mut Inner = &mut inner;
         let generation = inner.generation;
         match &inner.status {
-            DiagnosticsStatus::Ready { .. } => match inner.resident.as_ref() {
-                Some(resident) => {
-                    let freshness = compute_freshness(&inner, scan.as_ref());
-                    let result = f(resident, generation);
-                    ResidentOutcome::Ready(result, freshness)
+            DiagnosticsStatus::Ready { .. } => {
+                let freshness = compute_freshness(inner, scan.as_ref());
+                match inner.resident.as_mut() {
+                    Some(resident) => {
+                        let result = f(resident, generation);
+                        // After the read: its database clone is gone, so the trim never
+                        // waits on this request's own handle.
+                        resident.trim_after_read();
+                        ResidentOutcome::Ready(result, freshness)
+                    }
+                    None => ResidentOutcome::Loading,
                 }
-                None => ResidentOutcome::Loading,
-            },
+            }
             DiagnosticsStatus::Idle | DiagnosticsStatus::Loading => ResidentOutcome::Loading,
             DiagnosticsStatus::Disabled => ResidentOutcome::Disabled,
             DiagnosticsStatus::Failed(msg) => ResidentOutcome::Failed(msg.clone()),
@@ -565,7 +588,12 @@ impl DiagnosticsState {
         // Snapshot the hub cursor at build start: the build's baseline scan captures the
         // disk as of now, so only events landing after this point need replaying onto the
         // published resident.
-        self.resubscribe_cursor();
+        //
+        // `run_load` spawns only from `Idle`, with the cursor slot empty, so `resubscribe_cursor`
+        // takes the `hub.subscribe()` branch and `carried` is always `None` here. Taking it and
+        // settling below is defensiveness for a future reuse of this path, not the carried-debt
+        // story `run_reload` tells.
+        let carried = self.resubscribe_cursor();
         tracing::info!(?root, "diagnostics resident db build started");
         match Self::catch_build(|| Self::build_resident(&root, &self.excluded)) {
             Ok(built) => {
@@ -583,6 +611,10 @@ impl DiagnosticsState {
                     inner.status = DiagnosticsStatus::Ready { files };
                 }
                 *lock_recover(&self.scan) = None;
+                // The build read the tree whole, so the reconcile its fresh cursor carried
+                // is answered. Settled BEFORE the hub re-arm below: that re-arm can raise a
+                // window of its own, and that one is nobody's to pay here.
+                self.settle_rebuild_debt(carried);
                 tracing::info!(files, "diagnostics resident db ready");
                 self.ensure_hub_roots(
                     &built.scan_roots,
@@ -627,7 +659,7 @@ impl DiagnosticsState {
         self.rebuilds_started.fetch_add(1, Ordering::SeqCst);
         // Fresh cursor snapshot at rebuild start; events during the rebuild replay onto
         // the new resident, events before it are covered by the rebuild's baseline scan.
-        self.resubscribe_cursor();
+        let carried = self.resubscribe_cursor();
         match Self::catch_build(|| Self::build_resident(&root, &self.excluded)) {
             Ok(built) => {
                 // A swap states outright which files exist, so a build that could not read
@@ -670,6 +702,10 @@ impl DiagnosticsState {
                 inner.status = DiagnosticsStatus::Ready { files };
                 drop(inner);
                 *lock_recover(&self.scan) = None;
+                // The swap states this build read the tree whole, so the reconcile its
+                // fresh cursor carried is answered here — before the hub re-arm below,
+                // whose window would be a new debt and nobody's to settle.
+                self.settle_rebuild_debt(carried);
                 tracing::info!(files, "diagnostics resident db reloaded");
                 self.ensure_hub_roots(
                     &built.scan_roots,
@@ -830,6 +866,8 @@ impl DiagnosticsState {
         Ok(ResidentBuild {
             resident: DiagnosticsResident {
                 db,
+                #[cfg(test)]
+                read_trims: 0,
                 sweep_pool: std::sync::OnceLock::new(),
                 vfs,
                 by_path,

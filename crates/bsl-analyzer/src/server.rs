@@ -60,19 +60,24 @@ pub fn main_loop(connection: Connection) -> Result<()> {
     // config load) starts. Read it directly from the workspace root; `Off` leaves the
     // server on push-only diagnostics with no provider advertised.
     let workspace_root = extract_workspace_root(&initialize_params);
-    let workspace_diagnostics_scope = workspace_root
-        .as_ref()
-        .and_then(|root| match project_model::ProjectConfig::load(root) {
+    let early_config = workspace_root.as_ref().and_then(|root| {
+        match project_model::ProjectConfig::load(root) {
             Ok(config) => config,
             Err(e) => {
-                // Capability advertisement only; the workspace load below
-                // rejects the broken config loudly.
+                // Capability advertisement and help selection only; the workspace
+                // load below rejects the broken config loudly.
                 tracing::warn!(error = %e, "project config unreadable; capabilities use defaults");
                 None
             }
-        })
-        .map(|config| config.features.workspace_diagnostics)
-        .unwrap_or_default();
+        }
+    });
+    // Before any request can reach a platform lookup: the configured help source
+    // must serve the first answer, not a lazily fixed default.
+    let help_root =
+        workspace_root.clone().or_else(|| std::env::current_dir().ok()).unwrap_or_default();
+    platform_help::bootstrap(early_config.as_ref(), &help_root);
+    let workspace_diagnostics_scope =
+        early_config.map(|config| config.features.workspace_diagnostics).unwrap_or_default();
 
     let server_capabilities = server_capabilities(position_encoding, workspace_diagnostics_scope);
 
@@ -113,6 +118,8 @@ pub fn main_loop(connection: Connection) -> Result<()> {
         && client_supports_pull_diagnostics(&initialize_params.capabilities);
     state.supports_workspace_diagnostic_refresh =
         client_supports_workspace_diagnostic_refresh(&raw_capabilities);
+    state.supports_semantic_tokens_refresh =
+        client_supports_semantic_tokens_refresh(&initialize_params.capabilities);
 
     state.init_empty_source_root();
 
@@ -195,6 +202,16 @@ fn client_folding_range_limit(caps: &lsp_types::ClientCapabilities) -> Option<u3
 /// suppresses push to avoid double-reporting open buffers.
 fn client_supports_pull_diagnostics(caps: &lsp_types::ClientCapabilities) -> bool {
     caps.text_document.as_ref().and_then(|td| td.diagnostic.as_ref()).is_some()
+}
+
+/// Whether the client advertised `workspace.semanticTokens.refreshSupport`, the only grant the
+/// spec gives the server to send `workspace/semanticTokens/refresh`.
+fn client_supports_semantic_tokens_refresh(caps: &lsp_types::ClientCapabilities) -> bool {
+    caps.workspace
+        .as_ref()
+        .and_then(|w| w.semantic_tokens.as_ref())
+        .and_then(|st| st.refresh_support)
+        .unwrap_or(false)
 }
 
 /// Whether the client advertised `workspace.diagnostics.refreshSupport`, so the server may ask it
@@ -367,9 +384,13 @@ fn idle_trim_kind(state: &GlobalState, over_budget: bool) -> Option<IdleTrimKind
 /// compared with disk before anything is answered from it — and every branch of the loop
 /// answers, the loader's finalize by publishing the documents opened during the load.
 fn refresh_diagnostics_baseline(state: &mut GlobalState) {
-    if !state.refresh_diagnostics_baseline() {
-        return;
+    if state.refresh_diagnostics_baseline() {
+        answer_from_the_reloaded_baseline(state);
     }
+}
+
+/// The baseline in hand changed: everything answered from the old one is answered again.
+fn answer_from_the_reloaded_baseline(state: &mut GlobalState) {
     state.reset_workspace_batch();
     state.analysis_host.request_cancellation();
     let uris = state.opened_document_uris();
@@ -460,9 +481,12 @@ fn handle_lsp_msg(state: &mut GlobalState, msg: Message) -> Result<()> {
         Message::Notification(not) => {
             handle_notification(state, not)?;
         }
-        Message::Response(resp) => {
-            tracing::warn!("Unexpected response: {:?}", resp);
-        }
+        // The server's own requests (refreshes, progress creation) are fire-and-forget: a client
+        // that answers them is following the protocol, and only a refusal is worth a warning.
+        Message::Response(resp) => match &resp.error {
+            Some(error) => tracing::warn!(id = ?resp.id, ?error, "client refused a server request"),
+            None => tracing::debug!(id = ?resp.id, "client answered a server request"),
+        },
     }
     Ok(())
 }
@@ -652,6 +676,8 @@ fn handle_loader_msg(state: &mut GlobalState, msg: vfs::loader::Message) -> Resu
                     for uri in uris {
                         crate::handlers::notification::schedule_diagnostics(state, &uri);
                     }
+                    // The cancellation above dropped in-flight semantic-tokens requests.
+                    state.request_semantic_tokens_refresh();
                 }
                 if baseline_changed {
                     state.mark_workspace_batch_dirty();
@@ -678,6 +704,7 @@ fn handle_loader_msg(state: &mut GlobalState, msg: vfs::loader::Message) -> Resu
                     for uri in state.opened_document_uris() {
                         crate::handlers::notification::schedule_diagnostics(state, &uri);
                     }
+                    state.request_semantic_tokens_refresh();
                 }
                 tracing::info!(removed_paths = n, "processed removed directory subtree");
             }
@@ -807,6 +834,11 @@ fn handle_task(state: &mut GlobalState, task: crate::global_state::Task) -> Resu
         Task::AnalysisJobFinished => {
             state.note_analysis_finished();
         }
+        Task::DiagnosticsBaselineRecheck { hold } => {
+            if state.recheck_diagnostics_baseline(hold) {
+                answer_from_the_reloaded_baseline(state);
+            }
+        }
         Task::AnalysisScopeReady { generation, result, identity } => {
             state.handle_analysis_scope_ready(generation, result, identity);
         }
@@ -829,7 +861,8 @@ fn handle_task(state: &mut GlobalState, task: crate::global_state::Task) -> Resu
                 );
             }
         }
-        Task::CallHierarchyIndexSuperseded { source_root, generation } => {
+        Task::CallHierarchyIndexSuperseded { source_root, generation, reason } => {
+            tracing::debug!(?source_root, generation, reason, "call hierarchy index superseded");
             if state.call_hierarchy_index.finish_superseded(source_root, generation) {
                 state.schedule_call_hierarchy_index_build(source_root);
             }
@@ -1209,6 +1242,10 @@ fn handle_vfs_msg(
         if outcome.diagnostics_baseline_changed {
             state.request_workspace_diagnostic_refresh();
         }
+        // Semantic-tokens requests issued during the reindex were declined or
+        // cancelled; ask the client to pull them again, as the initial-load
+        // finalize does.
+        state.request_semantic_tokens_refresh();
     }
 
     Ok(())
@@ -1427,7 +1464,7 @@ mod tests {
     fn baseline_reload_invalidates_diagnostics_before_pool_scheduling() {
         let (sender, _receiver) = crossbeam_channel::unbounded();
         let mut state = crate::global_state::GlobalState::new(sender);
-        let uri = lsp_types::Url::parse("file:///workspace/module.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("workspace/module.bsl");
         state.diagnostics_generation.insert(uri.clone(), 7);
         invalidate_diagnostics(&mut state, std::slice::from_ref(&uri));
         assert_eq!(state.diagnostics_generation[&uri], 8);
@@ -1680,7 +1717,7 @@ mod tests {
         let (sender, receiver) = crossbeam_channel::unbounded();
         let mut state = crate::global_state::GlobalState::new(sender);
 
-        let uri = lsp_types::Url::parse("file:///gone.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("gone.bsl");
         // A diagnostics task that finished with the current generation, but for a
         // document that is NOT open (closed before the result arrived).
         state.diagnostics_generation.insert(uri.clone(), 1);
@@ -1860,7 +1897,7 @@ mod tests {
         let mut state = crate::global_state::GlobalState::new(sender);
         // A many-chunk sweep so applying several chunks never trips the finalize.
         install_test_plan(&mut state, 100);
-        let uri = lsp_types::Url::parse("file:///a.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("a.bsl");
 
         // First report for a closed file with diagnostics: published and recorded.
         let chunk = current_chunk(&state, vec![batch_item(&uri, "h1", vec![dummy_diagnostic()])]);
@@ -1888,7 +1925,7 @@ mod tests {
         let (sender, receiver) = crossbeam_channel::unbounded();
         let mut state = crate::global_state::GlobalState::new(sender);
         state.workspace_batch_generation = 5;
-        let uri = lsp_types::Url::parse("file:///a.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("a.bsl");
 
         // A chunk tagged with an older generation (its sweep was superseded by a
         // config reset) must never publish or record anything.
@@ -1914,8 +1951,8 @@ mod tests {
         let mut state = crate::global_state::GlobalState::new(sender);
         // A single-chunk sweep: the one chunk both reports and finalizes.
         install_test_plan(&mut state, 1);
-        let gone = lsp_types::Url::parse("file:///gone.bsl").unwrap();
-        let kept = lsp_types::Url::parse("file:///kept.bsl").unwrap();
+        let gone = crate::test_uri::file_uri("gone.bsl");
+        let kept = crate::test_uri::file_uri("kept.bsl");
 
         // Two files were pushed by an earlier sweep.
         state.batch_pushed.insert(gone.clone(), "h1".to_string());
@@ -1937,7 +1974,7 @@ mod tests {
         let (sender, receiver) = crossbeam_channel::unbounded();
         let mut state = crate::global_state::GlobalState::new(sender);
         install_test_plan(&mut state, 5);
-        let uri = lsp_types::Url::parse("file:///a.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("a.bsl");
         state.batch_pushed.insert(uri.clone(), "h1".to_string());
 
         // A cancelled chunk (a concurrent edit cancelled it) reported nothing: it must
@@ -1965,7 +2002,7 @@ mod tests {
         let (sender, receiver) = crossbeam_channel::unbounded();
         let mut state = crate::global_state::GlobalState::new(sender);
         install_test_plan(&mut state, 100);
-        let uri = lsp_types::Url::parse("file:///a.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("a.bsl");
 
         // Prime a pushed file, then re-report it clean: one empty publish clears it.
         state.batch_pushed.insert(uri.clone(), "h1".to_string());
@@ -1989,7 +2026,7 @@ mod tests {
         let (sender, receiver) = crossbeam_channel::unbounded();
         let mut state = crate::global_state::GlobalState::new(sender);
         install_test_plan(&mut state, 100);
-        let uri = lsp_types::Url::parse("file:///open.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("open.bsl");
 
         // The file was opened while the batch was computing: the interactive stream
         // owns it, so the batch result is dropped and never recorded.

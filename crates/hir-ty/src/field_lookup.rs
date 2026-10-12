@@ -18,8 +18,28 @@ pub(crate) fn project_form_data_for_fields_id(db: &dyn TypeKernelDb, ty: TypeId)
     if !matches!(kind, FormDataFacet::Structure | FormDataFacet::StructureWithCollection) {
         return None;
     }
-    let object_kind = MetadataKind::object_kind_for(owner.mdo_type)?;
+    let object_kind = form_data_structure_kind(owner.mdo_type)?;
     Some(db.metadata_ref(object_kind, owner.name.clone(), &RootConfigCtx))
+}
+
+/// What a form-data structure over an object of this kind stands for. An
+/// information register reaches a form as a single record only through its record
+/// manager — a record set is a collection — so its structure is that manager.
+fn form_data_structure_kind(mdo_type: MdoType) -> Option<MetadataKind> {
+    match mdo_type {
+        MdoType::InformationRegister => Some(MetadataKind::InformationRegisterRecordManager),
+        other => MetadataKind::object_kind_for(other),
+    }
+}
+
+/// A record form's data has exactly the fields of the record manager it mirrors
+/// (the register's columns), so a name it lacks is as absent as on the manager.
+pub(crate) fn is_record_manager_form_data(db: &dyn TypeKernelDb, ty: TypeId) -> bool {
+    matches!(
+        db.lookup_type(ty),
+        TypeKind::FormData { kind: FormDataFacet::Structure, underlying: Some(owner) }
+            if owner.mdo_type == MdoType::InformationRegister
+    )
 }
 
 fn lookup_form_data_tabular_section_field(
@@ -147,7 +167,14 @@ fn lookup_field_raw(
             return lookup_field_in_union_intersection(db, resolver, &arms, field_name);
         }
         TypeKind::MetadataRef(_) => {
-            return lookup_field_on_metadata_ref(db, resolver, effective_ty, field_name);
+            let found = lookup_field_on_metadata_ref(db, resolver, effective_ty, field_name);
+            // Form data proxies its object but is a platform object of its own too:
+            // `Запись.ИсходныйКлючЗаписи` belongs to ДанныеФормыСтруктура, not to the
+            // register record behind it.
+            if found.is_none() && projected_ty != receiver {
+                return lookup_field_via_platform_property(db, receiver, field_name);
+            }
+            return found;
         }
         _ => {}
     }
@@ -520,6 +547,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn form_data_projection_neutralizes_platform_property_env() {
         let config = {
             let mut c = Configuration::new("Test");
@@ -555,6 +583,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn form_data_union_arm_also_neutralizes_platform_property_env() {
         let config = {
             let mut c = Configuration::new("Test");
@@ -739,6 +768,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn field_lookup_tabular_row_line_number_resolves_via_platform() {
         let ts = TabularSection::new(Uuid::new_v4(), "Услуги");
         let mut cat = catalog("Номенклатура", vec![]);
@@ -1189,6 +1219,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn field_lookup_information_register_record_set_pulls_platform_properties() {
         let mut config = Configuration::new("Test");
         config.add_register(register_with(
@@ -1220,6 +1251,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn field_lookup_accounting_register_record_set_has_lock_for_update() {
         let mut config = Configuration::new("Test");
         config.add_register(register_with(
@@ -1412,6 +1444,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn lookup_field_on_union_intersection_readonly_merges_via_or() {
         let mut config = Configuration::new("Test");
         config.add_metadata_object(catalog("A", vec![]));
@@ -1434,6 +1467,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn field_lookup_document_object_pulls_platform_properties() {
         let mut config = Configuration::new("Test");
         config.add_metadata_object(document("ПКО", vec![]));
@@ -1467,6 +1501,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn field_lookup_this_object_is_typed_metadata_ref_not_generic_platform_object() {
         let mut config = Configuration::new("Test");
         config.add_metadata_object(document("ПКО", vec![]));
@@ -1501,6 +1536,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn field_lookup_this_object_specializes_across_yo_spelling_difference() {
         let mut config = Configuration::new("Test");
         config.add_metadata_object(mdo_of(MdoType::Report, "ОстаткиТоваров", vec![]));
@@ -1527,6 +1563,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn field_lookup_catalog_object_pulls_platform_properties() {
         let mut config = Configuration::new("Test");
         config.add_metadata_object(catalog("Номенклатура", vec![]));
@@ -1587,6 +1624,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn field_lookup_document_ref_caveats_and_cascade() {
         let mut config = Configuration::new("Test");
         config.add_metadata_object(document_with_standard_attrs("ПКО"));
@@ -1621,6 +1659,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn field_lookup_cascade_respects_presence_conditional_standard_attrs() {
         let mut config = Configuration::new("Test");
         config.add_metadata_object(document("ПКО", vec![]));
@@ -1804,6 +1843,7 @@ mod tests {
     /// `ЭтотОбъект` to itself; its platform properties come from the bare type
     /// `ВнешняяОбработка`, which has no manager prefix in the corpus.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn field_lookup_external_object_has_its_attributes_self_and_platform_properties() {
         let mut config = Configuration::new("Test");
         config.add_metadata_object(mdo_of(

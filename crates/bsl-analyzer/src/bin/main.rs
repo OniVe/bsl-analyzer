@@ -38,7 +38,12 @@ pub static malloc_conf: Option<&'static core::ffi::c_char> =
 
 mod cli;
 
-use std::{env, error::Error, fs, path::PathBuf};
+use std::{
+    env,
+    error::Error,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use cli::{
@@ -54,6 +59,7 @@ use cli::{
     logging::setup_logging,
     lsp::run_lsp_server,
     mcp::{self, McpCommand},
+    platform_help::{self as platform_help_cli, PlatformHelpCommand},
     rules::{self, RulesCommands},
     search_baseline::{self, SearchCommand},
     smoke::run_smoke,
@@ -194,6 +200,12 @@ enum Commands {
         command: RulesCommands,
     },
 
+    /// Platform help corpus packages.
+    PlatformHelp {
+        #[command(subcommand)]
+        command: PlatformHelpCommand,
+    },
+
     Deps {
         #[arg(short = 's', long = "source-dir", default_value = ".")]
         source_dir: PathBuf,
@@ -264,17 +276,25 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let json_profile_filter =
         cli.profile_json.clone().or_else(|| env::var("BSL_PROFILE_JSON").ok());
 
-    let _journal_guard =
-        match setup_logging(log_file.clone(), append_log, profile_filter, json_profile_filter) {
-            Ok(guard) => guard,
-            Err(e) => {
-                eprintln!("Failed to setup logging: {}", e);
+    let _journal_guard = match setup_logging(
+        log_file.clone(),
+        append_log,
+        profile_filter.clone(),
+        json_profile_filter.clone(),
+    ) {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("Failed to setup logging: {}", e);
+            if append_log {
+                setup_logging(None, false, profile_filter, json_profile_filter)?
+            } else {
                 if let Some(ref path) = log_file {
                     let _ = fs::write(path, format!("ERROR: Failed to setup logging: {}\n", e));
                 }
                 return Err(e.into());
             }
-        };
+        }
+    };
 
     // A panic inside a Salsa query leaves no useful trace of *which* query blew
     // up once `catch_unwind` has unwound past the query stack: Salsa attaches the
@@ -349,7 +369,11 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             ignored_authors,
             source_set,
         ),
-        Some(Commands::CheckConfig { config, source_set }) => check_config(config, source_set),
+        Some(Commands::CheckConfig { config, source_set }) => {
+            let root = config.parent().map(Path::to_path_buf).unwrap_or_default();
+            bsl_analyzer::help_bootstrap::bootstrap_for_root(&root, Some(&config));
+            check_config(config, source_set)
+        }
         Some(Commands::Diagnostics { command }) => diagnostics_baseline::run(command),
         Some(Commands::Contract) => {
             println!("{}", serde_json::to_string_pretty(&mcp_server::contract::document())?);
@@ -362,6 +386,7 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Some(Commands::Extension { command }) => extension::run(command),
         Some(Commands::Dap) => run_dap_server(),
         Some(Commands::Search { command }) => search_baseline::run(command),
+        Some(Commands::PlatformHelp { command }) => platform_help_cli::run(command),
         Some(Commands::Rules { command }) => rules::run(command),
         Some(Commands::Deps {
             source_dir,
@@ -375,20 +400,24 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             multi_open,
             bench_index,
             index_workers,
-        }) => run_deps(
-            source_dir,
-            depth,
-            sample,
-            format,
-            quiet,
-            bytes,
-            report_mem,
-            bench,
-            multi_open,
-            bench_index,
-            index_workers,
-        ),
+        }) => {
+            bsl_analyzer::help_bootstrap::bootstrap_for_root(&source_dir, None);
+            run_deps(
+                source_dir,
+                depth,
+                sample,
+                format,
+                quiet,
+                bytes,
+                report_mem,
+                bench,
+                multi_open,
+                bench_index,
+                index_workers,
+            )
+        }
         Some(Commands::Smoke { source_dir, scenarios, budgets, json }) => {
+            bsl_analyzer::help_bootstrap::bootstrap_for_root(&source_dir, None);
             run_smoke(source_dir, scenarios, budgets, json)
         }
         Some(Commands::Bench { command }) => run_bench(command),
@@ -673,6 +702,13 @@ mod contract_surface {
                   lang
                   output (-o)
                 list
+              platform-help
+                package
+                  corpus
+                  corpus-id
+                  hbk-dir
+                  output (-o)
+                  platform-version
               deps
                 bench !bench-index !multi-open
                 bench-index !bench !multi-open
