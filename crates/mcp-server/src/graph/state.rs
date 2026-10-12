@@ -6866,6 +6866,11 @@ mod tests {
         let graph = GraphState::for_workspace(root.to_path_buf()).with_probe_window_hook(hook);
         graph.ensure_loading();
         wait_ready(&graph);
+        // A ready snapshot can still have a builder holding its admission ticket.
+        wait_until(&graph, "the initial builder to release its ticket", || {
+            let inner = lock_recover(&graph.inner);
+            inner.building.is_none() && inner.claimed.is_none()
+        });
         assert!(graph.owes_recovery(), "the fixture needs an outstanding obligation");
         // Due, because a walk is only ever reserved for work the schedule says is ripe.
         lock_recover(&graph.debt).probe_now(Instant::now());
