@@ -39,6 +39,10 @@ pub fn check_config(
     };
     source_set.resolve(project_root)?.apply_to(&mut project_config);
 
+    ide::DiagnosticsConfig::warn_unknown_parameter_codes(
+        &project_config.diagnostics.rules_json(),
+        Some(&config),
+    );
     let diagnostics_config = diagnostics_config_from_project(&project_config)?;
     let diagnostics =
         mcp_server::resolve_project_baseline_diagnostics(config.parent(), &project_config);

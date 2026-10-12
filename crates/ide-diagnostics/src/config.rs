@@ -122,8 +122,24 @@ impl DiagnosticsConfig {
         locale: Locale,
         source: Option<&Path>,
     ) -> Self {
-        warn_unknown_parameter_codes(diagnostics, source);
+        Self::warn_unknown_parameter_codes(diagnostics, source);
         Self::from_project_json(diagnostics, locale)
+    }
+
+    /// Reports every code in `[diagnostics.parameters]` that is not a diagnostic of
+    /// this analyzer, for loaders that parse the section themselves.
+    pub fn warn_unknown_parameter_codes(diagnostics: &serde_json::Value, source: Option<&Path>) {
+        for name in unknown_parameter_codes(diagnostics) {
+            let file =
+                source.map_or_else(|| "<project config>".to_owned(), |p| p.display().to_string());
+            tracing::warn!(
+                key = name,
+                config_file = %file,
+                "unknown diagnostic code `{name}` in [diagnostics.parameters] of {file}: \
+                 the key is ignored and the rule keeps its default; {}",
+                unknown_code_hint(name)
+            );
+        }
     }
 
     pub fn all_enabled() -> Self {
@@ -245,20 +261,6 @@ fn unknown_code_hint(name: &str) -> String {
              deprecated-API finding, not only this one)"
         ),
         None => "no diagnostic has this name (typo, or a code of another analyzer)".to_owned(),
-    }
-}
-
-fn warn_unknown_parameter_codes(diagnostics: &serde_json::Value, source: Option<&Path>) {
-    for name in unknown_parameter_codes(diagnostics) {
-        let file =
-            source.map_or_else(|| "<project config>".to_owned(), |p| p.display().to_string());
-        tracing::warn!(
-            key = name,
-            config_file = %file,
-            "unknown diagnostic code `{name}` in [diagnostics.parameters] of {file}: \
-             the key is ignored and the rule keeps its default; {}",
-            unknown_code_hint(name)
-        );
     }
 }
 
