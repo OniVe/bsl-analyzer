@@ -3706,6 +3706,11 @@ mod tests {
         let graph = GraphState::for_workspace(root.to_path_buf()).with_publish_hook(hook);
         graph.ensure_loading();
         wait_ready(&graph);
+        super::super::test_support::wait_publish_pass_within(
+            &graph,
+            super::super::test_support::WAIT_CEILING,
+            1,
+        );
         let before = refreshes.load(Ordering::SeqCst);
 
         // A comparison that will answer without building — disk matches what is published —
@@ -3763,6 +3768,11 @@ mod tests {
         let graph = GraphState::for_workspace(root.to_path_buf()).with_publish_hook(hook);
         graph.ensure_loading();
         wait_ready(&graph);
+        super::super::test_support::wait_publish_pass_within(
+            &graph,
+            super::super::test_support::WAIT_CEILING,
+            1,
+        );
         armed.store(true, Ordering::SeqCst);
 
         graph.record_hook_debt(HookDebt { topology: true, roots: false, marks: false });
@@ -3871,6 +3881,11 @@ mod tests {
         let graph = GraphState::for_workspace(root.to_path_buf()).with_publish_hook(hook);
         graph.ensure_loading();
         wait_ready(&graph);
+        super::super::test_support::wait_publish_pass_within(
+            &graph,
+            super::super::test_support::WAIT_CEILING,
+            1,
+        );
         armed.store(true, Ordering::SeqCst);
 
         graph.record_hook_debt(HookDebt { topology: true, roots: false, marks: false });
@@ -3934,6 +3949,11 @@ mod tests {
         let graph = GraphState::for_workspace(root.to_path_buf()).with_publish_hook(hook);
         graph.ensure_loading();
         wait_ready(&graph);
+        super::super::test_support::wait_publish_pass_within(
+            &graph,
+            super::super::test_support::WAIT_CEILING,
+            1,
+        );
         *lock_recover(&slot) = Some(graph.clone());
         armed.store(true, Ordering::SeqCst);
 
@@ -3975,6 +3995,11 @@ mod tests {
         let graph = GraphState::for_workspace(root.to_path_buf()).with_publish_hook(hook);
         graph.ensure_loading();
         wait_ready(&graph);
+        super::super::test_support::wait_publish_pass_within(
+            &graph,
+            super::super::test_support::WAIT_CEILING,
+            1,
+        );
         armed.store(true, Ordering::SeqCst);
 
         graph.record_hook_debt(HookDebt { topology: true, roots: false, marks: false });
