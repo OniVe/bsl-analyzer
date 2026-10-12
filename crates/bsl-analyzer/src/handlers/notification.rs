@@ -6,8 +6,8 @@ use ide::file_diagnostics_query;
 use line_index::LineIndex;
 use lsp_server::Notification;
 use lsp_types::{
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, PublishDiagnosticsParams, Url,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, PublishDiagnosticsParams, Url,
 };
 use salsa::Database as _;
 
@@ -544,17 +544,106 @@ pub fn handle_cancel(state: &mut GlobalState, params: lsp_types::CancelParams) -
         lsp_types::NumberOrString::String(s) => lsp_server::RequestId::from(s),
     };
 
-    // Cancel but keep the token registered: the worker still holds its db snapshot
-    // until it posts `Task::RequestResult` (which removes the entry), and an early
-    // removal would let `interactive_analysis_quiescent` report quiescent while the
-    // cancelled worker is still unwinding — an LRU trim taken in that window blocks
-    // the event loop on the worker's snapshot.
-    if let Some(token) = state.request_tokens.get(&id) {
-        tracing::debug!(request_id = ?id, "cancelling in-flight async request");
-        token.cancel();
-    } else {
-        tracing::debug!(request_id = ?id, "cancel arrived after response (no-op)");
+    let phase = state.request_lifecycles.get_mut(&id).map(|lifecycle| {
+        lifecycle.client_cancelled = true;
+        (lifecycle.generation, lifecycle.attempt, lifecycle.phase)
+    });
+    match phase {
+        Some((generation, attempt, crate::global_state::RequestLifecyclePhase::RetryQueued)) => {
+            state
+                .pending_latency_retries
+                .retain(|pending| pending.id != id || pending.generation != generation);
+            state.request_lifecycles.remove(&id);
+            if state
+                .request_token_owners
+                .get(&id)
+                .is_some_and(|owner| owner.generation == generation)
+            {
+                state.request_token_owners.remove(&id);
+                state.request_tokens.remove(&id);
+            }
+            tracing::info!(request_id = ?id, generation, attempt, "cancelled queued LSP retry");
+            state.respond(lsp_server::Response::new_err(
+                id,
+                lsp_server::ErrorCode::RequestCanceled as i32,
+                "request cancelled".to_string(),
+            ));
+        }
+        Some((generation, attempt, crate::global_state::RequestLifecyclePhase::Running)) => {
+            if let Some(token) = state.request_tokens.get(&id) {
+                tracing::info!(request_id = ?id, generation, attempt, "cancelling in-flight LSP request");
+                token.cancel();
+            }
+        }
+        None => {
+            if let Some(token) = state.request_tokens.get(&id) {
+                tracing::debug!(request_id = ?id, "cancelling legacy in-flight request");
+                token.cancel();
+            } else {
+                tracing::debug!(request_id = ?id, "cancel arrived after response (no-op)");
+            }
+        }
     }
+    Ok(())
+}
+
+/// Route standard client watcher events through the same loader invalidation path used
+/// by the native watcher. The loader decides whether the file is loaded or watch-only;
+/// the normal VFS event loop then applies the corresponding source or metadata change.
+pub fn handle_did_change_watched_files(
+    state: &mut GlobalState,
+    params: DidChangeWatchedFilesParams,
+) -> Result<()> {
+    let roots = state.project.as_ref().map(|project| project.source_roots()).unwrap_or_default();
+    let workspace_root = state.workspace_root.as_deref();
+    let mut invalidated = 0usize;
+    let mut rejected = 0usize;
+
+    for event in params.changes {
+        let Ok(path) = event.uri.to_file_path() else {
+            rejected += 1;
+            continue;
+        };
+        let Some(path) = paths::Utf8PathBuf::from_path_buf(path).ok() else {
+            rejected += 1;
+            continue;
+        };
+        let Ok(abs_path) = paths::AbsPathBuf::try_from(path) else {
+            rejected += 1;
+            continue;
+        };
+        let std_path: &std::path::Path = abs_path.as_path().as_ref();
+        let in_source_root = roots.iter().any(|root| std_path.starts_with(root));
+        let relevant_source = in_source_root
+            && (project_model::is_bsl_source_path(std_path)
+                || project_model::is_metadata_path(std_path));
+        let relevant_config = workspace_root.is_some_and(|root| {
+            std_path.parent() == Some(root)
+                && std_path.file_name().is_some_and(|name| {
+                    matches!(
+                        name.to_str(),
+                        Some("bsl-analyzer.toml")
+                            | Some(".bsl-analyzer.json")
+                            | Some(".bsl-language-server.json")
+                    )
+                })
+        });
+        if !relevant_source && !relevant_config {
+            rejected += 1;
+            continue;
+        }
+
+        if event.typ == lsp_types::FileChangeType::DELETED
+            && project_model::is_bsl_source_path(std_path)
+        {
+            state.mem_docs.invalidate_identity(&event.uri);
+        }
+
+        state.loader.invalidate(abs_path);
+        invalidated += 1;
+    }
+
+    tracing::info!(invalidated, rejected, "processed client watched-file events");
     Ok(())
 }
 
@@ -567,6 +656,8 @@ mod tests {
         TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
         VersionedTextDocumentIdentifier,
     };
+    use parking_lot::Mutex;
+    use std::sync::Arc;
 
     fn create_test_state() -> (GlobalState, Receiver<Message>) {
         let (sender, receiver) = unbounded();
@@ -584,6 +675,102 @@ mod tests {
         state.vfs_done = true;
 
         (state, receiver)
+    }
+
+    #[derive(Debug)]
+    struct RecordingLoader(Arc<Mutex<Vec<paths::AbsPathBuf>>>);
+
+    impl vfs::loader::Handle for RecordingLoader {
+        fn spawn(_sender: vfs::loader::Sender) -> Self
+        where
+            Self: Sized,
+        {
+            unreachable!("test injects the loader")
+        }
+
+        fn set_config(&mut self, _config: vfs::loader::Config) {}
+
+        fn invalidate(&mut self, path: paths::AbsPathBuf) {
+            self.0.lock().push(path);
+        }
+
+        fn load_sync(&mut self, _path: &paths::AbsPath) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
+    #[test]
+    fn g1_watched_file_notifications_invalidate_only_local_project_inputs() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("bsl-analyzer.toml"), "[source]\nroot = \".\"\n").unwrap();
+        let invalidated = Arc::new(Mutex::new(Vec::new()));
+        let (sender, _receiver) = unbounded();
+        let (_loader_sender, loader_receiver) = crossbeam_channel::bounded(4);
+        let mut state = GlobalState::with_loader(
+            sender,
+            Box::new(RecordingLoader(Arc::clone(&invalidated))),
+            loader_receiver,
+        );
+        state.set_workspace_root(root.path().to_path_buf()).expect("valid local project");
+
+        let bsl = root.path().join("New.bsl");
+        let deleted_bsl = root.path().join("Deleted.bsl");
+        let xml = root.path().join("Catalogs/New.xml");
+        let config = root.path().join("bsl-analyzer.toml");
+        let outside = root.path().parent().unwrap().join("outside.bsl");
+        let remote = Url::parse("https://example.invalid/Remote.bsl").unwrap();
+        let uri = |path: &std::path::Path| Url::from_file_path(path).unwrap();
+        let open_uri = uri(&bsl);
+        state.mem_docs.insert(open_uri.clone(), "Процедура X() КонецПроцедуры".to_owned(), 3);
+        let open_identity = state.mem_docs.identity(&open_uri).unwrap();
+        let deleted_uri = uri(&deleted_bsl);
+        state.mem_docs.insert(
+            deleted_uri.clone(),
+            "Процедура Deleted() КонецПроцедуры".to_owned(),
+            1,
+        );
+        let deleted_identity = state.mem_docs.identity(&deleted_uri).unwrap();
+        handle_did_change_watched_files(
+            &mut state,
+            DidChangeWatchedFilesParams {
+                changes: vec![
+                    lsp_types::FileEvent {
+                        uri: uri(&bsl),
+                        typ: lsp_types::FileChangeType::CREATED,
+                    },
+                    lsp_types::FileEvent {
+                        uri: deleted_uri.clone(),
+                        typ: lsp_types::FileChangeType::DELETED,
+                    },
+                    lsp_types::FileEvent {
+                        uri: uri(&xml),
+                        typ: lsp_types::FileChangeType::CHANGED,
+                    },
+                    lsp_types::FileEvent {
+                        uri: uri(&config),
+                        typ: lsp_types::FileChangeType::CHANGED,
+                    },
+                    lsp_types::FileEvent {
+                        uri: uri(&outside),
+                        typ: lsp_types::FileChangeType::DELETED,
+                    },
+                    lsp_types::FileEvent { uri: remote, typ: lsp_types::FileChangeType::CHANGED },
+                ],
+            },
+        )
+        .unwrap();
+
+        let paths: Vec<_> =
+            invalidated.lock().iter().map(|path| path.as_path().to_path_buf()).collect();
+        assert_eq!(paths, vec![bsl, deleted_bsl, xml, config]);
+        assert_eq!(state.mem_docs.identity(&open_uri), Some(open_identity));
+        assert_eq!(state.mem_docs.get(&open_uri).as_deref(), Some("Процедура X() КонецПроцедуры"));
+        assert_ne!(state.mem_docs.identity(&deleted_uri), Some(deleted_identity));
+        assert_eq!(
+            state.mem_docs.get(&deleted_uri).as_deref(),
+            Some("Процедура Deleted() КонецПроцедуры"),
+            "a watched deletion invalidates outstanding requests but retains the editor buffer"
+        );
     }
 
     #[test]

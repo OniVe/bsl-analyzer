@@ -1,6 +1,7 @@
 # Руководство по Salsa для разработчиков
 
-**Версия:** Salsa 0.26  
+**Версия:** Salsa 0.28.2, fork `itrous/salsa`, revision из `Cargo.lock`
+
 **Статус:** актуальная памятка для проекта
 
 Этот документ — практическое руководство по тому, как в `bsl-analyzer`
@@ -169,6 +170,28 @@ pub fn my_query(
 
 Если склеить слишком много логики в один большой запрос, его сложнее кэшировать,
 отлаживать и переиспользовать.
+
+## Отмена reader при записи
+
+В используемом fork Salsa 0.28.2 (`Cargo.lock` фиксирует commit)
+write cancellation ждёт освобождения cloned DB handles. Поэтому LSP worker
+должен отпустить весь Analysis/query context до передачи outcome в event loop;
+очередь retry содержит только исходный запрос и данные владельца.
+Создание новой попытки до освобождения старого reader может задержать writer.
+
+`Cancelled::PendingWrite` подтверждает конкурентную запись.
+`Cancelled::PropagatedPanic` означает, что query owner размотался: причиной
+может быть как запись, так и настоящий panic. LSP проверяет `panic_watch`
+для ревизии отменённой попытки и сравнивает её с опубликованной ревизией
+после освобождения handles. Только отсутствие настоящего panic вместе
+с более новой ревизией допускает write retry. Одна cancellation flag и
+LRU eviction сами по себе не доказывают переход ревизии.
+
+Клиентский token (`Local`) не запускает retry. Сервер сохраняет его отмену
+на весь logical request, включая ожидание admission между попытками.
+Проверки этого пути находятся в `bsl-analyzer::server` и
+`bsl-analyzer::handlers::dispatch`; протокольный smoke — в
+`crates/bsl-analyzer/tests/lsp_live_vfs_g1.rs`.
 
 ## Типичные ошибки
 

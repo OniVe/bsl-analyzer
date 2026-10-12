@@ -290,6 +290,22 @@ impl Lsp {
                 && message["params"]["uri"] == uri.as_str()
         })
     }
+
+    pub fn request(&mut self, id: u64, method: &str, params: Value) -> Value {
+        self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        self.wait_for(|message| {
+            message["id"] == id
+                && message["method"].is_null()
+                && (message.get("result").is_some() || message.get("error").is_some())
+        })
+    }
+
+    pub fn shutdown(&mut self, id: u64) -> std::process::ExitStatus {
+        let response = self.request(id, "shutdown", Value::Null);
+        assert!(response["error"].is_null(), "shutdown request failed: {response}");
+        self.send(json!({"jsonrpc": "2.0", "method": "exit"}));
+        self.child.wait().expect("LSP child exits after shutdown/exit")
+    }
 }
 
 impl Drop for Lsp {

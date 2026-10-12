@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -11,6 +12,7 @@ use crate::lsp::PositionEncoding;
 #[derive(Debug, Clone, Default)]
 pub struct MemDocs {
     docs: Arc<RwLock<FxHashMap<Url, DocumentData>>>,
+    next_identity: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone)]
@@ -18,6 +20,7 @@ struct DocumentData {
     text: String,
     version: i32,
     line_index: LineIndex,
+    identity: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -67,7 +70,8 @@ impl MemDocs {
 
     pub fn insert(&mut self, uri: Url, text: String, version: i32) {
         let line_index = LineIndex::new(&text);
-        let data = DocumentData { text, version, line_index };
+        let identity = self.next_identity.fetch_add(1, Ordering::Relaxed) + 1;
+        let data = DocumentData { text, version, line_index, identity };
         self.docs.write().insert(uri, data);
     }
 
@@ -105,6 +109,7 @@ impl MemDocs {
             data.text = text;
             data.line_index = line_index;
             data.version += 1;
+            data.identity = self.next_identity.fetch_add(1, Ordering::Relaxed) + 1;
         } else {
             tracing::warn!("Attempted to update non-existent document: {}", uri);
         }
@@ -122,6 +127,17 @@ impl MemDocs {
 
     pub fn get_version(&self, uri: &Url) -> Option<i32> {
         self.docs.read().get(uri).map(|data| data.version)
+    }
+
+    pub fn identity(&self, uri: &Url) -> Option<u64> {
+        self.docs.read().get(uri).map(|data| data.identity)
+    }
+
+    /// Invalidate a request origin while keeping its authoritative editor buffer.
+    pub fn invalidate_identity(&mut self, uri: &Url) {
+        if let Some(data) = self.docs.write().get_mut(uri) {
+            data.identity = self.next_identity.fetch_add(1, Ordering::Relaxed) + 1;
+        }
     }
 
     pub fn get_line_index(&self, uri: &Url) -> Option<LineIndex> {
@@ -214,6 +230,30 @@ mod tests {
 
         assert_eq!(mem_docs.get(&uri), Some("new text".to_string()));
         assert_eq!(mem_docs.get_version(&uri), Some(2));
+    }
+
+    #[test]
+    fn g1_document_identity_changes_on_edit_and_same_version_reopen() {
+        let mut mem_docs = MemDocs::new();
+        let uri = crate::test_uri::file_uri("test.bsl");
+        let text = "Процедура Тест() КонецПроцедуры".to_owned();
+
+        mem_docs.insert(uri.clone(), text.clone(), 7);
+        let opened = mem_docs.identity(&uri).unwrap();
+        mem_docs.update(
+            &uri,
+            vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: text.clone(),
+            }],
+        );
+        let edited = mem_docs.identity(&uri).unwrap();
+        assert_ne!(opened, edited, "an accepted edit advances origin identity even if bytes match");
+
+        mem_docs.remove(&uri);
+        mem_docs.insert(uri.clone(), text, 7);
+        assert_ne!(edited, mem_docs.identity(&uri).unwrap());
     }
 
     #[test]

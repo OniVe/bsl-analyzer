@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{select, Receiver};
-use lsp_server::{Connection, Message, Notification, Request};
+use lsp_server::{Connection, Message, Notification, Request, Response};
 use lsp_types::{
     notification::{Exit, Notification as _},
     request::Shutdown,
@@ -14,7 +14,7 @@ use lsp_types::{
 };
 
 use crate::{
-    global_state::GlobalState,
+    global_state::{GlobalState, LatencyAttemptOutcome, RequestAttemptKey, RequestLifecyclePhase},
     handlers::{NotificationDispatcher, RequestDispatcher},
     locale::parse_lsp_locale,
     lsp::{PositionEncoding, Progress},
@@ -131,10 +131,9 @@ pub fn main_loop(connection: Connection) -> Result<()> {
             state.show_error_message(format!(
                 "bsl-analyzer: invalid project, analysis unavailable: {e}"
             ));
-            // Mirror the no-workspace path: nothing will load, so diagnostics
-            // must not stay deferred behind a boot window that never closes.
+            // Keep the readiness gate closed: this workspace was rejected, so no
+            // loader completion can establish a valid analysis substrate.
             state.update_diagnostics_config();
-            state.vfs_done = true;
         }
     } else {
         tracing::warn!("No workspace root provided by client");
@@ -145,10 +144,25 @@ pub fn main_loop(connection: Connection) -> Result<()> {
         state.vfs_done = true;
     }
 
-    run_event_loop(&mut state, &connection.receiver)?;
+    let loop_result = run_event_loop(&mut state, &connection.receiver);
+    cancel_latency_requests_on_shutdown(&mut state);
+    loop_result?;
 
     tracing::info!("LSP server shutting down");
     Ok(())
+}
+
+/// Requests may still own Analysis clones when the client disconnects. Cancel their
+/// tokens and drop all logical retry state before GlobalState goes away; no queued retry
+/// is admitted after the event loop has ended.
+fn cancel_latency_requests_on_shutdown(state: &mut GlobalState) {
+    for (_, token) in state.request_tokens.drain() {
+        token.cancel();
+    }
+    state.request_token_owners.clear();
+    state.request_lifecycles.clear();
+    state.pending_latency_retries.clear();
+    state.retry_dispatch = None;
 }
 
 /// Whether the client advertised `InsertTextMode::ADJUST_INDENTATION` in its
@@ -261,6 +275,8 @@ fn run_event_loop(state: &mut GlobalState, receiver: &Receiver<Message>) -> Resu
             state.call_hierarchy_index.shutdown();
             break;
         }
+
+        admit_pending_latency_retries(state)?;
 
         // The capacity gate keeps this from spinning: a schedule that finds the
         // pool still saturated would requeue the same URI, and the loop only
@@ -596,7 +612,20 @@ fn handle_loader_msg(state: &mut GlobalState, msg: vfs::loader::Message) -> Resu
                 }
             }
         }
-        vfs::loader::Message::Loaded { files } | vfs::loader::Message::Changed { files } => {
+        vfs::loader::Message::Loaded { files } => {
+            let count = files.len();
+            handle_vfs_msg(state, files, state.vfs_done)?;
+            tracing::debug!(count, vfs_done = state.vfs_done, "streamed VFS batch");
+        }
+        vfs::loader::Message::Changed { files } => {
+            for (path, contents) in &files {
+                let path: &std::path::Path = path.as_ref();
+                if contents.is_none() && !path.exists() && project_model::is_bsl_source_path(path) {
+                    if let Ok(uri) = lsp_types::Url::from_file_path(path) {
+                        state.mem_docs.invalidate_identity(&uri);
+                    }
+                }
+            }
             let count = files.len();
             handle_vfs_msg(state, files, state.vfs_done)?;
             tracing::debug!(count, vfs_done = state.vfs_done, "streamed VFS batch");
@@ -704,7 +733,7 @@ fn invalidate_diagnostics(state: &mut GlobalState, uris: &[lsp_types::Url]) {
     }
 }
 
-fn handle_task(state: &mut GlobalState, task: crate::global_state::Task) -> Result<()> {
+pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Task) -> Result<()> {
     use crate::global_state::Task;
 
     match task {
@@ -746,9 +775,8 @@ fn handle_task(state: &mut GlobalState, task: crate::global_state::Task) -> Resu
             state.preload_tokens.remove(&file_id);
             state.preload_external_tokens.remove(&file_id);
         }
-        Task::RequestResult { response } => {
-            state.request_tokens.remove(&response.id);
-            state.respond(response);
+        Task::LatencyRequestFinished { key, outcome } => {
+            handle_latency_request_finished(state, key, outcome)?;
         }
         Task::PreloadExternalFiles { files } => {
             if files.is_empty() {
@@ -864,6 +892,366 @@ fn handle_task(state: &mut GlobalState, task: crate::global_state::Task) -> Resu
                     "discarding stale call hierarchy prepare"
                 );
             }
+        }
+    }
+    Ok(())
+}
+
+const MAX_LATENCY_ATTEMPTS: u8 = 3;
+
+fn handle_latency_request_finished(
+    state: &mut GlobalState,
+    key: RequestAttemptKey,
+    outcome: LatencyAttemptOutcome,
+) -> Result<()> {
+    let Some(lifecycle) = state.request_lifecycles.get(&key.id) else {
+        tracing::debug!(request_id = ?key.id, generation = key.generation, attempt = key.attempt, "discarding completion without a live request");
+        return Ok(());
+    };
+    if lifecycle.generation != key.generation
+        || lifecycle.attempt != key.attempt
+        || lifecycle.phase != RequestLifecyclePhase::Running
+    {
+        tracing::debug!(
+            request_id = ?key.id,
+            generation = key.generation,
+            attempt = key.attempt,
+            "discarding stale latency completion"
+        );
+        return Ok(());
+    }
+
+    if state.request_token_owners.get(&key.id) == Some(&key) {
+        state.request_token_owners.remove(&key.id);
+        state.request_tokens.remove(&key.id);
+    }
+
+    let client_cancelled = lifecycle.client_cancelled;
+    let method = lifecycle.method.clone();
+    if client_cancelled {
+        finish_latency_request(
+            state,
+            &key,
+            Response::new_err(
+                key.id.clone(),
+                lsp_server::ErrorCode::RequestCanceled as i32,
+                "request cancelled".to_string(),
+            ),
+        );
+        return Ok(());
+    }
+
+    let response = match outcome {
+        LatencyAttemptOutcome::Response(response) => response,
+        LatencyAttemptOutcome::Cancelled { kind: salsa::Cancelled::Local, .. } => {
+            Response::new_err(
+                key.id.clone(),
+                lsp_server::ErrorCode::RequestCanceled as i32,
+                "request cancelled".to_string(),
+            )
+        }
+        LatencyAttemptOutcome::Cancelled { kind: salsa::Cancelled::PendingWrite, revision } => {
+            let current_revision =
+                salsa::plumbing::current_revision(state.analysis_host.raw_database());
+            match queue_latency_retry(
+                state,
+                &key,
+                &method,
+                "pending-write",
+                revision,
+                current_revision,
+                false,
+            ) {
+                RetryQueueResult::Queued => return Ok(()),
+                RetryQueueResult::Refused(refusal) => Response::new_err(
+                    key.id.clone(),
+                    lsp_server::ErrorCode::ContentModified as i32,
+                    refusal.message().to_string(),
+                ),
+            }
+        }
+        LatencyAttemptOutcome::Cancelled { kind: salsa::Cancelled::PropagatedPanic, revision } => {
+            let current_revision =
+                salsa::plumbing::current_revision(state.analysis_host.raw_database());
+            if crate::panic_watch::panicked_in(revision) {
+                tracing::error!(
+                    request_id = ?key.id,
+                    method,
+                    attempt = key.attempt,
+                    revision = ?revision,
+                    current_revision = ?current_revision,
+                    "propagated LSP unwind followed a real panic"
+                );
+                Response::new_err(
+                    key.id.clone(),
+                    lsp_server::ErrorCode::InternalError as i32,
+                    "internal handler panic".to_string(),
+                )
+            } else {
+                match queue_latency_retry(
+                    state,
+                    &key,
+                    &method,
+                    "propagated-after-write",
+                    revision,
+                    current_revision,
+                    true,
+                ) {
+                    RetryQueueResult::Queued => return Ok(()),
+                    RetryQueueResult::Refused(refusal) => Response::new_err(
+                        key.id.clone(),
+                        lsp_server::ErrorCode::ContentModified as i32,
+                        refusal.message().to_string(),
+                    ),
+                }
+            }
+        }
+        LatencyAttemptOutcome::Cancelled { .. } => Response::new_err(
+            key.id.clone(),
+            lsp_server::ErrorCode::RequestCanceled as i32,
+            "request cancelled".to_string(),
+        ),
+    };
+    finish_latency_request(state, &key, response);
+    Ok(())
+}
+
+fn request_origin_matches(
+    state: &GlobalState,
+    origin: &crate::global_state::RequestOriginGuard,
+) -> bool {
+    let Ok(path) = origin.uri.to_file_path() else {
+        return false;
+    };
+    let Some(project) = state.project.as_ref() else {
+        return false;
+    };
+    let current_source_roots = project.source_roots();
+    let source_eligible = project_model::is_bsl_source_path(&path)
+        && current_source_roots.iter().any(|root| path.starts_with(root))
+        && !project.is_source_excluded(&path);
+    state.mem_docs.identity(&origin.uri) == Some(origin.identity)
+        && state.workspace_root == origin.workspace_root
+        && current_source_roots == origin.source_roots
+        && source_eligible
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryRefusal {
+    MissingOwner,
+    StaleOwner,
+    ClientCancelled,
+    PolicyDisabled,
+    RequestUnavailable,
+    AttemptLimit,
+    InvalidOrigin,
+    NoNewRevision,
+}
+
+impl RetryRefusal {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingOwner => "missing-owner",
+            Self::StaleOwner => "stale-owner",
+            Self::ClientCancelled => "client-cancelled",
+            Self::PolicyDisabled => "policy-disabled",
+            Self::RequestUnavailable => "request-unavailable",
+            Self::AttemptLimit => "attempt-limit-exhausted",
+            Self::InvalidOrigin => "invalid-origin",
+            Self::NoNewRevision => "no-new-revision",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::AttemptLimit => "content modified: retry limit exhausted",
+            Self::InvalidOrigin => "content modified: document origin changed",
+            Self::PolicyDisabled => "content modified: automatic retry is not permitted",
+            Self::NoNewRevision => "content modified: no newer workspace revision",
+            Self::ClientCancelled => "request cancelled",
+            Self::MissingOwner | Self::StaleOwner => "content modified: request ownership changed",
+            Self::RequestUnavailable => "content modified: original request is unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryQueueResult {
+    Queued,
+    Refused(RetryRefusal),
+}
+
+fn queue_latency_retry(
+    state: &mut GlobalState,
+    key: &RequestAttemptKey,
+    method: &str,
+    reason: &str,
+    old_revision: salsa::Revision,
+    current_revision: salsa::Revision,
+    requires_new_revision: bool,
+) -> RetryQueueResult {
+    let Some(lifecycle) = state.request_lifecycles.get(&key.id) else {
+        tracing::info!(request_id = ?key.id, method, attempt = key.attempt, reason, refusal = "missing-owner", old_revision = ?old_revision, current_revision = ?current_revision, "latency retry refused");
+        return RetryQueueResult::Refused(RetryRefusal::MissingOwner);
+    };
+    let origin_matches =
+        lifecycle.origin.as_ref().is_some_and(|origin| request_origin_matches(state, origin));
+    let refusal = if lifecycle.generation != key.generation
+        || lifecycle.attempt != key.attempt
+        || lifecycle.phase != RequestLifecyclePhase::Running
+    {
+        Some(RetryRefusal::StaleOwner)
+    } else if lifecycle.client_cancelled {
+        Some(RetryRefusal::ClientCancelled)
+    } else if !lifecycle.retry_eligible {
+        Some(RetryRefusal::PolicyDisabled)
+    } else if lifecycle.request.is_none() {
+        Some(RetryRefusal::RequestUnavailable)
+    } else if lifecycle.attempt >= MAX_LATENCY_ATTEMPTS {
+        Some(RetryRefusal::AttemptLimit)
+    } else if !origin_matches {
+        Some(RetryRefusal::InvalidOrigin)
+    } else if requires_new_revision && current_revision <= old_revision {
+        Some(RetryRefusal::NoNewRevision)
+    } else {
+        None
+    };
+    if let Some(refusal) = refusal {
+        tracing::info!(request_id = ?key.id, method, attempt = key.attempt, reason, refusal = refusal.as_str(), old_revision = ?old_revision, current_revision = ?current_revision, "latency retry refused");
+        return RetryQueueResult::Refused(refusal);
+    }
+
+    let attempt = key.attempt + 1;
+    let lifecycle = state.request_lifecycles.get_mut(&key.id).expect("checked above");
+    lifecycle.attempt = attempt;
+    lifecycle.phase = RequestLifecyclePhase::RetryQueued;
+    lifecycle.retry_origin_revision = Some(old_revision);
+    let retry = RequestAttemptKey { id: key.id.clone(), generation: key.generation, attempt };
+    state.pending_latency_retries.push_back(retry);
+    tracing::info!(
+        request_id = ?key.id,
+        method,
+        attempt,
+        reason,
+        old_revision = ?old_revision,
+        current_revision = ?current_revision,
+        "queued fresh LSP request attempt"
+    );
+    RetryQueueResult::Queued
+}
+
+fn finish_latency_request(state: &mut GlobalState, key: &RequestAttemptKey, response: Response) {
+    let current = state.request_lifecycles.get(&key.id).is_some_and(|lifecycle| {
+        lifecycle.generation == key.generation && lifecycle.attempt == key.attempt
+    });
+    if !current {
+        tracing::debug!(request_id = ?key.id, generation = key.generation, attempt = key.attempt, "discarding stale terminal response");
+        return;
+    }
+
+    state
+        .pending_latency_retries
+        .retain(|pending| pending.id != key.id || pending.generation != key.generation);
+    state.request_lifecycles.remove(&key.id);
+    if state
+        .request_token_owners
+        .get(&key.id)
+        .is_some_and(|owner| owner.generation == key.generation)
+    {
+        state.request_token_owners.remove(&key.id);
+        state.request_tokens.remove(&key.id);
+    }
+    if state.active_workspace_diagnostic.as_ref() == Some(&key.id) {
+        state.active_workspace_diagnostic = None;
+    }
+    tracing::info!(
+        request_id = ?key.id,
+        generation = key.generation,
+        attempt = key.attempt,
+        "finalized LSP request"
+    );
+    state.respond(response);
+}
+
+pub(crate) fn admit_pending_latency_retries(state: &mut GlobalState) -> Result<()> {
+    while state.task_pool.pool.has_capacity() {
+        let Some(key) = state.pending_latency_retries.pop_front() else {
+            break;
+        };
+        let Some(lifecycle) = state.request_lifecycles.get(&key.id) else {
+            continue;
+        };
+        if lifecycle.generation != key.generation
+            || lifecycle.attempt != key.attempt
+            || lifecycle.phase != RequestLifecyclePhase::RetryQueued
+        {
+            continue;
+        }
+        let client_cancelled = lifecycle.client_cancelled;
+        let origin_matches =
+            lifecycle.origin.as_ref().is_some_and(|origin| request_origin_matches(state, origin));
+        let old_revision = lifecycle.retry_origin_revision;
+        let request = lifecycle.request.clone();
+        let method = lifecycle.method.clone();
+        if client_cancelled {
+            finish_latency_request(
+                state,
+                &key,
+                Response::new_err(
+                    key.id.clone(),
+                    lsp_server::ErrorCode::RequestCanceled as i32,
+                    "request cancelled".to_string(),
+                ),
+            );
+            continue;
+        }
+        if !origin_matches {
+            let current_revision =
+                salsa::plumbing::current_revision(state.analysis_host.raw_database());
+            let refusal = RetryRefusal::InvalidOrigin;
+            tracing::info!(
+                request_id = ?key.id,
+                method,
+                attempt = key.attempt,
+                reason = "origin-changed-before-admission",
+                refusal = refusal.as_str(),
+                old_revision = ?old_revision.unwrap_or(current_revision),
+                current_revision = ?current_revision,
+                "latency retry refused"
+            );
+            finish_latency_request(
+                state,
+                &key,
+                Response::new_err(
+                    key.id.clone(),
+                    lsp_server::ErrorCode::ContentModified as i32,
+                    refusal.message().to_string(),
+                ),
+            );
+            continue;
+        }
+        let request = request.expect("eligible retry retains request");
+        tracing::info!(
+            request_id = ?key.id,
+            method,
+            attempt = key.attempt,
+            "admitting fresh LSP request attempt"
+        );
+        state.retry_dispatch = Some(key.clone());
+        if let Err(error) = handle_request(state, request) {
+            state.retry_dispatch = None;
+            tracing::warn!(request_id = ?key.id, attempt = key.attempt, ?error, "retry dispatch failed");
+            finish_latency_request(
+                state,
+                &key,
+                Response::new_err(
+                    key.id.clone(),
+                    lsp_server::ErrorCode::ContentModified as i32,
+                    "content modified".to_string(),
+                ),
+            );
+        } else {
+            state.retry_dispatch = None;
         }
     }
     Ok(())
@@ -1191,7 +1579,6 @@ fn handle_vfs_msg(
     }
 
     let outcome = state.process_changes(false);
-
     // External (non-open) file changes — e.g. a `git pull` touching modules or
     // metadata — invalidate the Salsa cache but do not by themselves re-publish
     // diagnostics for documents the editor already has open. Reschedule those so
@@ -1264,8 +1651,8 @@ fn handle_request(state: &mut GlobalState, req: Request) -> Result<()> {
             state.shutdown_requested = true;
             Ok(())
         })
-        .on_latency::<GotoDefinition>(crate::handlers::handle_goto_definition)
-        .on_latency::<GotoTypeDefinition>(crate::handlers::handle_type_definition)
+        .on_retryable_latency::<GotoDefinition>(crate::handlers::handle_goto_definition)
+        .on_retryable_latency::<GotoTypeDefinition>(crate::handlers::handle_type_definition)
         .on_latency::<References>(crate::handlers::handle_find_references)
         .on_latency::<PrepareRenameRequest>(crate::handlers::handle_prepare_rename)
         .on_latency::<Rename>(crate::handlers::handle_rename)
@@ -1279,8 +1666,8 @@ fn handle_request(state: &mut GlobalState, req: Request) -> Result<()> {
         .on_latency::<SelectionRangeRequest>(crate::handlers::handle_selection_range)
         .on_latency::<DocumentHighlightRequest>(crate::handlers::handle_document_highlight)
         .on_latency::<FoldingRangeRequest>(crate::handlers::handle_folding_range)
-        .on_latency::<HoverRequest>(crate::handlers::handle_hover)
-        .on_latency::<Completion>(crate::handlers::handle_completion)
+        .on_retryable_latency::<HoverRequest>(crate::handlers::handle_hover)
+        .on_retryable_latency::<Completion>(crate::handlers::handle_completion)
         .on_latency::<SemanticTokensFullRequest>(crate::handlers::handle_semantic_tokens_full)
         .on_latency::<DocumentSymbolRequest>(crate::handlers::handle_document_symbol)
         .on_latency::<CodeActionRequest>(crate::handlers::handle_code_action)
@@ -1304,8 +1691,8 @@ fn handle_request(state: &mut GlobalState, req: Request) -> Result<()> {
 
 fn handle_notification(state: &mut GlobalState, not: Notification) -> Result<()> {
     use lsp_types::notification::{
-        Cancel, DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument,
-        DidSaveTextDocument,
+        Cancel, DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument,
+        DidOpenTextDocument, DidSaveTextDocument,
     };
 
     if not.method == Exit::METHOD {
@@ -1319,6 +1706,7 @@ fn handle_notification(state: &mut GlobalState, not: Notification) -> Result<()>
         .on_sync_mut::<DidChangeTextDocument>(crate::handlers::handle_did_change)?
         .on_sync_mut::<DidCloseTextDocument>(crate::handlers::handle_did_close)?
         .on_sync_mut::<DidSaveTextDocument>(crate::handlers::handle_did_save)?
+        .on_sync_mut::<DidChangeWatchedFiles>(crate::handlers::handle_did_change_watched_files)?
         .on_sync_mut::<Cancel>(crate::handlers::handle_cancel)?
         .finish();
 
@@ -1436,7 +1824,3009 @@ fn server_capabilities(
 mod tests {
     use super::*;
     use crate::global_state::Task;
-    use std::sync::Arc;
+    use lsp_types::request::Request as _;
+    use salsa::Database as _;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    static G1_CANCEL_FLAG_BASELINE: AtomicU64 = AtomicU64::new(0);
+    static G1_CANCEL_OBSERVED: AtomicU64 = AtomicU64::new(0);
+    static G1_READER_ENTERED: AtomicBool = AtomicBool::new(false);
+    static G1_READER_SAW_WRITE: AtomicBool = AtomicBool::new(false);
+    static G1_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    mod lsp_live_vfs_propagated_tests {
+        include!("lsp_live_vfs_propagated_tests.rs");
+    }
+
+    fn g1_with_tracing<T>(body: impl FnOnce() -> T) -> T {
+        let _serial = G1_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(std::io::stderr)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, body)
+    }
+
+    fn g1_definition_waiting_for_vfs_write(
+        ctx: &crate::frozen_context::LatencyRequestContext,
+        params: lsp_types::GotoDefinitionParams,
+    ) -> anyhow::Result<Option<lsp_types::GotoDefinitionResponse>> {
+        g1_wait_for_salsa_cancellation(ctx);
+        crate::handlers::handle_goto_definition(ctx, params)
+    }
+
+    fn g1_wait_for_salsa_cancellation(ctx: &crate::frozen_context::LatencyRequestContext) {
+        G1_READER_ENTERED.store(true, Ordering::Release);
+        let baseline = G1_CANCEL_FLAG_BASELINE.load(Ordering::Acquire);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while ctx
+            .analysis
+            .database()
+            .salsa_event_global()
+            .is_some_and(|events| events.set_cancellation <= baseline)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "VFS writer never set Salsa's cancellation flag"
+            );
+            std::thread::yield_now();
+        }
+        let observed = ctx
+            .analysis
+            .database()
+            .salsa_event_global()
+            .expect("G1 installs an event-enabled database in its fixture")
+            .set_cancellation;
+        assert!(observed > baseline);
+        G1_CANCEL_OBSERVED.store(observed, Ordering::Release);
+        tracing::info!(g1_marker = "salsa_did_set_cancellation", baseline, observed);
+        G1_READER_SAW_WRITE.store(true, Ordering::Release);
+    }
+
+    fn g1_hover_waiting_for_vfs_write(
+        ctx: &crate::frozen_context::LatencyRequestContext,
+        params: lsp_types::HoverParams,
+    ) -> anyhow::Result<Option<lsp_types::Hover>> {
+        g1_wait_for_salsa_cancellation(ctx);
+        crate::handlers::handle_hover(ctx, params)
+    }
+
+    fn g1_type_definition_waiting_for_vfs_write(
+        ctx: &crate::frozen_context::LatencyRequestContext,
+        params: lsp_types::GotoDefinitionParams,
+    ) -> anyhow::Result<Option<lsp_types::GotoDefinitionResponse>> {
+        g1_wait_for_salsa_cancellation(ctx);
+        crate::handlers::handle_type_definition(ctx, params)
+    }
+
+    fn g1_completion_waiting_for_vfs_write(
+        ctx: &crate::frozen_context::LatencyRequestContext,
+        params: lsp_types::CompletionParams,
+    ) -> anyhow::Result<Option<lsp_types::CompletionResponse>> {
+        g1_wait_for_salsa_cancellation(ctx);
+        crate::handlers::handle_completion(ctx, params)
+    }
+
+    fn g1_definition(
+        ctx: &crate::frozen_context::LatencyRequestContext,
+        params: lsp_types::GotoDefinitionParams,
+    ) -> anyhow::Result<Option<lsp_types::GotoDefinitionResponse>> {
+        crate::handlers::handle_goto_definition(ctx, params)
+    }
+
+    fn g1_definition_request(id: i32, uri: lsp_types::Url) -> lsp_server::Request {
+        use lsp_types::request::{GotoDefinition, Request as _};
+        let params = lsp_types::GotoDefinitionParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri },
+                position: lsp_types::Position { line: 4, character: 8 },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        lsp_server::Request::new(
+            lsp_server::RequestId::from(id),
+            GotoDefinition::METHOD.to_owned(),
+            serde_json::to_value(params).unwrap(),
+        )
+    }
+
+    fn g1_json_request(id: i32, method: &str, params: serde_json::Value) -> lsp_server::Request {
+        lsp_server::Request::new(lsp_server::RequestId::from(id), method.to_owned(), params)
+    }
+
+    fn g1_position(text: &str, line: u32, needle: &str, after: bool) -> lsp_types::Position {
+        let source_line = text.lines().nth(line as usize).expect("fixture line exists");
+        let byte_offset = source_line.find(needle).expect("fixture token exists")
+            + usize::from(after) * needle.len();
+        lsp_types::Position {
+            line,
+            character: source_line[..byte_offset].encode_utf16().count() as u32,
+        }
+    }
+
+    fn g1_cancel_then_retry<R>(
+        state: &mut crate::global_state::GlobalState,
+        request: lsp_server::Request,
+        handler: fn(
+            &crate::frozen_context::LatencyRequestContext,
+            R::Params,
+        ) -> anyhow::Result<R::Result>,
+        writer_path: &std::path::Path,
+        writer_text: &str,
+        client_receiver: &crossbeam_channel::Receiver<Message>,
+    ) -> serde_json::Value
+    where
+        R: lsp_types::request::Request,
+        R::Params: serde::de::DeserializeOwned + std::fmt::Debug + Send + 'static,
+        R::Result: serde::Serialize + Send + 'static,
+    {
+        G1_READER_ENTERED.store(false, Ordering::Release);
+        G1_READER_SAW_WRITE.store(false, Ordering::Release);
+        let baseline = state
+            .analysis_host
+            .raw_database()
+            .salsa_event_global()
+            .expect("G1 test DB records Salsa events")
+            .set_cancellation;
+        G1_CANCEL_FLAG_BASELINE.store(baseline, Ordering::Release);
+        let id = request.id.clone();
+        let task_receiver = state.task_pool.receiver.clone();
+        RequestDispatcher { req: Some(request), global_state: state }
+            .on_retryable_latency::<R>(handler)
+            .finish();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !G1_READER_ENTERED.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline, "semantic reader did not enter");
+            std::thread::yield_now();
+        }
+        std::fs::write(writer_path, writer_text).expect("write unrelated source file");
+        handle_loader_msg(
+            state,
+            vfs::loader::Message::Changed {
+                files: vec![(
+                    paths::AbsPathBuf::assert_utf8(writer_path.to_path_buf()),
+                    Some(writer_text.as_bytes().to_vec()),
+                )],
+            },
+        )
+        .expect("live VFS writer applies unrelated-file change");
+        assert!(G1_READER_SAW_WRITE.load(Ordering::Acquire));
+
+        let response = g1_wait_for_result(state, &task_receiver, client_receiver, id);
+        assert!(response.error.is_none(), "fresh retry must succeed: {response:?}");
+        response.result.expect("successful retry has a semantic result")
+    }
+
+    struct G1ReleasePoolProbe(Arc<AtomicBool>);
+
+    impl Drop for G1ReleasePoolProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    fn g1_three_real_writer_attempts(
+        state: &mut crate::global_state::GlobalState,
+        request: lsp_server::Request,
+        writer_path: &std::path::Path,
+        client_receiver: &crossbeam_channel::Receiver<Message>,
+    ) -> lsp_server::Response {
+        let id = request.id.clone();
+        let (entered, release) = crate::handlers::dispatch::g1_arm_pending_write_gate(&id, 3);
+        let mut task_receiver = state.task_pool.receiver.clone();
+        handle_lsp_msg(state, Message::Request(request))
+            .expect("production handler accepts request");
+
+        let mut writer_complete = 0;
+        for attempt in 1..=3 {
+            assert_eq!(
+                entered
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("production attempt reaches controlled test gate"),
+                attempt
+            );
+            let text = format!(
+                "Процедура WriterProcedure()\n// successive write {attempt}\nКонецПроцедуры\n"
+            );
+            std::fs::write(writer_path, &text).expect("write new contents for actual VFS event");
+            handle_loader_msg(
+                state,
+                vfs::loader::Message::Changed {
+                    files: vec![(
+                        paths::AbsPathBuf::assert_utf8(writer_path.to_path_buf()),
+                        Some(text.as_bytes().to_vec()),
+                    )],
+                },
+            )
+            .expect("production VFS path applies the writer");
+            writer_complete += 1;
+            tracing::info!(
+                g1_marker = "successive_real_writer_complete",
+                request_id = ?id,
+                attempt,
+                writer_complete
+            );
+
+            loop {
+                let task = task_receiver
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("cancelled attempt must return a production task");
+                handle_task(state, task).expect("production event loop handles the attempt task");
+                let retry_queued = state
+                    .request_lifecycles
+                    .get(&id)
+                    .is_some_and(|lifecycle| lifecycle.phase == RequestLifecyclePhase::RetryQueued);
+                let terminal = !state.request_lifecycles.contains_key(&id);
+                if retry_queued || terminal {
+                    break;
+                }
+            }
+
+            if attempt < 3 {
+                assert!(state.request_lifecycles.contains_key(&id));
+                assert_eq!(state.pending_latency_retries.len(), 1);
+
+                if attempt == 1 {
+                    let original_task_pool = std::mem::replace(
+                        &mut state.task_pool,
+                        crate::task_pool::TaskPool::new_with_workers(1),
+                    );
+                    task_receiver = state.task_pool.receiver.clone();
+                    let pool_entered = crossbeam_channel::bounded(1);
+                    let (pool_entered_tx, pool_entered_rx) = pool_entered;
+                    let pool_release = Arc::new(AtomicBool::new(false));
+                    let _release_pool_on_unwind = G1ReleasePoolProbe(Arc::clone(&pool_release));
+                    let release_flag = Arc::clone(&pool_release);
+                    state
+                        .task_pool
+                        .pool
+                        .try_spawn(move || {
+                            pool_entered_tx.send(()).unwrap();
+                            while !release_flag.load(Ordering::Acquire) {
+                                std::thread::yield_now();
+                            }
+                            Task::AnalysisProgressTick { epoch: u64::MAX }
+                        })
+                        .expect("one-worker pool accepts blocker");
+                    pool_entered_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .expect("capacity blocker occupies the only worker");
+                    let mut blockers = Vec::new();
+                    for _ in 0..state.task_pool.pool.capacity().unwrap() {
+                        let release_flag = Arc::clone(&pool_release);
+                        state
+                            .task_pool
+                            .pool
+                            .try_spawn(move || {
+                                while !release_flag.load(Ordering::Acquire) {
+                                    std::thread::yield_now();
+                                }
+                                Task::AnalysisProgressTick { epoch: u64::MAX }
+                            })
+                            .expect("fill the bounded admission queue");
+                        blockers.push(());
+                    }
+                    assert!(!state.task_pool.pool.has_capacity());
+                    assert!(!state.interactive_analysis_quiescent());
+                    admit_pending_latency_retries(state).unwrap();
+                    assert_eq!(state.pending_latency_retries.len(), 1);
+                    assert!(entered.try_recv().is_err(), "capacity gate holds attempt two");
+                    tracing::info!(
+                        g1_marker = "retry_capacity_held",
+                        queued = true,
+                        quiescent = false,
+                        worker_slots = 1
+                    );
+                    pool_release.store(true, Ordering::Release);
+                    for _ in 0..=blockers.len() {
+                        let task = task_receiver
+                            .recv_timeout(std::time::Duration::from_secs(10))
+                            .expect("released blocker emits its task");
+                        handle_task(state, task).expect("apply capacity-probe task result");
+                    }
+                    assert!(state.task_pool.pool.has_capacity());
+                    let (drained_tasks, completed_barriers) =
+                        g1_drain_task_pool_to_fixed_point(state, &task_receiver);
+                    tracing::info!(
+                        g1_marker = "retry_capacity_probe_pool_drained",
+                        drained_tasks,
+                        completed_barriers,
+                    );
+                    state.task_pool = original_task_pool;
+                    task_receiver = state.task_pool.receiver.clone();
+                    assert!(
+                        state.task_pool.pool.capacity().unwrap_or(0) / 4 >= 2,
+                        "restore the original multi-worker request pool after capacity probe"
+                    );
+                    tracing::info!(
+                        g1_marker = "capacity_probe_pool_restored",
+                        workers_at_least = 2,
+                        capacity = state.task_pool.pool.capacity().unwrap_or(0)
+                    );
+                }
+                admit_pending_latency_retries(state).expect("event loop admits next attempt");
+            }
+        }
+
+        release.store(true, Ordering::Release);
+        crate::handlers::dispatch::g1_disarm_pending_write_gate(&id);
+        assert_eq!(writer_complete, 3, "three actual writers overlapped the one logical request");
+        assert!(entered.try_recv().is_err(), "no fourth semantic attempt was started");
+        assert!(!state.request_lifecycles.contains_key(&id));
+        assert!(!state.request_tokens.contains_key(&id));
+        assert!(state.pending_latency_retries.is_empty());
+
+        loop {
+            if let Ok(Message::Response(response)) = client_receiver.try_recv() {
+                if response.id == id {
+                    return response;
+                }
+                panic!("unexpected response {:?} while checking retry exhaustion", response.id);
+            }
+            let task = task_receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("terminal ContentModified response was not sent");
+            handle_task(state, task).expect("production event loop drains final attempt");
+        }
+    }
+
+    fn g1_wait_for_result(
+        state: &mut crate::global_state::GlobalState,
+        receiver: &crossbeam_channel::Receiver<Task>,
+        client_receiver: &crossbeam_channel::Receiver<Message>,
+        id: lsp_server::RequestId,
+    ) -> lsp_server::Response {
+        loop {
+            while let Ok(message) = client_receiver.try_recv() {
+                if let Message::Response(response) = message {
+                    assert_eq!(
+                        response.id, id,
+                        "unexpected client response while awaiting request"
+                    );
+                    return response;
+                }
+            }
+            let task = receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap_or_else(|error| {
+                    let lifecycle = state.request_lifecycles.get(&id);
+                    let owner = state.request_token_owners.get(&id);
+                    let revision =
+                        salsa::plumbing::current_revision(state.analysis_host.raw_database());
+                    let salsa_events = state
+                        .analysis_host
+                        .raw_database()
+                        .salsa_event_global()
+                        .map(|events| events.set_cancellation);
+                    panic!(
+                        "request task timed out: {error}; id={id:?} lifecycle={lifecycle:?} owner={owner:?} pool_capacity={} queued_tasks={} pending_retries={} revision={revision:?} salsa_cancellations={salsa_events:?}",
+                        state.task_pool.pool.has_capacity(),
+                        receiver.len(),
+                        state.pending_latency_retries.len(),
+                    );
+                });
+            handle_task(state, task).expect("event loop must apply the request task");
+            admit_pending_latency_retries(state).expect("event loop must admit queued retry");
+        }
+    }
+
+    fn g1_drain_task_pool_to_fixed_point(
+        state: &mut crate::global_state::GlobalState,
+        receiver: &crossbeam_channel::Receiver<Task>,
+    ) -> (usize, usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut drained_tasks = 0;
+        let mut completed_barriers = 0;
+        loop {
+            let capacity = state.task_pool.pool.capacity().expect("bounded task pool");
+            assert_eq!(capacity % 4, 0, "task queue capacity is workers × 4");
+            let workers = capacity / 4;
+            let (ack_tx, ack_rx) = crossbeam_channel::bounded(workers);
+            match state.task_pool.try_broadcast(move || {
+                ack_tx
+                    .send(std::thread::current().id())
+                    .expect("quiescence caller receives every worker acknowledgement");
+            }) {
+                Ok(()) => {
+                    let mut worker_ids = std::collections::HashSet::with_capacity(workers);
+                    for _ in 0..workers {
+                        let remaining =
+                            deadline.saturating_duration_since(std::time::Instant::now());
+                        let worker_id = ack_rx
+                            .recv_timeout(remaining)
+                            .expect("every task-pool worker acknowledges its barrier callback");
+                        assert!(
+                            worker_ids.insert(worker_id),
+                            "each task-pool worker acknowledges exactly once"
+                        );
+                    }
+                    assert_eq!(worker_ids.len(), workers);
+                    completed_barriers += 1;
+                    tracing::info!(
+                        g1_marker = "task_pool_worker_barrier_acknowledged",
+                        workers,
+                        completed_barriers,
+                    );
+                    let mut handled = false;
+                    while let Ok(task) = receiver.try_recv() {
+                        handle_task(state, task).expect("quiescence drain applies task results");
+                        drained_tasks += 1;
+                        handled = true;
+                    }
+                    if !handled {
+                        return (drained_tasks, completed_barriers);
+                    }
+                }
+                Err(crate::task_pool::TrySpawnError::Full) => {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    let task = receiver
+                        .recv_timeout(remaining)
+                        .expect("drain task completions while waiting for pool barrier capacity");
+                    handle_task(state, task).expect("quiescence drain applies task result");
+                    drained_tasks += 1;
+                }
+                Err(crate::task_pool::TrySpawnError::Disconnected) => {
+                    panic!("task pool disconnected before its idle barrier")
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "task pool did not reach a quiescent barrier"
+            );
+        }
+    }
+
+    fn g1_wait_for_task_pool_quiescence(
+        state: &mut crate::global_state::GlobalState,
+        receiver: &crossbeam_channel::Receiver<Task>,
+    ) {
+        let (drained_tasks, completed_barriers) =
+            g1_drain_task_pool_to_fixed_point(state, receiver);
+        assert!(state.request_lifecycles.is_empty());
+        assert!(state.request_tokens.is_empty());
+        assert!(!state.workspace_batch_in_flight);
+        assert!(state.workspace_batch_plan.is_none());
+        assert!(state.interactive_analysis_quiescent());
+        tracing::info!(
+            g1_marker = "task_pool_quiescent_before_workspace_teardown",
+            drained_tasks,
+            completed_barriers,
+        );
+    }
+
+    fn g1_queue_valid_retry_for_session_boundary(
+        state: &mut crate::global_state::GlobalState,
+        id: lsp_server::RequestId,
+        uri: lsp_types::Url,
+    ) -> (crate::global_state::RequestAttemptKey, salsa::CancellationToken) {
+        let numeric_id = serde_json::to_value(&id)
+            .expect("serialize request id")
+            .as_i64()
+            .and_then(|id| i32::try_from(id).ok())
+            .expect("test request id must be numeric");
+        let request = g1_definition_request(numeric_id, uri.clone());
+        let origin = crate::global_state::RequestOriginGuard {
+            identity: state.mem_docs.identity(&uri).expect("open request document"),
+            uri,
+            workspace_root: state.workspace_root.clone(),
+            source_roots: state.project.as_ref().expect("loaded test project").source_roots(),
+        };
+        let generation = 41;
+        let first_attempt =
+            crate::global_state::RequestAttemptKey { id: id.clone(), generation, attempt: 1 };
+        state.request_lifecycles.insert(
+            id.clone(),
+            crate::global_state::RequestLifecycle {
+                generation,
+                method: lsp_types::request::GotoDefinition::METHOD.to_owned(),
+                request: Some(request),
+                attempt: 1,
+                phase: RequestLifecyclePhase::Running,
+                retry_origin_revision: None,
+                retry_eligible: true,
+                origin: Some(origin),
+                client_cancelled: false,
+            },
+        );
+        assert!(request_origin_matches(
+            state,
+            state.request_lifecycles[&id].origin.as_ref().unwrap()
+        ));
+        let revision = salsa::plumbing::current_revision(state.analysis_host.raw_database());
+        assert_eq!(
+            queue_latency_retry(
+                state,
+                &first_attempt,
+                lsp_types::request::GotoDefinition::METHOD,
+                "session-boundary-control",
+                revision,
+                revision,
+                false,
+            ),
+            RetryQueueResult::Queued,
+            "the origin-valid logical request must really be queued for attempt two"
+        );
+        let retry = state.pending_latency_retries.front().cloned().unwrap();
+
+        let active_id = lsp_server::RequestId::from(numeric_id + 1);
+        let active_key = crate::global_state::RequestAttemptKey {
+            id: active_id.clone(),
+            generation: generation + 1,
+            attempt: 1,
+        };
+        let active_token = state.analysis_host.raw_database().cancellation_token();
+        state.request_lifecycles.insert(
+            active_id.clone(),
+            crate::global_state::RequestLifecycle {
+                generation: active_key.generation,
+                method: lsp_types::request::HoverRequest::METHOD.to_owned(),
+                request: None,
+                attempt: 1,
+                phase: RequestLifecyclePhase::Running,
+                retry_origin_revision: None,
+                retry_eligible: false,
+                origin: None,
+                client_cancelled: false,
+            },
+        );
+        state.request_tokens.insert(active_id.clone(), active_token.clone());
+        state.request_token_owners.insert(active_id, active_key);
+        (retry, active_token)
+    }
+
+    fn g1_session_boundary_state(
+        retry_id: lsp_server::RequestId,
+    ) -> (
+        tempfile::TempDir,
+        crate::global_state::GlobalState,
+        crossbeam_channel::Receiver<Message>,
+        crossbeam_channel::Receiver<Task>,
+        crate::global_state::RequestAttemptKey,
+        salsa::CancellationToken,
+    ) {
+        let root = tempfile::tempdir().expect("create session-boundary project");
+        let caller_path = root.path().join("Caller.bsl");
+        let caller_text = "Процедура Caller()\nКонецПроцедуры\n";
+        std::fs::write(&caller_path, caller_text).expect("write session-boundary source");
+        std::fs::write(root.path().join("bsl-analyzer.toml"), "[source]\nroot = \".\"\n")
+            .expect("write valid project config");
+        let (sender, client_receiver) = crossbeam_channel::unbounded();
+        let mut state = crate::global_state::GlobalState::new(sender);
+        state.workspace_root = Some(root.path().to_path_buf());
+        state.project = Some(project_model::Project::new(root.path()).expect("load project"));
+        state.vfs_done = true;
+        let uri = lsp_types::Url::from_file_path(&caller_path).unwrap();
+        state.mem_docs.insert(uri.clone(), caller_text.to_owned(), 1);
+        let (retry, active_token) =
+            g1_queue_valid_retry_for_session_boundary(&mut state, retry_id, uri);
+        let task_receiver = state.task_pool.receiver.clone();
+        (root, state, client_receiver, task_receiver, retry, active_token)
+    }
+
+    fn g1_receive_loader_message(
+        state: &mut crate::global_state::GlobalState,
+        mut wanted: impl FnMut(&vfs::loader::Message) -> bool,
+    ) -> vfs::loader::Message {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .expect("expected VFS loader message before deadline");
+            let message = state
+                .loader_receiver
+                .recv_timeout(remaining)
+                .expect("real VFS loader did not produce expected message");
+            if wanted(&message) {
+                return message;
+            }
+            handle_loader_msg(state, message).expect("apply unrelated real VFS loader message");
+        }
+    }
+
+    fn g1_frame_round_trip(message: Message) -> Message {
+        let mut frame = Vec::new();
+        message.write(&mut frame).expect("encode Content-Length LSP frame");
+        assert!(frame.starts_with(b"Content-Length: "));
+        Message::read(&mut std::io::Cursor::new(frame))
+            .expect("decode Content-Length LSP frame")
+            .expect("frame contains one LSP message")
+    }
+
+    fn g1_framed_request_response(
+        state: &mut crate::global_state::GlobalState,
+        request: lsp_server::Request,
+        task_receiver: &crossbeam_channel::Receiver<Task>,
+        client_receiver: &crossbeam_channel::Receiver<Message>,
+    ) -> lsp_server::Response {
+        let id = request.id.clone();
+        let Message::Request(request) = g1_frame_round_trip(Message::Request(request)) else {
+            panic!("request frame decoded as a non-request")
+        };
+        tracing::info!(g1_marker = "framed_request_decoded", request_id = ?id);
+        handle_lsp_msg(state, Message::Request(request))
+            .expect("production request loop handles frame");
+        admit_pending_latency_retries(state)
+            .expect("production event loop admits a retry after request dispatch");
+        let response = g1_wait_for_result(state, task_receiver, client_receiver, id.clone());
+        let Message::Response(response) = g1_frame_round_trip(Message::Response(response)) else {
+            unreachable!("response frame decoded as non-response")
+        };
+        tracing::info!(g1_marker = "framed_response_decoded", request_id = ?id);
+        response
+    }
+
+    #[test]
+    fn g1_live_vfs_pending_write_cancels_real_definition_then_fresh_request_succeeds() {
+        g1_with_tracing(|| {
+            use base_db::SourceDatabase;
+            use lsp_types::request::GotoDefinition;
+
+            G1_READER_ENTERED.store(false, Ordering::Release);
+            G1_READER_SAW_WRITE.store(false, Ordering::Release);
+            G1_CANCEL_OBSERVED.store(0, Ordering::Release);
+            let (sender, client_receiver) = crossbeam_channel::unbounded();
+            let mut state = crate::global_state::GlobalState::new(sender);
+            *state.analysis_host.raw_database_mut() =
+                ide_db::RootDatabaseImpl::new_with_salsa_events();
+            state.init_empty_source_root();
+
+            let dir = tempfile::tempdir().unwrap();
+            let caller = dir.path().join("Caller.bsl");
+            let changed = dir.path().join("Other.bsl");
+            let caller_text = "Процедура TargetProcedure()\nКонецПроцедуры\n\nПроцедура Caller()\n    TargetProcedure();\nКонецПроцедуры\n";
+            let changed_text = "Процедура Other()\nКонецПроцедуры\n";
+            std::fs::write(&caller, caller_text).unwrap();
+            std::fs::write(&changed, changed_text).unwrap();
+            state.workspace_root = Some(dir.path().to_path_buf());
+            state.project = Some(project_model::Project::new(dir.path()).unwrap());
+            let abs = |path: &std::path::Path| paths::AbsPathBuf::assert_utf8(path.to_path_buf());
+            let caller_uri = lsp_types::Url::from_file_path(&caller).unwrap();
+
+            RequestDispatcher {
+                req: Some(g1_definition_request(367, caller_uri.clone())),
+                global_state: &mut state,
+            }
+            .on_latency::<GotoDefinition>(g1_definition)
+            .finish();
+            let cold = client_receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("cold-start guard must answer synchronously");
+            let lsp_server::Message::Response(cold) = cold else {
+                panic!("expected cold-start response, got {cold:?}");
+            };
+            assert_eq!(cold.id, lsp_server::RequestId::from(367));
+            assert_eq!(
+                cold.error.as_ref().map(|error| error.code),
+                Some(lsp_server::ErrorCode::ContentModified as i32)
+            );
+            assert!(!state.request_tokens.contains_key(&cold.id));
+            assert!(state.task_pool.receiver.try_recv().is_err());
+            tracing::info!(g1_marker = "cold_start_declined", code = "ContentModified");
+            handle_loader_msg(
+                &mut state,
+                vfs::loader::Message::Loaded {
+                    files: vec![
+                        (abs(&caller), Some(caller_text.as_bytes().to_vec())),
+                        (abs(&changed), Some(changed_text.as_bytes().to_vec())),
+                    ],
+                },
+            )
+            .unwrap();
+            // `handle_vfs_msg` streams contents into VFS/Salsa, while the production
+            // workspace loader publishes source-root membership after discovery.
+            // This focused fixture supplies that final piece so definition uses the
+            // same real semantic path as a loaded project.
+            let paths = [&caller, &changed];
+            let mut file_set = vfs::file_set::FileSet::new();
+            let file_ids: Vec<_> = paths
+                .iter()
+                .map(|path| {
+                    let vfs_path = vfs::VfsPath::new(path.as_path());
+                    let file_id = state.vfs.read().file_id(&vfs_path).unwrap();
+                    file_set.insert(file_id, vfs_path);
+                    file_id
+                })
+                .collect();
+            {
+                use base_db::{SourceRoot, BSL_SOURCE_ROOT};
+                let db = state.analysis_host.raw_database_mut();
+                db.set_source_root(BSL_SOURCE_ROOT, SourceRoot::new_local(file_set));
+                for file_id in file_ids {
+                    db.set_file_source_root(file_id, BSL_SOURCE_ROOT);
+                }
+            }
+            handle_loader_msg(
+                &mut state,
+                vfs::loader::Message::Progress {
+                    n_total: 2,
+                    n_done: vfs::loader::LoadingProgress::Finished,
+                    dir: None,
+                    config_version: 0,
+                },
+            )
+            .unwrap();
+            assert!(state.vfs_done, "the loader finalize must establish ready before the overlap");
+            state.mem_docs.insert(caller_uri.clone(), caller_text.to_owned(), 1);
+
+            // A successful semantic control proves the fixture resolves the symbol
+            // before we introduce the live writer; the post-release request must match it.
+            let control_receiver = state.task_pool.receiver.clone();
+            RequestDispatcher {
+                req: Some(g1_definition_request(368, caller_uri.clone())),
+                global_state: &mut state,
+            }
+            .on_latency::<GotoDefinition>(g1_definition)
+            .finish();
+            let control = g1_wait_for_result(
+                &mut state,
+                &control_receiver,
+                &client_receiver,
+                lsp_server::RequestId::from(368),
+            );
+            assert!(control.error.is_none(), "initial semantic control failed: {control:?}");
+            let control_result = control.result.expect("initial definition control must resolve");
+            let control_location =
+                if control_result.is_array() { control_result[0].clone() } else { control_result };
+            assert_eq!(control_location["uri"], caller_uri.as_str());
+            assert_eq!(control_location["range"]["start"]["line"], 0);
+            tracing::info!(g1_marker = "semantic_control", result = "definition", ready = true);
+            state.request_tokens.remove(&control.id);
+
+            let baseline = state
+                .analysis_host
+                .raw_database()
+                .salsa_event_global()
+                .expect("G1 test replaces GlobalState's DB with an event-enabled Salsa DB")
+                .set_cancellation;
+            G1_CANCEL_FLAG_BASELINE.store(baseline, Ordering::Release);
+            let task_receiver = state.task_pool.receiver.clone();
+            RequestDispatcher {
+                req: Some(g1_definition_request(369, caller_uri.clone())),
+                global_state: &mut state,
+            }
+            .on_retryable_latency::<GotoDefinition>(g1_definition_waiting_for_vfs_write)
+            .finish();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !G1_READER_ENTERED.load(Ordering::Acquire) {
+                assert!(std::time::Instant::now() < deadline, "semantic reader did not enter");
+                std::thread::yield_now();
+            }
+            tracing::info!(g1_marker = "semantic_reader_entered", request_id = 369);
+            let changed_text = "Процедура Other()\n    X = 1;\nКонецПроцедуры\n";
+            std::fs::write(&changed, changed_text).unwrap();
+            handle_loader_msg(
+                &mut state,
+                vfs::loader::Message::Changed {
+                    files: vec![(abs(&changed), Some(changed_text.as_bytes().to_vec()))],
+                },
+            )
+            .unwrap();
+            assert!(
+                G1_READER_SAW_WRITE.load(Ordering::Acquire),
+                "reader must observe active write"
+            );
+            let observed = G1_CANCEL_OBSERVED.load(Ordering::Acquire);
+            assert!(observed > baseline, "the semantic reader observed Salsa cancellation");
+            tracing::info!(
+                g1_marker = "salsa_did_set_cancellation",
+                baseline,
+                observed,
+                observed_during_writer_call = true
+            );
+            let changed_id = state.vfs.read().file_id(&vfs::VfsPath::new(changed.clone())).unwrap();
+            assert_eq!(&*state.analysis_host.raw_database().file_text(changed_id), changed_text);
+            assert!(state.vfs_done, "a live Changed package must preserve ready state");
+            tracing::info!(g1_marker = "changed_writer_complete", live_text = true, ready = true);
+
+            let response = g1_wait_for_result(
+                &mut state,
+                &task_receiver,
+                &client_receiver,
+                lsp_server::RequestId::from(369),
+            );
+            assert_eq!(response.id, lsp_server::RequestId::from(369));
+            assert!(
+                response.error.is_none(),
+                "live write must retry semantic request: {response:?}"
+            );
+            let result = response.result.expect("retried definition result");
+            let location = if result.is_array() { &result[0] } else { &result };
+            assert_eq!(location, &control_location, "retry must preserve original semantics");
+            tracing::info!(g1_marker = "semantic_reader_released", result = "retried-definition");
+            tracing::info!(g1_marker = "retry_response_matches_control", attempt = 2);
+
+            let retry_receiver = state.task_pool.receiver.clone();
+            RequestDispatcher {
+                req: Some(g1_definition_request(370, caller_uri.clone())),
+                global_state: &mut state,
+            }
+            .on_latency::<GotoDefinition>(g1_definition)
+            .finish();
+            let response = g1_wait_for_result(
+                &mut state,
+                &retry_receiver,
+                &client_receiver,
+                lsp_server::RequestId::from(370),
+            );
+            assert!(response.error.is_none(), "fresh semantic request failed: {response:?}");
+            let result = response.result.expect("definition should have a semantic result");
+            let location = if result.is_array() { &result[0] } else { &result };
+            assert_eq!(
+                location, &control_location,
+                "live writer release must restore the control result"
+            );
+            tracing::info!(
+                g1_marker = "fresh_definition",
+                matches_control = true,
+                result = "definition"
+            );
+
+            // Exercise the queued-cancel branch with another real Salsa read and
+            // writer overlap. Apply its cancellation completion, hold retry admission,
+            // then cancel the logical request before the event loop can start attempt 2.
+            G1_READER_ENTERED.store(false, Ordering::Release);
+            G1_READER_SAW_WRITE.store(false, Ordering::Release);
+            let next_baseline = state
+                .analysis_host
+                .raw_database()
+                .salsa_event_global()
+                .expect("event-enabled test DB")
+                .set_cancellation;
+            G1_CANCEL_FLAG_BASELINE.store(next_baseline, Ordering::Release);
+            let queued_cancel_id = lsp_server::RequestId::from(375);
+            let queued_cancel_receiver = state.task_pool.receiver.clone();
+            RequestDispatcher {
+                req: Some(g1_definition_request(375, caller_uri.clone())),
+                global_state: &mut state,
+            }
+            .on_retryable_latency::<GotoDefinition>(g1_definition_waiting_for_vfs_write)
+            .finish();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !G1_READER_ENTERED.load(Ordering::Acquire) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "second semantic reader did not enter"
+                );
+                std::thread::yield_now();
+            }
+            let second_changed_text = "Процедура Other()\n    X = 2;\nКонецПроцедуры\n";
+            std::fs::write(&changed, second_changed_text).unwrap();
+            handle_loader_msg(
+                &mut state,
+                vfs::loader::Message::Changed {
+                    files: vec![(abs(&changed), Some(second_changed_text.as_bytes().to_vec()))],
+                },
+            )
+            .unwrap();
+            assert!(G1_READER_SAW_WRITE.load(Ordering::Acquire));
+
+            let completion = loop {
+                let task = queued_cancel_receiver
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("queued-cancel request did not finish its real attempt");
+                if matches!(
+                    &task,
+                    Task::LatencyRequestFinished { key, .. } if key.id == queued_cancel_id
+                ) {
+                    break task;
+                }
+                handle_task(&mut state, task).expect("apply unrelated event-loop task");
+            };
+            handle_task(&mut state, completion).expect("apply cancellation before retry admission");
+            assert!(state.request_lifecycles.get(&queued_cancel_id).is_some_and(|lifecycle| {
+                lifecycle.phase == RequestLifecyclePhase::RetryQueued && lifecycle.attempt == 2
+            }));
+            assert_eq!(
+                state.pending_latency_retries.front(),
+                Some(&RequestAttemptKey {
+                    id: queued_cancel_id.clone(),
+                    generation: state.request_lifecycles[&queued_cancel_id].generation,
+                    attempt: 2,
+                })
+            );
+            tracing::info!(
+                g1_marker = "retry_queued_before_admission",
+                request_id = ?queued_cancel_id,
+                writer_complete = true,
+                attempt = 2
+            );
+
+            let original_task_pool = std::mem::replace(
+                &mut state.task_pool,
+                crate::task_pool::TaskPool::new_with_workers(1),
+            );
+            let saturated_receiver = state.task_pool.receiver.clone();
+            let blocker_entered = crossbeam_channel::bounded(1);
+            let (blocker_entered_tx, blocker_entered_rx) = blocker_entered;
+            let release_pool = Arc::new(AtomicBool::new(false));
+            let release_worker = Arc::clone(&release_pool);
+            state
+                .task_pool
+                .pool
+                .try_spawn(move || {
+                    blocker_entered_tx.send(()).unwrap();
+                    while !release_worker.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    Task::AnalysisProgressTick { epoch: u64::MAX }
+                })
+                .unwrap();
+            blocker_entered_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("one-worker pool blocker starts");
+            let queued_blockers = state.task_pool.pool.capacity().unwrap();
+            let _release_pool_on_unwind = G1ReleasePoolProbe(Arc::clone(&release_pool));
+            for _ in 0..queued_blockers {
+                let release_worker = Arc::clone(&release_pool);
+                state
+                    .task_pool
+                    .pool
+                    .try_spawn(move || {
+                        while !release_worker.load(Ordering::Acquire) {
+                            std::thread::yield_now();
+                        }
+                        Task::AnalysisProgressTick { epoch: u64::MAX }
+                    })
+                    .expect("fill the bounded worker queue");
+            }
+            assert!(!state.task_pool.pool.has_capacity());
+            crate::handlers::notification::handle_cancel(
+                &mut state,
+                lsp_types::CancelParams { id: lsp_types::NumberOrString::Number(375) },
+            )
+            .unwrap();
+            let lsp_server::Message::Response(cancelled) = client_receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("queued cancellation must answer once")
+            else {
+                panic!("queued cancellation produced a non-response")
+            };
+            assert_eq!(cancelled.id, queued_cancel_id);
+            assert_eq!(
+                cancelled.error.as_ref().map(|error| error.code),
+                Some(lsp_server::ErrorCode::RequestCanceled as i32)
+            );
+            assert!(
+                state.pending_latency_retries.is_empty(),
+                "queued cancellation must unlink its generation immediately at full capacity"
+            );
+            admit_pending_latency_retries(&mut state).expect("stale retry admission is safe");
+            assert!(!state.request_lifecycles.contains_key(&queued_cancel_id));
+            assert!(!state.request_tokens.contains_key(&queued_cancel_id));
+            assert!(state.pending_latency_retries.is_empty());
+            assert!(
+                client_receiver.try_recv().is_err(),
+                "queued cancel sends exactly one response"
+            );
+            tracing::info!(
+                g1_marker = "queued_retry_cancelled_before_admission",
+                request_id = ?queued_cancel_id,
+                response = "RequestCanceled",
+                retry_started = false,
+                pool_saturated = true,
+                queue_unlinked = true
+            );
+            release_pool.store(true, Ordering::Release);
+            for _ in 0..=queued_blockers {
+                let task = saturated_receiver
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("all pool blockers finish after release");
+                handle_task(&mut state, task).expect("apply queued-cancel capacity probe result");
+            }
+            let (drained_tasks, completed_barriers) =
+                g1_drain_task_pool_to_fixed_point(&mut state, &saturated_receiver);
+            tracing::info!(
+                g1_marker = "queued_cancel_capacity_pool_drained",
+                drained_tasks,
+                completed_barriers,
+            );
+            state.task_pool = original_task_pool;
+            assert!(
+                state.task_pool.pool.capacity().unwrap_or(0) / 4 >= 2,
+                "the normal task pool remains available after queued-cancel probe"
+            );
+            tracing::info!(
+                g1_marker = "queued_cancel_capacity_pool_restored",
+                workers_at_least = 2,
+                capacity = state.task_pool.pool.capacity().unwrap_or(0)
+            );
+
+            let running_cancel_id = lsp_server::RequestId::from(376);
+            let (reader_entered, release_reader) =
+                crate::handlers::dispatch::g1_arm_pending_write_gate(&running_cancel_id, 1);
+            let running_cancel_receiver = state.task_pool.receiver.clone();
+            handle_lsp_msg(
+                &mut state,
+                Message::Request(g1_definition_request(376, caller_uri.clone())),
+            )
+            .unwrap();
+            assert_eq!(
+                reader_entered.recv_timeout(std::time::Duration::from_secs(10)).unwrap(),
+                1,
+                "real dispatched handler reaches the controlled query checkpoint"
+            );
+            handle_notification(
+                &mut state,
+                Notification::new("$/cancelRequest".to_owned(), serde_json::json!({"id": 376})),
+            )
+            .unwrap();
+            release_reader.store(true, Ordering::Release);
+            crate::handlers::dispatch::g1_disarm_pending_write_gate(&running_cancel_id);
+            let running_cancelled = g1_wait_for_result(
+                &mut state,
+                &running_cancel_receiver,
+                &client_receiver,
+                running_cancel_id.clone(),
+            );
+            assert_eq!(
+                running_cancelled.error.as_ref().map(|error| error.code),
+                Some(lsp_server::ErrorCode::RequestCanceled as i32)
+            );
+            assert!(!state.request_lifecycles.contains_key(&running_cancel_id));
+            assert!(!state.request_tokens.contains_key(&running_cancel_id));
+            assert!(state.pending_latency_retries.is_empty());
+            handle_notification(
+                &mut state,
+                Notification::new("$/cancelRequest".to_owned(), serde_json::json!({"id": 376})),
+            )
+            .unwrap();
+            assert!(
+                client_receiver.try_recv().is_err(),
+                "late cancel after completion cannot send another response"
+            );
+            tracing::info!(
+                g1_marker = "running_request_cancelled_at_checkpoint",
+                request_id = ?running_cancel_id,
+                response = "RequestCanceled",
+                retries = 0
+            );
+
+            let origin_change_id = lsp_server::RequestId::from(377);
+            let (origin_reader_entered, _origin_release) =
+                crate::handlers::dispatch::g1_arm_pending_write_gate(&origin_change_id, 1);
+            let origin_task_receiver = state.task_pool.receiver.clone();
+            handle_lsp_msg(
+                &mut state,
+                Message::Request(g1_definition_request(377, caller_uri.clone())),
+            )
+            .unwrap();
+            assert_eq!(
+                origin_reader_entered.recv_timeout(std::time::Duration::from_secs(10)).unwrap(),
+                1
+            );
+            let origin_writer_text = "Процедура Other()\n    Значение = 3;\nКонецПроцедуры\n";
+            std::fs::write(&changed, origin_writer_text).unwrap();
+            handle_loader_msg(
+                &mut state,
+                vfs::loader::Message::Changed {
+                    files: vec![(abs(&changed), Some(origin_writer_text.as_bytes().to_vec()))],
+                },
+            )
+            .unwrap();
+            crate::handlers::dispatch::g1_disarm_pending_write_gate(&origin_change_id);
+            let completion = loop {
+                let task = origin_task_receiver
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("origin-change attempt returns its real task");
+                if matches!(
+                    &task,
+                    Task::LatencyRequestFinished { key, .. } if key.id == origin_change_id
+                ) {
+                    break task;
+                }
+                handle_task(&mut state, task).unwrap();
+            };
+            handle_task(&mut state, completion).unwrap();
+            assert!(state.request_lifecycles.get(&origin_change_id).is_some_and(|lifecycle| {
+                lifecycle.phase == RequestLifecyclePhase::RetryQueued && lifecycle.attempt == 2
+            }));
+            let original_identity = state.mem_docs.identity(&caller_uri).unwrap();
+            handle_notification(
+                &mut state,
+                Notification::new(
+                    "textDocument/didChange".to_owned(),
+                    serde_json::json!({
+                        "textDocument": {"uri": caller_uri, "version": 2},
+                        "contentChanges": [{"text": caller_text}]
+                    }),
+                ),
+            )
+            .unwrap();
+            assert_ne!(state.mem_docs.identity(&caller_uri), Some(original_identity));
+            let stale_origin_response = g1_wait_for_result(
+                &mut state,
+                &origin_task_receiver,
+                &client_receiver,
+                origin_change_id.clone(),
+            );
+            assert_eq!(
+                stale_origin_response.error.as_ref().map(|error| error.code),
+                Some(lsp_server::ErrorCode::ContentModified as i32)
+            );
+            assert_eq!(
+                stale_origin_response.error.as_ref().map(|error| error.message.as_str()),
+                Some("content modified: document origin changed")
+            );
+            assert!(origin_reader_entered.try_recv().is_err(), "stale position is never replayed");
+            crate::handlers::dispatch::g1_disarm_pending_write_gate(&origin_change_id);
+            tracing::info!(
+                g1_marker = "did_change_invalidates_queued_retry",
+                request_id = ?origin_change_id,
+                attempt = 1,
+                retries = 0,
+                response = "ContentModified"
+            );
+            let fresh_response = g1_framed_request_response(
+                &mut state,
+                g1_definition_request(378, caller_uri.clone()),
+                &origin_task_receiver,
+                &client_receiver,
+            );
+            assert!(
+                fresh_response.error.is_none(),
+                "fresh external request after edit succeeds: {fresh_response:?}"
+            );
+            let fresh_result = fresh_response.result.expect("fresh definition result");
+            let fresh_location =
+                if fresh_result.is_array() { &fresh_result[0] } else { &fresh_result };
+            assert_eq!(fresh_location, &control_location);
+            tracing::info!(g1_marker = "fresh_request_after_origin_change", semantic_parity = true);
+        });
+    }
+
+    #[test]
+    fn g1_initial_project_failure_keeps_real_dispatch_gate_closed() {
+        g1_with_tracing(|| {
+            let (sender, receiver) = crossbeam_channel::unbounded();
+            let mut state = crate::global_state::GlobalState::new(sender);
+            state.init_empty_source_root();
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("bsl-analyzer.toml"), "[source\nroot = \"src\"\n")
+                .unwrap();
+
+            let error = state
+                .set_workspace_root(root.path().to_path_buf())
+                .expect_err("malformed initial project config must fail");
+            assert!(state.project.is_none());
+            assert!(!state.vfs_done, "failed initial project load must not publish readiness");
+            tracing::info!(g1_marker = "initial_project_failure", failed = true, ready = false);
+
+            let uri = lsp_types::Url::from_file_path(root.path().join("Caller.bsl")).unwrap();
+            RequestDispatcher {
+                req: Some(g1_definition_request(371, uri)),
+                global_state: &mut state,
+            }
+            .on_latency::<lsp_types::request::GotoDefinition>(g1_definition)
+            .finish();
+            let message = receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("failed-load guard must answer synchronously");
+            let lsp_server::Message::Response(response) = message else {
+                panic!("expected failed-load response, got {message:?}");
+            };
+            assert_eq!(response.id, lsp_server::RequestId::from(371));
+            assert_eq!(
+                response.error.as_ref().map(|error| error.code),
+                Some(lsp_server::ErrorCode::ContentModified as i32)
+            );
+            assert!(state.request_tokens.is_empty());
+            assert!(state.task_pool.receiver.try_recv().is_err());
+            drop(error);
+        });
+    }
+
+    #[test]
+    fn g1_native_loader_applies_bsl_and_watch_only_events_around_framed_semantics() {
+        g1_with_tracing(|| {
+            use base_db::SourceDatabase;
+
+            fn catalog_xml(uuid: &str) -> String {
+                format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <Catalog uuid="{uuid}">
+        <Properties><Name>Before</Name><CodeLength>9</CodeLength></Properties>
+    </Catalog>
+</MetaDataObject>"#
+                )
+            }
+
+            let root = tempfile::tempdir().expect("create native loader workspace");
+            let root_path = root.path().canonicalize().expect("canonical workspace root");
+            let caller = root_path.join("Caller.bsl");
+            let removed = root_path.join("Removed.bsl");
+            let configuration = root_path.join("Configuration.xml");
+            let catalog = root_path.join("Catalogs/Before.xml");
+            std::fs::create_dir_all(catalog.parent().unwrap()).unwrap();
+            let caller_text = "Процедура TargetProcedure()\nКонецПроцедуры\n\nПроцедура Caller()\n    TargetProcedure();\n    Ref = Справочники.Before.СоздатьЭлемент();\nКонецПроцедуры\n";
+            let removed_text = "Процедура ToRemove()\nКонецПроцедуры\n";
+            std::fs::write(&caller, caller_text).unwrap();
+            std::fs::write(&removed, removed_text).unwrap();
+            std::fs::write(&configuration, "<Configuration/>").unwrap();
+            std::fs::write(&catalog, catalog_xml("00000000-0000-0000-0000-000000000021")).unwrap();
+
+            let (sender, client_receiver) = crossbeam_channel::unbounded();
+            let mut state = crate::global_state::GlobalState::new(sender);
+            *state.analysis_host.raw_database_mut() =
+                ide_db::RootDatabaseImpl::new_with_salsa_events();
+            state.init_empty_source_root();
+            state
+                .set_workspace_root(root_path.clone())
+                .expect("real NotifyHandle accepts project loader config");
+
+            let initial_finish = g1_receive_loader_message(&mut state, |message| {
+                matches!(
+                    message,
+                    vfs::loader::Message::Progress {
+                        n_done: vfs::loader::LoadingProgress::Finished,
+                        ..
+                    }
+                )
+            });
+            handle_loader_msg(&mut state, initial_finish)
+                .expect("apply actual loader finish through production handler");
+            assert!(state.vfs_done, "real loader completion opens semantic readiness");
+
+            let caller_uri = lsp_types::Url::from_file_path(&caller).unwrap();
+            state.mem_docs.insert(caller_uri.clone(), caller_text.to_owned(), 1);
+            let caller_id = state
+                .vfs
+                .read()
+                .file_id(&vfs::VfsPath::new(caller.clone()))
+                .expect("real initial scan loaded caller");
+            let task_receiver = state.task_pool.receiver.clone();
+            let control = g1_framed_request_response(
+                &mut state,
+                g1_definition_request(421, caller_uri.clone()),
+                &task_receiver,
+                &client_receiver,
+            );
+            assert!(control.error.is_none(), "loaded semantic control: {control:?}");
+            let control_result = control.result.expect("loaded definition returns a location");
+            let control_location =
+                if control_result.is_array() { control_result[0].clone() } else { control_result };
+            assert_eq!(control_location["uri"], caller_uri.as_str());
+
+            let added = root_path.join("Added.bsl");
+            let added_text = "Процедура AddedProcedure()\nКонецПроцедуры\n";
+            std::fs::write(&added, added_text).expect("create watched BSL source");
+            let added_abs = paths::AbsPathBuf::assert_utf8(added.clone());
+            let added_event = g1_receive_loader_message(&mut state, |message| {
+                matches!(
+                    message,
+                    vfs::loader::Message::Changed { files }
+                        if files.iter().any(|(path, contents)| path == &added_abs
+                            && contents.as_deref() == Some(added_text.as_bytes()))
+                )
+            });
+            handle_loader_msg(&mut state, added_event)
+                .expect("apply real NotifyHandle add through production VFS path");
+            let added_id = state
+                .vfs
+                .read()
+                .file_id(&vfs::VfsPath::new(added.clone()))
+                .expect("added source receives VFS identity");
+            assert!(state.vfs.read().exists(added_id));
+            assert_eq!(&*state.analysis_host.raw_database().file_text(added_id), added_text);
+            tracing::info!(g1_marker = "native_loader_added_bsl_applied", actual_loader = true);
+
+            std::fs::remove_file(&removed).expect("delete watched BSL source");
+            let removed_abs = paths::AbsPathBuf::assert_utf8(removed.clone());
+            let pending_deletion = g1_receive_loader_message(&mut state, |message| {
+                matches!(
+                    message,
+                    vfs::loader::Message::Changed { files }
+                        if files.iter().any(|(path, contents)| path == &removed_abs
+                            && contents.is_none())
+                )
+            });
+            let during_loader_work = g1_framed_request_response(
+                &mut state,
+                g1_definition_request(422, caller_uri.clone()),
+                &task_receiver,
+                &client_receiver,
+            );
+            assert!(
+                during_loader_work.error.is_none(),
+                "semantic response while received deletion awaits VFS application: {during_loader_work:?}"
+            );
+            let during_result = during_loader_work
+                .result
+                .expect("semantic request has a positive result during loader work");
+            let during_location =
+                if during_result.is_array() { &during_result[0] } else { &during_result };
+            assert_eq!(during_location, &control_location);
+            tracing::info!(
+                g1_marker = "framed_semantic_response_with_native_deletion_received_not_applied",
+                semantic_parity = true
+            );
+
+            handle_loader_msg(&mut state, pending_deletion)
+                .expect("apply real NotifyHandle delete through production VFS path");
+            assert!(!state.vfs.read().exists(
+                state
+                    .vfs
+                    .read()
+                    .file_id(&vfs::VfsPath::new(removed.clone()))
+                    .expect("deleted source retains its VFS identity")
+            ));
+            tracing::info!(g1_marker = "native_loader_deleted_bsl_applied", actual_loader = true);
+
+            let old_catalog = state
+                .analysis_host
+                .raw_database()
+                .resolve_metadata_object_for_file(
+                    caller_id,
+                    bsl_metadata::MdoType::Catalog,
+                    "Before",
+                )
+                .expect("actual initial watch-only XML registered metadata");
+            let updated_catalog_text = catalog_xml("00000000-0000-0000-0000-000000000022");
+            std::fs::write(&catalog, &updated_catalog_text).expect("update watched XML");
+            handle_notification(
+                &mut state,
+                Notification::new(
+                    "workspace/didChangeWatchedFiles".to_owned(),
+                    serde_json::json!({
+                        "changes": [{
+                            "uri": lsp_types::Url::from_file_path(&catalog).unwrap(),
+                            "type": 2
+                        }]
+                    }),
+                ),
+            )
+            .expect("route standard watched-files event through real NotifyHandle");
+            let catalog_abs = paths::AbsPathBuf::assert_utf8(catalog.clone());
+            let watch_only_event = g1_receive_loader_message(&mut state, |message| {
+                matches!(
+                    message,
+                    vfs::loader::Message::WatchOnly { files }
+                        if files.iter().any(|path| path == &catalog_abs)
+                )
+            });
+            handle_loader_msg(&mut state, watch_only_event)
+                .expect("apply real native WatchOnly event through production handler");
+            let new_catalog = state
+                .analysis_host
+                .raw_database()
+                .resolve_metadata_object_for_file(
+                    caller_id,
+                    bsl_metadata::MdoType::Catalog,
+                    "Before",
+                )
+                .expect("actual WatchOnly update refreshes semantic metadata");
+            assert_ne!(old_catalog.uuid, new_catalog.uuid);
+            assert_eq!(
+                new_catalog.uuid.unwrap().to_string(),
+                "00000000-0000-0000-0000-000000000022"
+            );
+            tracing::info!(
+                g1_marker = "native_watch_only_xml_uuid_applied",
+                standard_notification_routed = true,
+                semantic_metadata_changed = true
+            );
+            g1_wait_for_task_pool_quiescence(&mut state, &task_receiver);
+        });
+    }
+
+    #[test]
+    fn g1_watch_only_atomic_config_and_active_batch_keep_definition_available() {
+        g1_with_tracing(|| {
+            use base_db::SourceDatabase;
+            use parking_lot::Mutex;
+            use std::sync::Arc;
+
+            #[derive(Debug)]
+            struct RecordingLoader(Arc<Mutex<Vec<paths::AbsPathBuf>>>);
+            impl vfs::loader::Handle for RecordingLoader {
+                fn spawn(_sender: vfs::loader::Sender) -> Self
+                where
+                    Self: Sized,
+                {
+                    unreachable!("injected loader")
+                }
+                fn set_config(&mut self, _config: vfs::loader::Config) {}
+                fn invalidate(&mut self, path: paths::AbsPathBuf) {
+                    self.0.lock().push(path);
+                }
+                fn load_sync(&mut self, _path: &paths::AbsPath) -> Option<Vec<u8>> {
+                    None
+                }
+            }
+
+            fn catalog_xml(name: &str, uuid: &str) -> String {
+                format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <Catalog uuid="{uuid}">
+        <Properties><Name>{name}</Name><CodeLength>9</CodeLength></Properties>
+    </Catalog>
+</MetaDataObject>"#
+                )
+            }
+
+            struct ReleaseBatchOnDrop {
+                receiver: crossbeam_channel::Receiver<Task>,
+                wait_for_completion: bool,
+            }
+            impl Drop for ReleaseBatchOnDrop {
+                fn drop(&mut self) {
+                    crate::handlers::workspace_batch::g1_batch_barrier(false);
+                    if self.wait_for_completion {
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(10);
+                        loop {
+                            let remaining =
+                                deadline.saturating_duration_since(std::time::Instant::now());
+                            match self.receiver.recv_timeout(remaining) {
+                                Ok(Task::WorkspaceBatchChunk { .. }) => break,
+                                Ok(_) => continue,
+                                Err(error) => {
+                                    tracing::error!(
+                                        g1_marker = "batch_cleanup_wait_failed",
+                                        error = %error,
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let root = tempfile::tempdir().unwrap();
+            let caller = root.path().join("Caller.bsl");
+            let batch_file = root.path().join("Batch.bsl");
+            let catalog_dir = root.path().join("Catalogs");
+            std::fs::create_dir_all(&catalog_dir).unwrap();
+            let caller_text = "Процедура TargetProcedure()\nКонецПроцедуры\n\nПроцедура Caller()\n    TargetProcedure();\n    Ref = Справочники.Before.СоздатьЭлемент();\n    Сообщить(Ref);\n    Справочники.Before.\nКонецПроцедуры\n";
+            let batch_text = "Процедура BatchProcedure()\nКонецПроцедуры\n";
+            let writer_path = root.path().join("Writer.bsl");
+            let writer_text = "Процедура WriterProcedure()\nКонецПроцедуры\n";
+            std::fs::write(&caller, caller_text).unwrap();
+            std::fs::write(&batch_file, batch_text).unwrap();
+            std::fs::write(&writer_path, writer_text).unwrap();
+            std::fs::write(root.path().join("Configuration.xml"), "<Configuration/>").unwrap();
+            let catalog_path = catalog_dir.join("Before.xml");
+            std::fs::write(
+                &catalog_path,
+                catalog_xml("Before", "00000000-0000-0000-0000-000000000011"),
+            )
+            .unwrap();
+            let config_path = root.path().join("bsl-analyzer.toml");
+            std::fs::write(
+                &config_path,
+                "[source]\nroot = \".\"\n\n[features]\nworkspaceDiagnostics = \"all\"\n",
+            )
+            .unwrap();
+
+            let (sender, client_receiver) = crossbeam_channel::unbounded();
+            let (loader_sender, loader_receiver) = crossbeam_channel::bounded(4);
+            let loader_receiver_test = loader_receiver.clone();
+            let invalidated_paths = Arc::new(Mutex::new(Vec::new()));
+            let mut state = crate::global_state::GlobalState::with_loader(
+                sender,
+                Box::new(RecordingLoader(Arc::clone(&invalidated_paths))),
+                loader_receiver,
+            );
+            *state.analysis_host.raw_database_mut() =
+                ide_db::RootDatabaseImpl::new_with_salsa_events();
+            state.init_empty_source_root();
+            state.set_workspace_root(root.path().to_path_buf()).expect("valid loaded workspace");
+            let mut release_batch_on_drop = ReleaseBatchOnDrop {
+                receiver: state.task_pool.receiver.clone(),
+                wait_for_completion: false,
+            };
+            let abs = |path: &std::path::Path| paths::AbsPathBuf::assert_utf8(path.to_path_buf());
+            handle_loader_msg(
+                &mut state,
+                vfs::loader::Message::Loaded {
+                    files: vec![
+                        (abs(&caller), Some(caller_text.as_bytes().to_vec())),
+                        (abs(&batch_file), Some(batch_text.as_bytes().to_vec())),
+                        (abs(&writer_path), Some(writer_text.as_bytes().to_vec())),
+                    ],
+                },
+            )
+            .unwrap();
+            handle_loader_msg(
+                &mut state,
+                vfs::loader::Message::WatchOnly {
+                    files: vec![abs(&catalog_path), abs(&root.path().join("Configuration.xml"))],
+                },
+            )
+            .unwrap();
+            let catalog_id =
+                state.vfs.read().file_id(&vfs::VfsPath::new(catalog_path.clone())).unwrap();
+            let initial_config_version = state.vfs_progress_config_version;
+            handle_loader_msg(
+                &mut state,
+                vfs::loader::Message::Progress {
+                    n_total: 2,
+                    n_done: vfs::loader::LoadingProgress::Started,
+                    dir: None,
+                    config_version: initial_config_version,
+                },
+            )
+            .unwrap();
+            handle_loader_msg(
+                &mut state,
+                vfs::loader::Message::Progress {
+                    n_total: 2,
+                    n_done: vfs::loader::LoadingProgress::Progress(2),
+                    dir: None,
+                    config_version: initial_config_version,
+                },
+            )
+            .unwrap();
+            handle_loader_msg(
+                &mut state,
+                vfs::loader::Message::Progress {
+                    n_total: 2,
+                    n_done: vfs::loader::LoadingProgress::Finished,
+                    dir: None,
+                    config_version: initial_config_version,
+                },
+            )
+            .unwrap();
+            assert!(state.vfs_done);
+            assert_eq!(
+                state.project.as_ref().unwrap().config.features.workspace_diagnostics,
+                project_model::WorkspaceDiagnosticsScope::All
+            );
+            tracing::info!(g1_marker = "loaded_ready", started_progress_finished = true);
+
+            state.mem_docs.insert(
+                lsp_types::Url::from_file_path(&caller).unwrap(),
+                caller_text.to_owned(),
+                1,
+            );
+            let caller_id = state.vfs.read().file_id(&vfs::VfsPath::new(caller.clone())).unwrap();
+            let control_receiver = state.task_pool.receiver.clone();
+            let control = g1_framed_request_response(
+                &mut state,
+                g1_definition_request(401, lsp_types::Url::from_file_path(&caller).unwrap()),
+                &control_receiver,
+                &client_receiver,
+            );
+            assert!(control.error.is_none(), "loaded definition control failed: {control:?}");
+            let control_result = control.result.expect("loaded control resolves a definition");
+            let control_location =
+                if control_result.is_array() { control_result[0].clone() } else { control_result };
+            assert_eq!(
+                control_location["uri"],
+                lsp_types::Url::from_file_path(&caller).unwrap().as_str()
+            );
+            assert_eq!(control_location["range"]["start"]["line"], 0);
+
+            let caller_uri = lsp_types::Url::from_file_path(&caller).unwrap();
+            let position_params = |position: lsp_types::Position| {
+                serde_json::json!({
+                    "textDocument": {"uri": caller_uri},
+                    "position": position,
+                })
+            };
+            let hover_control = g1_framed_request_response(
+                &mut state,
+                g1_json_request(
+                    406,
+                    lsp_types::request::HoverRequest::METHOD,
+                    position_params(lsp_types::Position { line: 4, character: 8 }),
+                ),
+                &control_receiver,
+                &client_receiver,
+            )
+            .result
+            .expect("hover control has a semantic result");
+            assert!(hover_control["contents"].is_object() || hover_control["contents"].is_string());
+
+            let first_package_text =
+                "Процедура WriterProcedure()\n    Значение = 1;\nКонецПроцедуры\n";
+            std::fs::write(&writer_path, first_package_text).unwrap();
+            loader_sender
+                .send(vfs::loader::Message::Changed {
+                    files: vec![(abs(&writer_path), Some(first_package_text.as_bytes().to_vec()))],
+                })
+                .unwrap();
+            let first_package = loader_receiver_test
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("first production loader package is queued");
+            assert!(matches!(first_package, vfs::loader::Message::Changed { .. }));
+            handle_loader_msg(&mut state, first_package).unwrap();
+            let second_package_text =
+                "Процедура BatchProcedure()\n    Значение = 2;\nКонецПроцедуры\n";
+            std::fs::write(&batch_file, second_package_text).unwrap();
+            loader_sender
+                .send(vfs::loader::Message::Changed {
+                    files: vec![(abs(&batch_file), Some(second_package_text.as_bytes().to_vec()))],
+                })
+                .unwrap();
+            let between_packages = g1_framed_request_response(
+                &mut state,
+                g1_definition_request(414, caller_uri.clone()),
+                &control_receiver,
+                &client_receiver,
+            );
+            assert!(between_packages.error.is_none());
+            let between_result =
+                between_packages.result.expect("semantic response between packages");
+            let between_location =
+                if between_result.is_array() { &between_result[0] } else { &between_result };
+            assert_eq!(between_location, &control_location);
+            assert_eq!(loader_receiver_test.len(), 1, "second real loader package remains pending");
+            tracing::info!(
+                g1_marker = "semantic_response_between_loader_packages",
+                first_package_applied = true,
+                second_package_pending = true,
+                semantic_parity = true
+            );
+            let second_package = loader_receiver_test
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("second production loader package remains available after the request");
+            handle_loader_msg(&mut state, second_package).unwrap();
+            let batch_file_id =
+                state.vfs.read().file_id(&vfs::VfsPath::new(batch_file.clone())).unwrap();
+            assert_eq!(
+                &*state.analysis_host.raw_database().file_text(batch_file_id),
+                second_package_text,
+                "the second queued loader package applies after the semantic response"
+            );
+            tracing::info!(g1_marker = "second_loader_package_applied", actual_vfs_text = true);
+
+            let type_position = g1_position(caller_text, 6, "Ref", false);
+            let type_definition_control = g1_framed_request_response(
+                &mut state,
+                g1_json_request(
+                    407,
+                    lsp_types::request::GotoTypeDefinition::METHOD,
+                    position_params(type_position),
+                ),
+                &control_receiver,
+                &client_receiver,
+            )
+            .result
+            .expect("type-definition control has a target");
+            let type_location = if type_definition_control.is_array() {
+                type_definition_control[0].clone()
+            } else {
+                type_definition_control.clone()
+            };
+            assert_eq!(
+                type_location["uri"],
+                lsp_types::Url::from_file_path(&catalog_path).unwrap().as_str()
+            );
+
+            let completion_position = g1_position(caller_text, 7, "Справочники.Before.", true);
+            let completion_control = g1_framed_request_response(
+                &mut state,
+                g1_json_request(
+                    408,
+                    lsp_types::request::Completion::METHOD,
+                    position_params(completion_position),
+                ),
+                &control_receiver,
+                &client_receiver,
+            )
+            .result
+            .expect("completion control has a response");
+            let completion_items = if completion_control.is_array() {
+                &completion_control
+            } else {
+                &completion_control["items"]
+            };
+            assert!(completion_items.as_array().is_some_and(|items| !items.is_empty()));
+
+            let before = state
+                .analysis_host
+                .raw_database()
+                .resolve_metadata_object_for_file(
+                    caller_id,
+                    bsl_metadata::MdoType::Catalog,
+                    "Before",
+                )
+                .expect("initial watch-only XML resolves through the loaded workspace");
+            assert!(before.uuid.is_some(), "initial metadata object retains its UUID");
+
+            let updated_catalog_text =
+                catalog_xml("Before", "00000000-0000-0000-0000-000000000012");
+            std::fs::write(&catalog_path, &updated_catalog_text).unwrap();
+            handle_notification(
+            &mut state,
+            Notification::new(
+                "workspace/didChangeWatchedFiles".to_owned(),
+                serde_json::json!({"changes":[{"uri":lsp_types::Url::from_file_path(&catalog_path).unwrap(),"type":2}]}),
+            ),
+        )
+        .unwrap();
+            assert_eq!(
+                state.vfs.read().file_id(&vfs::VfsPath::new(catalog_path.clone())),
+                Some(catalog_id),
+            );
+            assert_eq!(
+                invalidated_paths.lock().as_slice(),
+                &[abs(&catalog_path)],
+                "the standard watched-files notification routes the local XML path"
+            );
+            tracing::info!(
+                g1_marker = "watched_files_notification_routed",
+                native_watch_only_event_follows = true
+            );
+
+            handle_loader_msg(
+                &mut state,
+                vfs::loader::Message::WatchOnly { files: vec![abs(&catalog_path)] },
+            )
+            .unwrap();
+            assert_eq!(
+                state.vfs.read().file_id(&vfs::VfsPath::new(catalog_path.clone())),
+                Some(catalog_id),
+            );
+            let after = state
+                .analysis_host
+                .raw_database()
+                .resolve_metadata_object_for_file(
+                    caller_id,
+                    bsl_metadata::MdoType::Catalog,
+                    "Before",
+                )
+                .expect("production WatchOnly handler refreshes changed XML");
+            assert!(after.uuid.is_some());
+            assert_ne!(
+                before.uuid, after.uuid,
+                "WatchOnly update must refresh changed XML content"
+            );
+            tracing::info!(
+                g1_marker = "watched_xml_applied",
+                notification_routed = true,
+                native_watch_only_semantics = true
+            );
+            let response_receiver = state.task_pool.receiver.clone();
+            RequestDispatcher {
+                req: Some(g1_definition_request(
+                    402,
+                    lsp_types::Url::from_file_path(&caller).unwrap(),
+                )),
+                global_state: &mut state,
+            }
+            .on_latency::<lsp_types::request::GotoDefinition>(g1_definition)
+            .finish();
+            let response = g1_wait_for_result(
+                &mut state,
+                &response_receiver,
+                &client_receiver,
+                lsp_server::RequestId::from(402),
+            );
+            assert!(
+                response.error.is_none(),
+                "definition after WatchOnly update failed: {response:?}"
+            );
+            let result = response.result.expect("definition after WatchOnly resolves");
+            let location = if result.is_array() { &result[0] } else { &result };
+            assert_eq!(location, &control_location);
+            tracing::info!(
+                g1_marker = "watch_only_live_update",
+                semantic_result_matches_control = true
+            );
+
+            let retried_definition = g1_cancel_then_retry::<lsp_types::request::GotoDefinition>(
+                &mut state,
+                g1_definition_request(409, caller_uri.clone()),
+                g1_definition_waiting_for_vfs_write,
+                &writer_path,
+                "Процедура WriterProcedure()\n// phase 1\nКонецПроцедуры\n",
+                &client_receiver,
+            );
+            let retried_definition = if retried_definition.is_array() {
+                retried_definition[0].clone()
+            } else {
+                retried_definition
+            };
+            assert_eq!(retried_definition, control_location);
+            tracing::info!(
+                g1_marker = "allowlisted_retry_parity",
+                method = "definition",
+                matches_control = true
+            );
+
+            let retried_hover = g1_cancel_then_retry::<lsp_types::request::HoverRequest>(
+                &mut state,
+                g1_json_request(
+                    410,
+                    lsp_types::request::HoverRequest::METHOD,
+                    position_params(lsp_types::Position { line: 4, character: 8 }),
+                ),
+                g1_hover_waiting_for_vfs_write,
+                &writer_path,
+                "Процедура WriterProcedure()\n// phase 2\nКонецПроцедуры\n",
+                &client_receiver,
+            );
+            assert_eq!(retried_hover, hover_control);
+            tracing::info!(
+                g1_marker = "allowlisted_retry_parity",
+                method = "hover",
+                matches_control = true
+            );
+
+            let retried_type_definition =
+                g1_cancel_then_retry::<lsp_types::request::GotoTypeDefinition>(
+                    &mut state,
+                    g1_json_request(
+                        411,
+                        lsp_types::request::GotoTypeDefinition::METHOD,
+                        position_params(type_position),
+                    ),
+                    g1_type_definition_waiting_for_vfs_write,
+                    &writer_path,
+                    "Процедура WriterProcedure()\n// phase 3\nКонецПроцедуры\n",
+                    &client_receiver,
+                );
+            assert_eq!(retried_type_definition, type_definition_control);
+            tracing::info!(
+                g1_marker = "allowlisted_retry_parity",
+                method = "typeDefinition",
+                matches_control = true
+            );
+
+            let retried_completion = g1_cancel_then_retry::<lsp_types::request::Completion>(
+                &mut state,
+                g1_json_request(
+                    412,
+                    lsp_types::request::Completion::METHOD,
+                    position_params(completion_position),
+                ),
+                g1_completion_waiting_for_vfs_write,
+                &writer_path,
+                "Процедура WriterProcedure()\n// phase 4\nКонецПроцедуры\n",
+                &client_receiver,
+            );
+            assert_eq!(retried_completion, completion_control);
+            tracing::info!(
+                g1_marker = "allowlisted_retry_parity",
+                method = "completion",
+                matches_control = true
+            );
+
+            let exhausted = g1_three_real_writer_attempts(
+                &mut state,
+                g1_definition_request(413, caller_uri.clone()),
+                &writer_path,
+                &client_receiver,
+            );
+            assert_eq!(
+                exhausted.error.as_ref().map(|error| error.code),
+                Some(lsp_server::ErrorCode::ContentModified as i32)
+            );
+            assert_eq!(
+                exhausted.error.as_ref().map(|error| error.message.as_str()),
+                Some("content modified: retry limit exhausted")
+            );
+            assert!(exhausted.result.is_none());
+            assert!(
+                client_receiver.try_iter().all(|message| {
+                    !matches!(message, Message::Response(response) if response.id == exhausted.id)
+                }),
+                "retry exhaustion produces exactly one response for the original id"
+            );
+            tracing::info!(
+                g1_marker = "three_real_writes_exhaust_attempt_budget",
+                attempts = 3,
+                retries = 2,
+                terminal_code = "ContentModified",
+                exactly_one_response = true
+            );
+
+            assert!(state.workspace_batch_dirty, "finalize must arm the real batch");
+            let available_worker_budget = state.task_pool.pool.capacity().unwrap_or(0) / 4;
+            assert!(
+                available_worker_budget >= 2,
+                "batch overlap requires the original multi-worker pool, not the capacity probe"
+            );
+            tracing::info!(
+                g1_marker = "batch_overlap_worker_budget",
+                available_workers_at_least = available_worker_budget,
+                task_queue_capacity = state.task_pool.pool.capacity().unwrap_or(0)
+            );
+            crate::handlers::workspace_batch::g1_batch_barrier(true);
+            crate::handlers::spawn_workspace_batch(&mut state);
+            release_batch_on_drop.wait_for_completion = true;
+            assert!(state.workspace_batch_in_flight, "production spawn must mark the batch active");
+            assert!(state.workspace_batch_plan.is_some(), "production spawn builds a real plan");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !crate::handlers::workspace_batch::g1_batch_entered() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "batch worker did not hit test barrier"
+                );
+                std::thread::yield_now();
+            }
+            assert!(crate::handlers::workspace_batch::g1_batch_is_paused());
+            tracing::info!(g1_marker = "workspace_batch_worker_active", in_flight = true);
+
+            let batch_cancel_baseline = state
+                .analysis_host
+                .raw_database()
+                .salsa_event_global()
+                .expect("G1 test uses event-enabled Salsa DB")
+                .set_cancellation;
+            let initial_plan = state.workspace_batch_plan.as_ref().unwrap();
+            let initial_generation = initial_plan.generation;
+            let initial_chunk = initial_plan.next_chunk;
+            tracing::info!(
+                g1_marker = "workspace_batch_progress",
+                generation = initial_plan.generation,
+                next_chunk = initial_plan.next_chunk,
+                total_chunks = initial_plan.num_chunks,
+                outstanding_files = initial_plan.file_ids.len(),
+            );
+
+            let changed_batch_text =
+                "Процедура BatchProcedure()\n    Значение = 42;\nКонецПроцедуры\n";
+            std::fs::write(&batch_file, changed_batch_text).unwrap();
+            handle_loader_msg(
+                &mut state,
+                vfs::loader::Message::Changed {
+                    files: vec![(abs(&batch_file), Some(changed_batch_text.as_bytes().to_vec()))],
+                },
+            )
+            .unwrap();
+            let cancelled_at = crate::handlers::workspace_batch::g1_batch_cancel_observed();
+            assert!(
+                cancelled_at > batch_cancel_baseline,
+                "live writer reached the Salsa checkpoint"
+            );
+            let batch_file_id =
+                state.vfs.read().file_id(&vfs::VfsPath::new(batch_file.clone())).unwrap();
+            assert_eq!(
+                &*state.analysis_host.raw_database().file_text(batch_file_id),
+                changed_batch_text,
+                "the live Changed writer applied the new Salsa text"
+            );
+            assert!(state.workspace_batch_in_flight, "writer returned after the worker dropped its snapshot, before event-loop task handling");
+            tracing::info!(
+                g1_marker = "batch_writer_applied_live_contents",
+                salsa_cancel_baseline = batch_cancel_baseline,
+                salsa_cancel_observed = cancelled_at,
+                text_matches_disk = true,
+                worker_task_pending = true,
+            );
+
+            let cancelled_task = loop {
+                let task = state
+                    .task_pool
+                    .receiver
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("cancelled batch task timed out");
+                match &task {
+                    Task::WorkspaceBatchChunk {
+                        generation,
+                        outcome: crate::global_state::WorkspaceBatchOutcome::Cancelled,
+                    } => {
+                        assert_eq!(*generation, initial_generation);
+                        break task;
+                    }
+                    _ => handle_task(&mut state, task).unwrap(),
+                }
+            };
+            handle_task(&mut state, cancelled_task).unwrap();
+            release_batch_on_drop.wait_for_completion = false;
+            assert!(!state.workspace_batch_in_flight);
+            assert!(state.workspace_batch_plan.is_some(), "cancelled chunk stays on its real plan");
+            assert_eq!(state.workspace_batch_plan.as_ref().unwrap().next_chunk, initial_chunk);
+            tracing::info!(
+                g1_marker = "cancelled_batch_task_handled",
+                same_chunk_retained = true,
+                in_flight = false,
+            );
+
+            crate::handlers::workspace_batch::g1_batch_barrier(true);
+            crate::handlers::spawn_workspace_batch(&mut state);
+            release_batch_on_drop.wait_for_completion = true;
+            assert!(
+                state.workspace_batch_in_flight,
+                "production scheduler restarts the real batch"
+            );
+            let restarted_generation = state.workspace_batch_plan.as_ref().unwrap().generation;
+            assert_eq!(restarted_generation, initial_generation);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !crate::handlers::workspace_batch::g1_batch_entered() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "restarted batch worker did not hit checkpoint"
+                );
+                std::thread::yield_now();
+            }
+            let plan = state.workspace_batch_plan.as_ref().unwrap();
+            let outstanding_files = plan.file_ids.len() - plan.next_chunk * plan.chunk_size;
+            assert!(outstanding_files > 0);
+            assert!(crate::handlers::workspace_batch::g1_batch_is_paused());
+            tracing::info!(
+                g1_marker = "workspace_batch_restarted_active",
+                generation = restarted_generation,
+                next_chunk = plan.next_chunk,
+                total_chunks = plan.num_chunks,
+                outstanding_files,
+            );
+
+            let active_receiver = state.task_pool.receiver.clone();
+            let active_response = g1_framed_request_response(
+                &mut state,
+                g1_definition_request(403, lsp_types::Url::from_file_path(&caller).unwrap()),
+                &active_receiver,
+                &client_receiver,
+            );
+            assert!(crate::handlers::workspace_batch::g1_batch_is_paused());
+            assert!(state.workspace_batch_in_flight);
+            assert!(state.vfs_done);
+            assert_eq!(
+                &*state.analysis_host.raw_database().file_text(batch_file_id),
+                changed_batch_text,
+                "the changed VFS contents stay applied through the framed response"
+            );
+            assert!(
+                active_response.error.is_none(),
+                "framed semantic request failed: {active_response:?}"
+            );
+            let active_result = active_response.result.expect("framed definition returns a result");
+            let active_location =
+                if active_result.is_array() { &active_result[0] } else { &active_result };
+            assert_eq!(active_location, &control_location);
+            let plan = state.workspace_batch_plan.as_ref().unwrap();
+            assert!(plan.next_chunk < plan.num_chunks, "batch work remains at framed response");
+            tracing::info!(
+                g1_marker = "framed_semantic_parity_with_outstanding_batch",
+                matches_control = true,
+                batch_in_flight = state.workspace_batch_in_flight,
+                worker_paused = crate::handlers::workspace_batch::g1_batch_is_paused(),
+                writer_contents_live = true,
+                next_chunk = plan.next_chunk,
+                total_chunks = plan.num_chunks,
+                outstanding_files,
+            );
+
+            crate::handlers::workspace_batch::g1_batch_barrier(false);
+            let mut batch_publish_counts = std::collections::HashMap::<String, usize>::new();
+            while state.workspace_batch_plan.is_some() {
+                if !state.workspace_batch_in_flight {
+                    crate::handlers::spawn_workspace_batch(&mut state);
+                }
+                let task = state
+                    .task_pool
+                    .receiver
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("active batch completion task timed out");
+                let completed_chunk = matches!(task, Task::WorkspaceBatchChunk { .. });
+                handle_task(&mut state, task).unwrap();
+                if completed_chunk {
+                    tracing::info!(
+                        g1_marker = "workspace_batch_chunk_completed",
+                        plan_still_active = state.workspace_batch_plan.is_some()
+                    );
+                }
+                while let Ok(message) = client_receiver.try_recv() {
+                    if let Message::Notification(notification) = message {
+                        if notification.method == "textDocument/publishDiagnostics" {
+                            let params: lsp_types::PublishDiagnosticsParams =
+                                serde_json::from_value(notification.params).unwrap();
+                            *batch_publish_counts.entry(params.uri.to_string()).or_default() += 1;
+                        }
+                    }
+                }
+            }
+            release_batch_on_drop.wait_for_completion = false;
+            assert!(!state.workspace_batch_in_flight);
+            assert!(
+                batch_publish_counts.values().all(|count| *count <= 1),
+                "one live batch must not publish diagnostics twice for a URI: {batch_publish_counts:?}"
+            );
+            tracing::info!(
+                g1_marker = "workspace_batch_single_publication_per_uri",
+                published_uris = batch_publish_counts.len(),
+                max_publications = batch_publish_counts.values().copied().max().unwrap_or(0),
+            );
+            tracing::info!(g1_marker = "workspace_batch_final_release", completed = true);
+
+            let reload_receiver = state.task_pool.receiver.clone();
+            RequestDispatcher {
+                req: Some(g1_definition_request(
+                    405,
+                    lsp_types::Url::from_file_path(&caller).unwrap(),
+                )),
+                global_state: &mut state,
+            }
+            .on_retryable_latency::<lsp_types::request::GotoDefinition>(g1_definition)
+            .finish();
+            let request_id = lsp_server::RequestId::from(405);
+            let origin = state.request_lifecycles[&request_id]
+                .origin
+                .clone()
+                .expect("open-document retry captures a source origin");
+
+            let new_config =
+                "[source]\nroot = \".\"\n\n[features]\nworkspaceDiagnostics = \"off\"\n";
+            let old_workspace_root = state.workspace_root.clone();
+            let old_source_roots = state.project.as_ref().unwrap().source_roots();
+            let temporary_config = root.path().join("bsl-analyzer.toml.next");
+            std::fs::write(&temporary_config, new_config).unwrap();
+            std::fs::rename(&temporary_config, &config_path).unwrap();
+            handle_loader_msg(
+                &mut state,
+                vfs::loader::Message::Changed {
+                    files: vec![(abs(&config_path), Some(new_config.as_bytes().to_vec()))],
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                state.project.as_ref().unwrap().config.features.workspace_diagnostics,
+                project_model::WorkspaceDiagnosticsScope::Off
+            );
+            let reloaded_source_roots = state.project.as_ref().unwrap().source_roots();
+            assert_eq!(state.workspace_root, old_workspace_root);
+            assert_eq!(reloaded_source_roots, old_source_roots);
+            assert!(request_origin_matches(&state, &origin));
+            tracing::info!(g1_marker = "config_only_reload_preserves_request_origin");
+            assert!(state.vfs_done, "atomic live config reload must preserve readiness");
+            let reload_config_version = state.vfs_progress_config_version;
+            handle_loader_msg(
+                &mut state,
+                vfs::loader::Message::Progress {
+                    n_total: 2,
+                    n_done: vfs::loader::LoadingProgress::Started,
+                    dir: None,
+                    config_version: reload_config_version,
+                },
+            )
+            .unwrap();
+            handle_loader_msg(
+                &mut state,
+                vfs::loader::Message::Progress {
+                    n_total: 2,
+                    n_done: vfs::loader::LoadingProgress::Progress(2),
+                    dir: None,
+                    config_version: reload_config_version,
+                },
+            )
+            .unwrap();
+            handle_loader_msg(
+                &mut state,
+                vfs::loader::Message::Progress {
+                    n_total: 2,
+                    n_done: vfs::loader::LoadingProgress::Finished,
+                    dir: None,
+                    config_version: reload_config_version,
+                },
+            )
+            .unwrap();
+            assert!(state.vfs_done, "finished live reload must keep ready open");
+            tracing::info!(g1_marker = "atomic_config_reload_ready", scope = "off", ready = true);
+
+            let final_response =
+                g1_wait_for_result(&mut state, &reload_receiver, &client_receiver, request_id);
+            assert!(
+                final_response.error.is_none(),
+                "post-reload definition failed: {final_response:?}"
+            );
+            let final_result = final_response.result.expect("post-reload definition resolves");
+            let final_location =
+                if final_result.is_array() { &final_result[0] } else { &final_result };
+            assert_eq!(final_location, &control_location);
+            tracing::info!(g1_marker = "post_reload_definition", matches_control = true);
+            g1_wait_for_task_pool_quiescence(&mut state, &reload_receiver);
+        });
+    }
+
+    #[test]
+    fn g1_retry_limit_and_origin_guard_are_terminal() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let mut state = crate::global_state::GlobalState::new(sender);
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("Caller.bsl");
+        std::fs::write(&path, "Процедура X() КонецПроцедуры").unwrap();
+        state.workspace_root = Some(root.path().to_path_buf());
+        state.project = Some(project_model::Project::new(root.path()).unwrap());
+        let uri = lsp_types::Url::from_file_path(path).unwrap();
+        state.mem_docs.insert(uri.clone(), "Процедура X() КонецПроцедуры".to_owned(), 4);
+        let origin = crate::global_state::RequestOriginGuard {
+            uri: uri.clone(),
+            identity: state.mem_docs.identity(&uri).unwrap(),
+            workspace_root: state.workspace_root.clone(),
+            source_roots: state.project.as_ref().unwrap().source_roots(),
+        };
+        let id = lsp_server::RequestId::from(601);
+        let request = g1_definition_request(601, uri.clone());
+        let request_key = |attempt| crate::global_state::RequestAttemptKey {
+            id: id.clone(),
+            generation: 19,
+            attempt,
+        };
+        state.request_lifecycles.insert(
+            id.clone(),
+            crate::global_state::RequestLifecycle {
+                generation: 19,
+                method: lsp_types::request::GotoDefinition::METHOD.to_owned(),
+                request: Some(request),
+                attempt: 1,
+                phase: RequestLifecyclePhase::Running,
+                retry_origin_revision: None,
+                retry_eligible: true,
+                origin: Some(origin.clone()),
+                client_cancelled: false,
+            },
+        );
+
+        let revision = salsa::plumbing::current_revision(state.analysis_host.raw_database());
+        let mut queued = 0;
+        for attempt in 1..=3 {
+            let key = request_key(attempt);
+            assert!(request_origin_matches(&state, &origin));
+            let accepted = queue_latency_retry(
+                &mut state,
+                &key,
+                lsp_types::request::GotoDefinition::METHOD,
+                "test-attempt-budget",
+                revision,
+                revision,
+                false,
+            );
+            if attempt < MAX_LATENCY_ATTEMPTS {
+                assert_eq!(
+                    accepted,
+                    RetryQueueResult::Queued,
+                    "attempts one and two may queue a fresh context"
+                );
+                queued += 1;
+                let retry = state.pending_latency_retries.pop_front().unwrap();
+                assert_eq!(retry, request_key(attempt + 1));
+                let lifecycle = state.request_lifecycles.get_mut(&id).unwrap();
+                lifecycle.attempt = attempt + 1;
+                lifecycle.phase = RequestLifecyclePhase::Running;
+            } else {
+                assert_eq!(
+                    accepted,
+                    RetryQueueResult::Refused(RetryRefusal::AttemptLimit),
+                    "attempt three must be terminal"
+                );
+                finish_latency_request(
+                    &mut state,
+                    &key,
+                    Response::new_err(
+                        id.clone(),
+                        lsp_server::ErrorCode::ContentModified as i32,
+                        RetryRefusal::AttemptLimit.message().to_owned(),
+                    ),
+                );
+            }
+        }
+        assert_eq!(queued, 2);
+        assert!(state.request_lifecycles.is_empty());
+        let Message::Response(response) = receiver.try_recv().unwrap() else {
+            panic!("retry exhaustion emits an LSP response");
+        };
+        assert_eq!(response.id, id);
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
+            Some(lsp_server::ErrorCode::ContentModified as i32)
+        );
+        assert!(receiver.try_recv().is_err(), "only one terminal response is sent");
+
+        let reopened_id = lsp_server::RequestId::from(602);
+        let retained_request = g1_definition_request(602, uri.clone());
+        let stale_origin = crate::global_state::RequestOriginGuard {
+            identity: state.mem_docs.identity(&uri).unwrap(),
+            ..origin.clone()
+        };
+        state.request_lifecycles.insert(
+            reopened_id.clone(),
+            crate::global_state::RequestLifecycle {
+                generation: 20,
+                method: lsp_types::request::GotoDefinition::METHOD.to_owned(),
+                request: Some(retained_request),
+                attempt: 1,
+                phase: RequestLifecyclePhase::Running,
+                retry_origin_revision: None,
+                retry_eligible: true,
+                origin: Some(stale_origin.clone()),
+                client_cancelled: false,
+            },
+        );
+        let previous_identity = state.mem_docs.identity(&uri).unwrap();
+        state.mem_docs.remove(&uri);
+        state.mem_docs.insert(uri.clone(), "Процедура X() КонецПроцедуры".to_owned(), 4);
+        assert_ne!(state.mem_docs.identity(&uri), Some(previous_identity));
+        assert!(
+            !request_origin_matches(&state, &stale_origin),
+            "same-text, same-version close/reopen changes the document incarnation"
+        );
+        let reopened_key = crate::global_state::RequestAttemptKey {
+            id: reopened_id.clone(),
+            generation: 20,
+            attempt: 1,
+        };
+        assert_eq!(
+            queue_latency_retry(
+                &mut state,
+                &reopened_key,
+                lsp_types::request::GotoDefinition::METHOD,
+                "test-origin-changed",
+                revision,
+                revision,
+                false,
+            ),
+            RetryQueueResult::Refused(RetryRefusal::InvalidOrigin)
+        );
+        finish_latency_request(
+            &mut state,
+            &reopened_key,
+            Response::new_err(
+                reopened_id,
+                lsp_server::ErrorCode::ContentModified as i32,
+                "content modified".to_owned(),
+            ),
+        );
+        assert!(state.pending_latency_retries.is_empty());
+        assert!(matches!(receiver.try_recv(), Ok(Message::Response(_))));
+    }
+
+    #[test]
+    fn g1_shutdown_branch_does_not_admit_valid_queued_retry_and_cleans_session() {
+        g1_with_tracing(|| {
+            let (_root, mut state, client_receiver, task_receiver, retry, active_token) =
+                g1_session_boundary_state(lsp_server::RequestId::from(7400));
+            assert!(state.task_pool.pool.has_capacity());
+            assert_eq!(state.pending_latency_retries.front(), Some(&retry));
+            assert_eq!(
+                state.request_lifecycles[&retry.id].phase,
+                RequestLifecyclePhase::RetryQueued
+            );
+            assert!(request_origin_matches(
+                &state,
+                state.request_lifecycles[&retry.id].origin.as_ref().unwrap()
+            ));
+            assert_eq!(retry.attempt, 2);
+
+            let (input_sender, input_receiver) = crossbeam_channel::unbounded();
+            let shutdown_id = lsp_server::RequestId::from(7402);
+            input_sender
+                .send(Message::Request(lsp_server::Request::new(
+                    shutdown_id.clone(),
+                    Shutdown::METHOD.to_owned(),
+                    serde_json::Value::Null,
+                )))
+                .unwrap();
+            run_event_loop(&mut state, &input_receiver)
+                .expect("actual shutdown request branch exits cleanly");
+            assert!(state.shutdown_requested);
+            assert_eq!(state.pending_latency_retries.front(), Some(&retry));
+            assert_eq!(
+                state.request_lifecycles[&retry.id].phase,
+                RequestLifecyclePhase::RetryQueued
+            );
+            assert_eq!(state.request_lifecycles[&retry.id].attempt, 2);
+
+            let shutdown_response = client_receiver
+                .try_iter()
+                .find_map(|message| match message {
+                    Message::Response(response) if response.id == shutdown_id => Some(response),
+                    Message::Response(response) => {
+                        panic!("shutdown loop sent unexpected response {:?}", response.id)
+                    }
+                    _ => None,
+                })
+                .expect("shutdown request receives its protocol response");
+            assert!(shutdown_response.error.is_none());
+            cancel_latency_requests_on_shutdown(&mut state);
+            assert!(active_token.is_cancelled(), "session cleanup cancels remaining handles");
+            assert!(state.request_tokens.is_empty());
+            assert!(state.request_token_owners.is_empty());
+            assert!(state.request_lifecycles.is_empty());
+            assert!(state.pending_latency_retries.is_empty());
+            let (drained, _) = g1_drain_task_pool_to_fixed_point(&mut state, &task_receiver);
+            assert_eq!(drained, 0, "shutdown never admitted a second request attempt");
+            assert!(client_receiver.try_recv().is_err(), "no retry response follows shutdown");
+            tracing::info!(
+                g1_marker = "shutdown_skipped_queued_retry_and_cleaned_session",
+                request_id = ?retry.id,
+                queued_attempt = retry.attempt,
+                shutdown_response = true,
+                request_retry_started = false,
+                lifecycle_cleanup = true,
+                token_cancelled = true,
+            );
+            drop(input_sender);
+        });
+    }
+
+    #[test]
+    fn g1_disconnected_client_skips_valid_queued_retry_and_cleans_session() {
+        g1_with_tracing(|| {
+            let (_root, mut state, client_receiver, task_receiver, retry, active_token) =
+                g1_session_boundary_state(lsp_server::RequestId::from(7410));
+            assert!(state.task_pool.pool.has_capacity());
+            assert_eq!(state.pending_latency_retries.front(), Some(&retry));
+            assert!(request_origin_matches(
+                &state,
+                state.request_lifecycles[&retry.id].origin.as_ref().unwrap()
+            ));
+
+            let (input_sender, input_receiver) = crossbeam_channel::unbounded();
+            drop(input_sender);
+            assert!(
+                run_event_loop(&mut state, &input_receiver).is_err(),
+                "a disconnected LSP input channel exits the production event loop"
+            );
+            assert_eq!(state.pending_latency_retries.front(), Some(&retry));
+            assert_eq!(
+                state.request_lifecycles[&retry.id].phase,
+                RequestLifecyclePhase::RetryQueued
+            );
+            assert_eq!(state.request_lifecycles[&retry.id].attempt, 2);
+
+            cancel_latency_requests_on_shutdown(&mut state);
+            assert!(active_token.is_cancelled(), "disconnect cleanup cancels remaining handles");
+            assert!(state.request_tokens.is_empty());
+            assert!(state.request_token_owners.is_empty());
+            assert!(state.request_lifecycles.is_empty());
+            assert!(state.pending_latency_retries.is_empty());
+            let (drained, _) = g1_drain_task_pool_to_fixed_point(&mut state, &task_receiver);
+            assert_eq!(drained, 0, "disconnect never admitted a second request attempt");
+            assert!(client_receiver.try_recv().is_err(), "disconnect sends no retry response");
+            tracing::info!(
+                g1_marker = "disconnect_skipped_queued_retry_and_cleaned_session",
+                request_id = ?retry.id,
+                queued_attempt = retry.attempt,
+                request_retry_started = false,
+                lifecycle_cleanup = true,
+                token_cancelled = true,
+            );
+        });
+    }
+
+    #[test]
+    fn g1_workspace_diagnostic_real_partial_is_terminal_after_pending_write() {
+        g1_with_tracing(|| {
+            use base_db::{SourceDatabase as _, SourceRoot, BSL_SOURCE_ROOT};
+            use lsp_types::request::{Request as _, WorkspaceDiagnosticRequest};
+
+            let root = tempfile::tempdir().expect("create workspace-diagnostic fixture");
+            let config = root.path().join("bsl-analyzer.toml");
+            std::fs::write(
+                &config,
+                "[source]\nroot = \".\"\n\n[features]\nworkspaceDiagnostics = \"all\"\n",
+            )
+            .expect("write workspace-diagnostic project config");
+
+            let caller = root.path().join("Caller.bsl");
+            let caller_text =
+                "Процедура TargetProcedure()\nКонецПроцедуры\n\nПроцедура Caller()\n    TargetProcedure();\nКонецПроцедуры\n";
+            std::fs::write(&caller, caller_text).expect("write semantic control source");
+
+            let mut files = vec![(caller.clone(), caller_text.to_owned())];
+            for index in 0..63 {
+                let path = root.path().join(format!("Broken{index:02}.bsl"));
+                let text = format!(
+                    "Процедура Broken{index}() Экспорт\n    Значение = ;\nКонецПроцедуры\n"
+                );
+                std::fs::write(&path, &text).expect("write real diagnostic source");
+                files.push((path, text));
+            }
+            let writer = root.path().join("Writer.bsl");
+            let writer_text = "Процедура WriterProcedure()\nКонецПроцедуры\n";
+            std::fs::write(&writer, writer_text).expect("write cancellation target");
+            files.push((writer.clone(), writer_text.to_owned()));
+            assert_eq!(files.len(), 65);
+
+            let (sender, client_receiver) = crossbeam_channel::unbounded();
+            let mut state = crate::global_state::GlobalState::new(sender);
+            *state.analysis_host.raw_database_mut() =
+                ide_db::RootDatabaseImpl::new_with_salsa_events();
+            state.init_empty_source_root();
+            state.workspace_root = Some(root.path().to_path_buf());
+            state.project =
+                Some(project_model::Project::new(root.path()).expect("load diagnostics project"));
+            assert_eq!(
+                state.project.as_ref().unwrap().config.features.workspace_diagnostics,
+                project_model::WorkspaceDiagnosticsScope::All
+            );
+
+            let abs = |path: &std::path::Path| paths::AbsPathBuf::assert_utf8(path.to_path_buf());
+            handle_loader_msg(
+                &mut state,
+                vfs::loader::Message::Loaded {
+                    files: files
+                        .iter()
+                        .map(|(path, text)| (abs(path), Some(text.as_bytes().to_vec())))
+                        .collect(),
+                },
+            )
+            .expect("load all diagnostic inputs through production VFS handler");
+            let mut file_set = vfs::file_set::FileSet::new();
+            let file_ids: Vec<_> = files
+                .iter()
+                .map(|(path, _)| {
+                    let vfs_path = vfs::VfsPath::new(path.as_path());
+                    let file_id = state.vfs.read().file_id(&vfs_path).expect("loaded file id");
+                    file_set.insert(file_id, vfs_path);
+                    file_id
+                })
+                .collect();
+            {
+                let db = state.analysis_host.raw_database_mut();
+                db.set_source_root(BSL_SOURCE_ROOT, SourceRoot::new_local(file_set));
+                for file_id in file_ids {
+                    db.set_file_source_root(file_id, BSL_SOURCE_ROOT);
+                }
+            }
+            handle_loader_msg(
+                &mut state,
+                vfs::loader::Message::Progress {
+                    n_total: files.len(),
+                    n_done: vfs::loader::LoadingProgress::Finished,
+                    dir: None,
+                    config_version: 0,
+                },
+            )
+            .expect("mark diagnostics fixture loaded");
+            assert!(state.vfs_done);
+            let caller_uri = lsp_types::Url::from_file_path(&caller).unwrap();
+            state.mem_docs.insert(caller_uri, caller_text.to_owned(), 1);
+            let caller_id = state
+                .vfs
+                .read()
+                .file_id(&vfs::VfsPath::new(caller.clone()))
+                .expect("caller VFS id");
+            state.open_files.insert(caller_id);
+
+            let request_id = lsp_server::RequestId::from(7420);
+            let partial_token = lsp_types::ProgressToken::String("g1/partial".to_owned());
+            let work_token = lsp_types::ProgressToken::String("g1/work".to_owned());
+            let (gate, entered) = crate::handlers::request::g1_arm_workspace_diagnostic_chunk_gate(
+                partial_token.clone(),
+                64,
+            );
+            let task_receiver = state.task_pool.receiver.clone();
+            handle_lsp_msg(
+                &mut state,
+                Message::Request(g1_json_request(
+                    7420,
+                    WorkspaceDiagnosticRequest::METHOD,
+                    serde_json::json!({
+                        "previousResultIds": [],
+                        "partialResultToken": partial_token,
+                        "workDoneToken": work_token,
+                    }),
+                )),
+            )
+            .expect("production dispatcher admits workspace diagnostic request");
+
+            let (done, emitted_items) = entered
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("real handler sends its first partial then reaches test gate");
+            assert_eq!(done, 64);
+            assert!(emitted_items > 0, "partial contains real diagnostics");
+            tracing::info!(
+                g1_marker = "workspace_diagnostics_real_partial_active",
+                request_id = ?request_id,
+                files_done = done,
+                diagnostic_items = emitted_items,
+                more_files_pending = files.len() - done,
+            );
+
+            let mut progress_values = Vec::new();
+            while let Ok(message) = client_receiver.try_recv() {
+                if let Message::Notification(notification) = message {
+                    if notification.method == "$/progress" {
+                        progress_values.push(notification.params);
+                    }
+                }
+            }
+            let partial = progress_values
+                .iter()
+                .find(|params| params["token"] == serde_json::json!("g1/partial"))
+                .expect("real nonempty partial-result progress was sent before the VFS write");
+            assert_eq!(partial["value"]["items"].as_array().unwrap().len(), emitted_items);
+            assert!(emitted_items > 0);
+            let initial_work_events: Vec<_> = progress_values
+                .iter()
+                .filter(|params| params["token"] == serde_json::json!("g1/work"))
+                .collect();
+            assert_eq!(initial_work_events.len(), 2, "one Begin and one Report preceded writer");
+
+            let db = state.analysis_host.raw_database().clone();
+            let cancellation_baseline = db.salsa_event_global().unwrap().set_cancellation;
+            let replacement =
+                "Процедура WriterProcedure()\n    Значение = 1;\nКонецПроцедуры\n".to_owned();
+            std::fs::write(&writer, &replacement).expect("persist changed writer contents");
+            let writer_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let writer_finished_observer = Arc::clone(&writer_finished);
+            let release_gate = gate.release_sender();
+            let observer_request_id = request_id.clone();
+            let pending_files = files.len() - done;
+            let observer_dispatch = tracing::dispatcher::get_default(Clone::clone);
+            let observer = std::thread::spawn(move || {
+                tracing::dispatcher::with_default(&observer_dispatch, || {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    let observed_cancellation = loop {
+                        let current = db.salsa_event_global().unwrap().set_cancellation;
+                        if current > cancellation_baseline {
+                            break current;
+                        }
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "real VFS writer did not publish a Salsa cancellation event"
+                        );
+                        std::thread::yield_now();
+                    };
+                    assert!(
+                    !writer_finished_observer.load(Ordering::Acquire),
+                    "VFS Changed handler remains blocked while the real query holds its snapshot"
+                );
+                    tracing::info!(
+                        g1_marker = "workspace_diagnostics_vfs_writer_active",
+                        request_id = ?observer_request_id,
+                        cancellation = observed_cancellation,
+                        writer_returned = false,
+                        remaining_files = pending_files,
+                    );
+                    drop(db);
+                    release_gate.send(()).expect("test releases the parked workspace handler");
+                    observed_cancellation
+                })
+            });
+            handle_loader_msg(
+                &mut state,
+                vfs::loader::Message::Changed {
+                    files: vec![(abs(&writer), Some(replacement.as_bytes().to_vec()))],
+                },
+            )
+            .expect("production VFS writer finishes after the real handler releases its ctx");
+            writer_finished.store(true, Ordering::Release);
+            let observed_cancellation =
+                observer.join().expect("cancellation observer did not panic");
+            tracing::info!(
+                g1_marker = "workspace_diagnostics_vfs_writer_complete",
+                request_id = ?request_id,
+                cancellation = observed_cancellation,
+            );
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "cancelled workspace diagnostic did not yield its terminal task"
+                );
+                let task = task_receiver
+                    .recv_timeout(std::time::Duration::from_millis(50))
+                    .expect("task pool remains connected while diagnostic finishes");
+                if let Task::LatencyRequestFinished { key, outcome } = task {
+                    if key.id == request_id {
+                        assert_eq!(key.attempt, 1);
+                        assert!(matches!(
+                            &outcome,
+                            LatencyAttemptOutcome::Cancelled {
+                                kind: salsa::Cancelled::PendingWrite,
+                                ..
+                            }
+                        ));
+                        handle_task(&mut state, Task::LatencyRequestFinished { key, outcome })
+                            .expect(
+                                "production consumer rejects retry after streamed partial output",
+                            );
+                        break;
+                    }
+                    handle_task(&mut state, Task::LatencyRequestFinished { key, outcome })
+                        .expect("apply other latency completion through production consumer");
+                } else {
+                    handle_task(&mut state, task)
+                        .expect("apply non-target background task through production consumer");
+                }
+            }
+
+            let response = loop {
+                if let Ok(message) =
+                    client_receiver.recv_timeout(std::time::Duration::from_secs(10))
+                {
+                    match message {
+                        Message::Response(response) if response.id == request_id => break response,
+                        Message::Notification(notification)
+                            if notification.method == "$/progress" =>
+                        {
+                            progress_values.push(notification.params);
+                        }
+                        _ => {}
+                    }
+                } else {
+                    panic!("workspace diagnostic cancellation sent no terminal response");
+                }
+            };
+            assert_eq!(
+                response.error.as_ref().map(|error| error.code),
+                Some(lsp_server::ErrorCode::ContentModified as i32)
+            );
+            assert_eq!(
+                response.error.as_ref().unwrap().message,
+                "content modified: automatic retry is not permitted"
+            );
+            assert!(state.request_lifecycles.is_empty());
+            assert!(state.request_tokens.is_empty());
+            assert!(state.pending_latency_retries.is_empty());
+            while let Ok(message) = client_receiver.try_recv() {
+                if let Message::Notification(notification) = message {
+                    if notification.method == "$/progress" {
+                        progress_values.push(notification.params);
+                    }
+                } else if let Message::Response(other) = message {
+                    assert_ne!(other.id, request_id, "one terminal response, no retry attempt");
+                }
+            }
+            let partials: Vec<_> = progress_values
+                .iter()
+                .filter(|params| params["token"] == serde_json::json!("g1/partial"))
+                .collect();
+            assert_eq!(partials.len(), 1, "one actual partial chunk; no duplicate partial");
+            assert!(!partials[0]["value"]["items"].as_array().unwrap().is_empty());
+            let work_events: Vec<_> = progress_values
+                .iter()
+                .filter(|params| params["token"] == serde_json::json!("g1/work"))
+                .collect();
+            assert_eq!(work_events.len(), 3, "Begin, Report, and End close streamed work");
+            assert_eq!(work_events[0]["value"]["kind"], "begin");
+            assert_eq!(work_events[1]["value"]["kind"], "report");
+            assert_eq!(work_events[2]["value"]["kind"], "end");
+            let writer_id = state
+                .vfs
+                .read()
+                .file_id(&vfs::VfsPath::new(writer.clone()))
+                .expect("writer remains in the VFS");
+            assert_eq!(
+                state.analysis_host.raw_database().file_text(writer_id).as_ref(),
+                replacement.as_str(),
+                "actual writer contents were applied"
+            );
+            assert_eq!(
+                state.mem_docs.get(&lsp_types::Url::from_file_path(&caller).unwrap()).as_deref(),
+                Some(caller_text),
+                "unrelated open editor buffer remains authoritative"
+            );
+            let (drained, _) = g1_drain_task_pool_to_fixed_point(&mut state, &task_receiver);
+            tracing::info!(
+                g1_marker = "workspace_diagnostics_policy_disabled_terminal",
+                request_id = ?request_id,
+                attempts = 1,
+                partial_chunks = partials.len(),
+                work_done_events = work_events.len(),
+                drained_background_tasks = drained,
+            );
+            drop(gate);
+        });
+    }
+
+    #[test]
+    fn g1_stale_completion_preserves_new_owner_and_shutdown_clears_retry_state() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let mut state = crate::global_state::GlobalState::new(sender);
+        let id = lsp_server::RequestId::from(603);
+        let current =
+            crate::global_state::RequestAttemptKey { id: id.clone(), generation: 22, attempt: 2 };
+        let stale =
+            crate::global_state::RequestAttemptKey { id: id.clone(), generation: 21, attempt: 1 };
+        let token = state.analysis_host.raw_database().cancellation_token();
+        state.request_tokens.insert(id.clone(), token);
+        state.request_token_owners.insert(id.clone(), current.clone());
+        state.request_lifecycles.insert(
+            id.clone(),
+            crate::global_state::RequestLifecycle {
+                generation: current.generation,
+                method: lsp_types::request::GotoDefinition::METHOD.to_owned(),
+                request: None,
+                attempt: current.attempt,
+                phase: RequestLifecyclePhase::Running,
+                retry_origin_revision: None,
+                retry_eligible: false,
+                origin: None,
+                client_cancelled: false,
+            },
+        );
+        handle_task(
+            &mut state,
+            Task::LatencyRequestFinished {
+                key: stale,
+                outcome: crate::global_state::LatencyAttemptOutcome::Response(Response::new_ok(
+                    id.clone(),
+                    serde_json::json!({"stale": true}),
+                )),
+            },
+        )
+        .unwrap();
+        assert_eq!(state.request_token_owners.get(&id), Some(&current));
+        assert!(state.request_tokens.contains_key(&id));
+        assert!(receiver.try_recv().is_err(), "stale completion has no wire response");
+
+        handle_task(
+            &mut state,
+            Task::LatencyRequestFinished {
+                key: current.clone(),
+                outcome: crate::global_state::LatencyAttemptOutcome::Response(Response::new_ok(
+                    id.clone(),
+                    serde_json::json!({"current": true}),
+                )),
+            },
+        )
+        .unwrap();
+        assert!(state.request_lifecycles.is_empty());
+        assert!(!state.request_tokens.contains_key(&id));
+        let Message::Response(response) = receiver.try_recv().unwrap() else {
+            panic!("current completion sends the only response");
+        };
+        assert_eq!(response.result, Some(serde_json::json!({"current": true})));
+        assert!(receiver.try_recv().is_err());
+
+        let shutdown_id = lsp_server::RequestId::from(604);
+        let shutdown_key = crate::global_state::RequestAttemptKey {
+            id: shutdown_id.clone(),
+            generation: 23,
+            attempt: 2,
+        };
+        state.request_token_owners.insert(shutdown_id.clone(), shutdown_key.clone());
+        state
+            .request_tokens
+            .insert(shutdown_id.clone(), state.analysis_host.raw_database().cancellation_token());
+        state.request_lifecycles.insert(
+            shutdown_id.clone(),
+            crate::global_state::RequestLifecycle {
+                generation: shutdown_key.generation,
+                method: lsp_types::request::GotoDefinition::METHOD.to_owned(),
+                request: None,
+                attempt: shutdown_key.attempt,
+                phase: RequestLifecyclePhase::RetryQueued,
+                retry_origin_revision: None,
+                retry_eligible: true,
+                origin: None,
+                client_cancelled: false,
+            },
+        );
+        state.pending_latency_retries.push_back(shutdown_key);
+        cancel_latency_requests_on_shutdown(&mut state);
+        assert!(state.request_tokens.is_empty());
+        assert!(state.request_token_owners.is_empty());
+        assert!(state.request_lifecycles.is_empty());
+        assert!(state.pending_latency_retries.is_empty());
+    }
+
+    #[test]
+    fn g1_origin_guard_rejects_deleted_and_config_excluded_documents() {
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = crate::global_state::GlobalState::new(sender);
+        state.init_empty_source_root();
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("src");
+        std::fs::create_dir_all(source.join("excluded")).unwrap();
+        let deleted_path = source.join("Deleted.bsl");
+        let excluded_path = source.join("excluded/Caller.bsl");
+        std::fs::write(&deleted_path, "Процедура X() КонецПроцедуры").unwrap();
+        std::fs::write(&excluded_path, "Процедура Y() КонецПроцедуры").unwrap();
+        let config_path = root.path().join("bsl-analyzer.toml");
+        std::fs::write(&config_path, "[source]\nroot = \"src\"\n").unwrap();
+        state.workspace_root = Some(root.path().to_path_buf());
+        state.project = Some(project_model::Project::new(root.path()).unwrap());
+
+        let make_origin = |state: &crate::global_state::GlobalState, uri: lsp_types::Url| {
+            crate::global_state::RequestOriginGuard {
+                identity: state.mem_docs.identity(&uri).unwrap(),
+                workspace_root: state.workspace_root.clone(),
+                source_roots: state.project.as_ref().unwrap().source_roots(),
+                uri,
+            }
+        };
+        let deleted_uri = lsp_types::Url::from_file_path(&deleted_path).unwrap();
+        state.mem_docs.insert(deleted_uri.clone(), "Процедура X() КонецПроцедуры".to_owned(), 1);
+        let deleted_vfs_path = vfs::VfsPath::new(deleted_path.clone());
+        state.vfs.write().set_file_contents(
+            deleted_vfs_path.clone(),
+            Some(std::sync::Arc::from("Процедура X() КонецПроцедуры")),
+        );
+        let deleted_file_id = state.vfs.read().file_id(&deleted_vfs_path).unwrap();
+        state.open_files.insert(deleted_file_id);
+        let deleted_origin = make_origin(&state, deleted_uri.clone());
+        assert!(request_origin_matches(&state, &deleted_origin));
+        std::fs::remove_file(&deleted_path).unwrap();
+        handle_loader_msg(
+            &mut state,
+            vfs::loader::Message::Changed {
+                files: vec![(paths::AbsPathBuf::assert_utf8(deleted_path.clone()), None)],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            state.mem_docs.get(&deleted_uri).as_deref(),
+            Some("Процедура X() КонецПроцедуры"),
+            "deletion must invalidate origin while preserving the unsaved editor buffer"
+        );
+        assert!(!request_origin_matches(&state, &deleted_origin));
+        let deleted_id = lsp_server::RequestId::from(605);
+        let deleted_key = crate::global_state::RequestAttemptKey {
+            id: deleted_id.clone(),
+            generation: 1,
+            attempt: 1,
+        };
+        state.request_lifecycles.insert(
+            deleted_id.clone(),
+            crate::global_state::RequestLifecycle {
+                generation: 1,
+                method: lsp_types::request::GotoDefinition::METHOD.to_owned(),
+                request: Some(g1_definition_request(605, deleted_uri)),
+                attempt: 1,
+                phase: RequestLifecyclePhase::Running,
+                retry_origin_revision: None,
+                retry_eligible: true,
+                origin: Some(deleted_origin),
+                client_cancelled: false,
+            },
+        );
+        let revision = salsa::plumbing::current_revision(state.analysis_host.raw_database());
+        assert_eq!(
+            queue_latency_retry(
+                &mut state,
+                &deleted_key,
+                lsp_types::request::GotoDefinition::METHOD,
+                "pending-write",
+                revision,
+                revision,
+                false,
+            ),
+            RetryQueueResult::Refused(RetryRefusal::InvalidOrigin)
+        );
+        state.request_lifecycles.remove(&deleted_id);
+
+        let excluded_uri = lsp_types::Url::from_file_path(&excluded_path).unwrap();
+        state.mem_docs.insert(excluded_uri.clone(), "Процедура Y() КонецПроцедуры".to_owned(), 1);
+        let excluded_origin = make_origin(&state, excluded_uri.clone());
+        assert!(request_origin_matches(&state, &excluded_origin));
+        std::fs::write(&config_path, "[source]\nroot = \"src\"\nexclude = [\"src/excluded\"]\n")
+            .unwrap();
+        assert!(state.reload_project_config());
+        assert_eq!(
+            state.project.as_ref().unwrap().source_roots(),
+            excluded_origin.source_roots,
+            "subdirectory exclusion must not rely on a root-list change"
+        );
+        assert!(!request_origin_matches(&state, &excluded_origin));
+        let excluded_id = lsp_server::RequestId::from(606);
+        let excluded_key = crate::global_state::RequestAttemptKey {
+            id: excluded_id.clone(),
+            generation: 1,
+            attempt: 1,
+        };
+        state.request_lifecycles.insert(
+            excluded_id.clone(),
+            crate::global_state::RequestLifecycle {
+                generation: 1,
+                method: lsp_types::request::GotoDefinition::METHOD.to_owned(),
+                request: Some(g1_definition_request(606, excluded_uri)),
+                attempt: 1,
+                phase: RequestLifecyclePhase::Running,
+                retry_origin_revision: None,
+                retry_eligible: true,
+                origin: Some(excluded_origin),
+                client_cancelled: false,
+            },
+        );
+        assert_eq!(
+            queue_latency_retry(
+                &mut state,
+                &excluded_key,
+                lsp_types::request::GotoDefinition::METHOD,
+                "pending-write",
+                revision,
+                revision,
+                false,
+            ),
+            RetryQueueResult::Refused(RetryRefusal::InvalidOrigin)
+        );
+    }
 
     #[test]
     fn baseline_reload_invalidates_diagnostics_before_pool_scheduling() {

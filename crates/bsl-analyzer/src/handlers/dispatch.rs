@@ -2,13 +2,22 @@ use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
+#[cfg(test)]
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex, OnceLock,
+};
+
 use anyhow::Result;
-use lsp_server::{ErrorCode, Notification, Request, RequestId, Response};
+use lsp_server::{ErrorCode, Notification, Request, Response};
 use salsa::Database as _;
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::frozen_context::{FrozenFilePaths, LatencyRequestContext};
-use crate::global_state::{GlobalState, Task};
+use crate::global_state::{
+    GlobalState, LatencyAttemptOutcome, RequestAttemptKey, RequestLifecycle, RequestLifecyclePhase,
+    RequestOriginGuard, Task,
+};
 
 pub struct RequestDispatcher<'a> {
     pub req: Option<Request>,
@@ -19,6 +28,84 @@ pub struct RequestDispatcher<'a> {
 enum LatencyExecutor {
     TaskPool,
     DedicatedThread,
+}
+
+#[cfg(test)]
+struct G1PendingWriteGate {
+    through_attempt: u8,
+    entered: crossbeam_channel::Sender<u8>,
+    release: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+static G1_PENDING_WRITE_GATES: OnceLock<
+    Mutex<std::collections::HashMap<String, Arc<G1PendingWriteGate>>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+fn g1_pending_write_gates(
+) -> &'static Mutex<std::collections::HashMap<String, Arc<G1PendingWriteGate>>> {
+    G1_PENDING_WRITE_GATES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn g1_arm_pending_write_gate(
+    id: &lsp_server::RequestId,
+    through_attempt: u8,
+) -> (crossbeam_channel::Receiver<u8>, Arc<AtomicBool>) {
+    let (entered, receiver) = crossbeam_channel::unbounded();
+    let release = Arc::new(AtomicBool::new(false));
+    let gate =
+        Arc::new(G1PendingWriteGate { through_attempt, entered, release: Arc::clone(&release) });
+    g1_pending_write_gates()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(format!("{id:?}"), gate);
+    (receiver, release)
+}
+
+#[cfg(test)]
+pub(crate) fn g1_disarm_pending_write_gate(id: &lsp_server::RequestId) {
+    g1_pending_write_gates()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&format!("{id:?}"));
+}
+
+#[cfg(test)]
+fn g1_wait_for_test_writer(key: &RequestAttemptKey, ctx: &LatencyRequestContext) {
+    let gate = g1_pending_write_gates()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&format!("{:?}", key.id))
+        .cloned();
+    let Some(gate) = gate.filter(|gate| key.attempt <= gate.through_attempt) else {
+        return;
+    };
+
+    let baseline = ctx
+        .analysis
+        .database()
+        .salsa_event_global()
+        .expect("controlled overlap uses an event-enabled Salsa database")
+        .set_cancellation;
+    if gate.entered.send(key.attempt).is_err() {
+        return;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !gate.release.load(Ordering::Acquire)
+        && ctx
+            .analysis
+            .database()
+            .salsa_event_global()
+            .is_some_and(|events| events.set_cancellation <= baseline)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "controlled PendingWrite gate did not observe a real writer"
+        );
+        std::thread::yield_now();
+    }
 }
 
 impl RequestDispatcher<'_> {
@@ -78,7 +165,19 @@ impl RequestDispatcher<'_> {
         R::Params: DeserializeOwned + fmt::Debug + Send + 'static,
         R::Result: Serialize + Send + 'static,
     {
-        self.on_latency_with::<R>(f, LatencyExecutor::TaskPool)
+        self.on_latency_with::<R>(f, LatencyExecutor::TaskPool, false)
+    }
+
+    pub fn on_retryable_latency<R>(
+        &mut self,
+        f: fn(&LatencyRequestContext, R::Params) -> Result<R::Result>,
+    ) -> &mut Self
+    where
+        R: lsp_types::request::Request,
+        R::Params: DeserializeOwned + fmt::Debug + Send + 'static,
+        R::Result: Serialize + Send + 'static,
+    {
+        self.on_latency_with::<R>(f, LatencyExecutor::TaskPool, true)
     }
 
     pub fn on_waiting_latency<R>(
@@ -90,13 +189,14 @@ impl RequestDispatcher<'_> {
         R::Params: DeserializeOwned + fmt::Debug + Send + 'static,
         R::Result: Serialize + Send + 'static,
     {
-        self.on_latency_with::<R>(f, LatencyExecutor::DedicatedThread)
+        self.on_latency_with::<R>(f, LatencyExecutor::DedicatedThread, false)
     }
 
     fn on_latency_with<R>(
         &mut self,
         f: fn(&LatencyRequestContext, R::Params) -> Result<R::Result>,
         executor: LatencyExecutor,
+        retry_eligible: bool,
     ) -> &mut Self
     where
         R: lsp_types::request::Request,
@@ -144,14 +244,64 @@ impl RequestDispatcher<'_> {
             LatencyExecutor::TaskPool | LatencyExecutor::DedicatedThread => {}
         }
 
+        let key = if let Some(key) = self.global_state.retry_dispatch.take() {
+            assert_eq!(key.id, req.id, "retry dispatch must match its request id");
+            let lifecycle = self
+                .global_state
+                .request_lifecycles
+                .get_mut(&key.id)
+                .expect("queued retry keeps its logical request");
+            assert_eq!(lifecycle.generation, key.generation);
+            assert_eq!(lifecycle.attempt, key.attempt);
+            assert_eq!(lifecycle.phase, RequestLifecyclePhase::RetryQueued);
+            lifecycle.phase = RequestLifecyclePhase::Running;
+            key
+        } else {
+            self.global_state.next_request_generation =
+                self.global_state.next_request_generation.wrapping_add(1);
+            let generation = self.global_state.next_request_generation;
+            let origin = retry_eligible
+                .then(|| retry_origin(&req.method, &req.params))
+                .flatten()
+                .and_then(|uri| {
+                    self.global_state.mem_docs.identity(&uri).map(|identity| RequestOriginGuard {
+                        uri,
+                        identity,
+                        workspace_root: self.global_state.workspace_root.clone(),
+                        source_roots: self
+                            .global_state
+                            .project
+                            .as_ref()
+                            .map(|project| project.source_roots())
+                            .unwrap_or_default(),
+                    })
+                });
+            if let Some(token) = self.global_state.request_tokens.remove(&req.id) {
+                token.cancel();
+            }
+            self.global_state.request_token_owners.remove(&req.id);
+            self.global_state.request_lifecycles.insert(
+                req.id.clone(),
+                RequestLifecycle {
+                    generation,
+                    method: req.method.clone(),
+                    request: retry_eligible.then(|| req.clone()),
+                    attempt: 1,
+                    phase: RequestLifecyclePhase::Running,
+                    retry_origin_revision: None,
+                    retry_eligible,
+                    origin,
+                    client_cancelled: false,
+                },
+            );
+            RequestAttemptKey { id: req.id.clone(), generation, attempt: 1 }
+        };
+
         let db = self.global_state.analysis_host.raw_database().clone();
         let token = db.cancellation_token();
         let analysis = ide::Analysis::from_database(db);
-
-        if let Some(prev) = self.global_state.request_tokens.insert(req.id.clone(), token) {
-            tracing::warn!(request_id = ?req.id, "duplicate LSP request id; cancelling previous");
-            prev.cancel();
-        }
+        self.global_state.request_token_owners.insert(req.id.clone(), key.clone());
+        self.global_state.request_tokens.insert(req.id.clone(), token);
 
         let ctx = LatencyRequestContext {
             analysis,
@@ -178,16 +328,15 @@ impl RequestDispatcher<'_> {
             scope_dirty_docs: self.global_state.scope_dirty_docs.clone(),
         };
 
-        let id = req.id;
-        let job_id = id.clone();
+        let job_key = key.clone();
         match executor {
             LatencyExecutor::TaskPool => {
                 let spawned = self.global_state.task_pool.pool.try_spawn(move || {
-                    let response = run_latency_handler::<R>(job_id, ctx, params, f);
-                    Task::RequestResult { response }
+                    let outcome = run_latency_attempt::<R>(job_key.clone(), ctx, params, f);
+                    Task::LatencyRequestFinished { key: job_key, outcome }
                 });
                 if let Err(err) = spawned {
-                    self.reject_latency_launch::<R>(id, err);
+                    self.reject_latency_launch::<R>(&key, err);
                 }
             }
             LatencyExecutor::DedicatedThread => {
@@ -195,25 +344,36 @@ impl RequestDispatcher<'_> {
                 let spawned = std::thread::Builder::new()
                     .name("bsl-call-hierarchy-waiter".to_owned())
                     .spawn(move || {
-                        let response = run_latency_handler::<R>(job_id, ctx, params, f);
-                        let _ = task_sender.send(Task::RequestResult { response });
+                        let outcome = run_latency_attempt::<R>(job_key.clone(), ctx, params, f);
+                        let _ = task_sender
+                            .send(Task::LatencyRequestFinished { key: job_key, outcome });
                     });
                 if let Err(err) = spawned {
-                    self.reject_latency_launch::<R>(id, err);
+                    self.reject_latency_launch::<R>(&key, err);
                 }
             }
         }
         self
     }
 
-    fn reject_latency_launch<R>(&mut self, id: RequestId, error: impl fmt::Debug)
+    fn reject_latency_launch<R>(&mut self, key: &RequestAttemptKey, error: impl fmt::Debug)
     where
         R: lsp_types::request::Request,
     {
-        tracing::warn!(method = R::METHOD, request_id = ?id, ?error, "could not launch latency request");
-        self.global_state.request_tokens.remove(&id);
+        tracing::warn!(method = R::METHOD, request_id = ?key.id, attempt = key.attempt, ?error, "could not launch latency request");
+        if self.global_state.request_token_owners.get(&key.id) == Some(key) {
+            self.global_state.request_token_owners.remove(&key.id);
+            self.global_state.request_tokens.remove(&key.id);
+        }
+        if self.global_state.request_lifecycles.get(&key.id).is_some_and(|lifecycle| {
+            lifecycle.generation == key.generation
+                && lifecycle.attempt == key.attempt
+                && lifecycle.phase == RequestLifecyclePhase::Running
+        }) {
+            self.global_state.request_lifecycles.remove(&key.id);
+        }
         self.global_state.respond(Response::new_err(
-            id,
+            key.id.clone(),
             ErrorCode::ContentModified as i32,
             "server is busy, please retry".to_string(),
         ));
@@ -259,6 +419,27 @@ impl RequestDispatcher<'_> {
         };
 
         Some((req, params))
+    }
+}
+
+fn retry_origin(method: &str, params: &serde_json::Value) -> Option<lsp_types::Url> {
+    use lsp_types::request::{
+        Completion, GotoDefinition, GotoTypeDefinition, HoverRequest, Request as _,
+    };
+
+    match method {
+        HoverRequest::METHOD => serde_json::from_value::<lsp_types::HoverParams>(params.clone())
+            .ok()
+            .map(|p| p.text_document_position_params.text_document.uri),
+        GotoDefinition::METHOD | GotoTypeDefinition::METHOD => {
+            serde_json::from_value::<lsp_types::GotoDefinitionParams>(params.clone())
+                .ok()
+                .map(|p| p.text_document_position_params.text_document.uri)
+        }
+        Completion::METHOD => serde_json::from_value::<lsp_types::CompletionParams>(params.clone())
+            .ok()
+            .map(|p| p.text_document_position.text_document.uri),
+        _ => None,
     }
 }
 
@@ -331,8 +512,9 @@ where
     }
 }
 
+#[cfg(test)]
 fn run_latency_handler<R>(
-    id: RequestId,
+    id: lsp_server::RequestId,
     ctx: LatencyRequestContext,
     params: R::Params,
     f: fn(&LatencyRequestContext, R::Params) -> Result<R::Result>,
@@ -341,110 +523,88 @@ where
     R: lsp_types::request::Request,
     R::Result: Serialize,
 {
-    let inner_id = id.clone();
-    let started = std::time::Instant::now();
-    // The revision this request reads in, asked of salsa rather than proxied: a
-    // panic stamped with it (or newer) can reach this request, an older one
-    // cannot.
+    let key = RequestAttemptKey { id, generation: 0, attempt: 1 };
+    match run_latency_attempt::<R>(key.clone(), ctx, params, f) {
+        LatencyAttemptOutcome::Response(response) => response,
+        LatencyAttemptOutcome::Cancelled { kind, revision } => match kind {
+            salsa::Cancelled::PropagatedPanic if !crate::panic_watch::panicked_in(revision) => {
+                Response::new_err(
+                    key.id,
+                    ErrorCode::ContentModified as i32,
+                    "content modified".to_string(),
+                )
+            }
+            salsa::Cancelled::PropagatedPanic => Response::new_err(
+                key.id,
+                ErrorCode::InternalError as i32,
+                "internal handler panic".to_string(),
+            ),
+            _ => Response::new_err(
+                key.id,
+                ErrorCode::RequestCanceled as i32,
+                "request cancelled".to_string(),
+            ),
+        },
+    }
+}
+
+fn run_latency_attempt<R>(
+    key: RequestAttemptKey,
+    ctx: LatencyRequestContext,
+    params: R::Params,
+    f: fn(&LatencyRequestContext, R::Params) -> Result<R::Result>,
+) -> LatencyAttemptOutcome
+where
+    R: lsp_types::request::Request,
+    R::Result: Serialize,
+{
     let revision = salsa::plumbing::current_revision(ctx.analysis.database());
-    let inner = move || -> Response {
-        // The handler body is one attach scope, so a `$/cancelRequest` landing inside
-        // any of its queries is still there for the next checkpoint (`Analysis::attached`).
+    let started = std::time::Instant::now();
+    let run_key = key.clone();
+    let run = move || {
+        #[cfg(test)]
+        g1_wait_for_test_writer(&run_key, &ctx);
         let attached = || ctx.analysis.attached(|_| f(&ctx, params));
         match salsa::Cancelled::catch(AssertUnwindSafe(attached)) {
-            Ok(result) => result_to_response::<R>(inner_id, result),
-            Err(cancelled) => {
-                let elapsed_ms = started.elapsed().as_millis() as u64;
-                match cancelled {
-                    // Salsa says only that the thread owning this query
-                    // unwound — a pending write lands here too, because the
-                    // claim guard keeps `WaitResult::Cancelled` for a
-                    // thread-LOCAL cancellation. Cancellations unwind through
-                    // `resume_unwind`, which skips the panic hook, so a panic
-                    // stamp older than this request means nothing that could
-                    // reach it panicked, and the client should simply ask again.
-                    // Stamps carry salsa's own revision rather than a
-                    // per-request count because salsa also replays the panic of
-                    // a poisoned cycle head to a reader that never blocked on
-                    // anything.
-                    // A real panic still reaches the client: hiding one behind a
-                    // retryable code is the worse error.
-                    salsa::Cancelled::PropagatedPanic
-                        if !crate::panic_watch::panicked_in(revision) =>
-                    {
-                        tracing::info!(
-                            request_id = ?inner_id,
-                            method = R::METHOD,
-                            elapsed_ms,
-                            cancel_kind = "propagated",
-                            "async LSP request unwound (cancelled)"
-                        );
-                        Response::new_err(
-                            inner_id,
-                            ErrorCode::ContentModified as i32,
-                            "content modified".to_string(),
-                        )
-                    }
-                    salsa::Cancelled::PropagatedPanic => {
-                        tracing::error!(
-                            request_id = ?inner_id,
-                            method = R::METHOD,
-                            elapsed_ms,
-                            "async LSP request aborted: a thread it was blocked on panicked"
-                        );
-                        Response::new_err(
-                            inner_id,
-                            ErrorCode::InternalError as i32,
-                            "internal handler panic".to_string(),
-                        )
-                    }
-                    // Distinguish a client `$/cancelRequest` (Local) from an
-                    // implicit cancel by a concurrent VFS write (PendingWrite),
-                    // and report elapsed so logs show how much work was saved.
-                    cancelled => {
-                        let cancel_kind = match cancelled {
-                            salsa::Cancelled::Local => "local",
-                            salsa::Cancelled::PendingWrite => "pending-write",
-                            _ => "other",
-                        };
-                        tracing::info!(
-                            request_id = ?inner_id,
-                            method = R::METHOD,
-                            elapsed_ms,
-                            cancel_kind,
-                            "async LSP request unwound (cancelled)"
-                        );
-                        Response::new_err(
-                            inner_id,
-                            ErrorCode::RequestCanceled as i32,
-                            "request cancelled".to_string(),
-                        )
-                    }
-                }
+            Ok(result) => {
+                LatencyAttemptOutcome::Response(result_to_response::<R>(run_key.id.clone(), result))
+            }
+            Err(kind) => {
+                let cancel_kind = match kind {
+                    salsa::Cancelled::Local => "local",
+                    salsa::Cancelled::PendingWrite => "pending-write",
+                    salsa::Cancelled::PropagatedPanic => "propagated",
+                    _ => "other",
+                };
+                tracing::info!(
+                    request_id = ?run_key.id,
+                    method = R::METHOD,
+                    attempt = run_key.attempt,
+                    cancel_kind,
+                    revision = ?revision,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "async LSP request unwound"
+                );
+                LatencyAttemptOutcome::Cancelled { kind, revision }
             }
         }
     };
 
-    match catch_unwind(AssertUnwindSafe(inner)) {
-        Ok(response) => response,
-        Err(payload) => {
-            let msg = payload
-                .downcast_ref::<&'static str>()
-                .map(|s| (*s).to_string())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "<non-string panic>".to_string());
+    match catch_unwind(AssertUnwindSafe(run)) {
+        Ok(outcome) => outcome,
+        Err(_) => {
             tracing::error!(
-                request_id = ?id,
+                request_id = ?key.id,
                 method = R::METHOD,
-                panic = %msg,
-                backtrace = %std::backtrace::Backtrace::force_capture(),
+                attempt = key.attempt,
+                revision = ?revision,
                 "async LSP handler panicked"
             );
-            Response::new_err(
-                id,
+            LatencyAttemptOutcome::Response(Response::new_err(
+                key.id,
                 ErrorCode::InternalError as i32,
                 "internal handler panic".to_string(),
-            )
+            ))
         }
     }
 }
@@ -455,6 +615,16 @@ mod tests {
     use crossbeam_channel::unbounded;
     use lsp_types::request::{HoverRequest, Request as _, Shutdown};
     use std::time::Duration;
+
+    fn response_task(task: Task) -> Response {
+        match task {
+            Task::LatencyRequestFinished {
+                outcome: LatencyAttemptOutcome::Response(response),
+                ..
+            } => response,
+            task => panic!("expected a completed latency response, got {task:?}"),
+        }
+    }
 
     fn hover_params() -> lsp_types::HoverParams {
         lsp_types::HoverParams {
@@ -540,9 +710,7 @@ mod tests {
         let task = receiver
             .recv_timeout(Duration::from_secs(5))
             .expect("task pool did not produce RequestResult");
-        let Task::RequestResult { response } = task else {
-            panic!("expected RequestResult, got {task:?}");
-        };
+        let response = response_task(task);
         assert_eq!(response.id, lsp_server::RequestId::from(42));
         assert!(response.error.is_none(), "happy path must not set error");
         assert_eq!(response.result, Some(serde_json::Value::Null));
@@ -569,9 +737,7 @@ mod tests {
         let task = receiver
             .recv_timeout(Duration::from_secs(5))
             .expect("task pool did not produce RequestResult");
-        let Task::RequestResult { response } = task else {
-            panic!("expected RequestResult, got {task:?}");
-        };
+        let response = response_task(task);
         assert_eq!(response.id, lsp_server::RequestId::from(7));
         let err = response.error.expect("panic must produce error");
         assert_eq!(err.code, ErrorCode::InternalError as i32);
@@ -605,7 +771,13 @@ mod tests {
             .receiver
             .recv_timeout(Duration::from_secs(5))
             .expect("the first job must answer");
-        assert!(matches!(task, Task::RequestResult { .. }), "{task:?}");
+        assert!(
+            matches!(
+                task,
+                Task::LatencyRequestFinished { outcome: LatencyAttemptOutcome::Response(_), .. }
+            ),
+            "{task:?}"
+        );
 
         let req2 = Request::new(
             id.clone(),
@@ -855,7 +1027,7 @@ mod tests {
 
     #[test]
     fn late_cancel_after_completion_is_noop() {
-        let (sender, _receiver) = unbounded();
+        let (sender, client_receiver) = unbounded();
         let mut state = GlobalState::new(sender);
         state.vfs_done = true;
 
@@ -875,15 +1047,17 @@ mod tests {
         let task = receiver
             .recv_timeout(Duration::from_secs(5))
             .expect("task pool did not produce RequestResult");
-        let Task::RequestResult { response } = task else {
-            panic!("expected RequestResult, got {task:?}");
+        let token = state.request_tokens.get(&id).expect("attempt token is registered").clone();
+        crate::server::handle_task(&mut state, task)
+            .expect("event loop applies request completion");
+        let lsp_server::Message::Response(response) = client_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("event loop sends one response")
+        else {
+            panic!("expected request response")
         };
         assert_eq!(response.id, id);
         assert!(response.error.is_none(), "a completed handler must return Ok, not cancelled");
-
-        // The server evicts the token when it dispatches the response
-        // (server.rs, on RequestResult). Model that here.
-        let token = state.request_tokens.remove(&id).expect("token registered while in flight");
 
         // A `$/cancelRequest` that races in *after* completion now finds no
         // token: it must take the no-op branch, not panic, and produce no work.
@@ -894,7 +1068,11 @@ mod tests {
         .unwrap();
 
         // No second response was produced by the late cancel.
-        assert!(receiver.try_recv().is_err(), "a late cancel must not conjure a second response");
+        assert!(receiver.try_recv().is_err(), "a late cancel must not conjure a second task");
+        assert!(
+            client_receiver.try_recv().is_err(),
+            "a late cancel must not send a second response"
+        );
 
         // The already-consumed token is one-shot: a late `cancel()` (and a
         // duplicate) is harmless and idempotent.

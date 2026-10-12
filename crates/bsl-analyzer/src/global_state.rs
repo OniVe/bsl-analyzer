@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -8,7 +8,7 @@ use base_db::{DiagnosticsConfigInput, Locale};
 use crossbeam_channel::{Receiver, Sender};
 use hir::CallHierarchyReverseIndex;
 use ide::Analysis;
-use lsp_server::{Message, ReqQueue, Response};
+use lsp_server::{Message, ReqQueue, Request, RequestId, Response};
 use lsp_types::{PublishDiagnosticsParams, Url};
 use parking_lot::RwLock;
 use project_model::Project;
@@ -91,8 +91,10 @@ pub enum Task {
     PreloadExternalFiles {
         files: Vec<vfs::FileId>,
     },
-    RequestResult {
-        response: Response,
+    /// A latency worker's context has been dropped before this outcome reaches the loop.
+    LatencyRequestFinished {
+        key: RequestAttemptKey,
+        outcome: LatencyAttemptOutcome,
     },
     /// Debounce timer fired for a background-analysis busy burst. If the burst
     /// (`epoch`) is still the current one and still running, it promotes to a
@@ -156,6 +158,50 @@ pub enum Task {
     DiagnosticsBaselineRecheck {
         hold: u64,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestAttemptKey {
+    pub id: RequestId,
+    pub generation: u64,
+    pub attempt: u8,
+}
+
+#[derive(Debug)]
+pub enum LatencyAttemptOutcome {
+    Response(Response),
+    Cancelled { kind: salsa::Cancelled, revision: salsa::Revision },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestLifecyclePhase {
+    Running,
+    RetryQueued,
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestOriginGuard {
+    pub uri: Url,
+    pub identity: u64,
+    pub workspace_root: Option<PathBuf>,
+    pub source_roots: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+pub struct RequestLifecycle {
+    pub generation: u64,
+    pub method: String,
+    /// Retained only for the four replay-safe semantic methods.
+    pub request: Option<Request>,
+    /// Attempt currently running, or the next attempt waiting for admission.
+    pub attempt: u8,
+    pub phase: RequestLifecyclePhase,
+    /// Revision of the attempt that queued the retry, retained until the next
+    /// admission so a refusal can explain which snapshot became stale.
+    pub retry_origin_revision: Option<salsa::Revision>,
+    pub retry_eligible: bool,
+    pub origin: Option<RequestOriginGuard>,
+    pub client_cancelled: bool,
 }
 
 /// What a finished batch chunk carries back to the event loop.
@@ -377,6 +423,12 @@ pub struct GlobalState {
     pub preload_external_tokens: HashMap<vfs::FileId, salsa::CancellationToken>,
 
     pub request_tokens: HashMap<lsp_server::RequestId, salsa::CancellationToken>,
+    pub request_token_owners: HashMap<RequestId, RequestAttemptKey>,
+    pub request_lifecycles: HashMap<RequestId, RequestLifecycle>,
+    pub pending_latency_retries: VecDeque<RequestAttemptKey>,
+    /// Set only while the event loop replays a retained request through `handle_request`.
+    pub retry_dispatch: Option<RequestAttemptKey>,
+    pub next_request_generation: u64,
     /// The in-flight `workspace/diagnostic` request, if any. A whole-workspace sweep can run
     /// for minutes; letting several pile onto the shared latency pool would starve interactive
     /// requests. Tracking the active one lets a newer sweep cancel the previous so at most one
@@ -552,6 +604,11 @@ impl GlobalState {
             preload_tokens: HashMap::new(),
             preload_external_tokens: HashMap::new(),
             request_tokens: HashMap::new(),
+            request_token_owners: HashMap::new(),
+            request_lifecycles: HashMap::new(),
+            pending_latency_retries: VecDeque::new(),
+            retry_dispatch: None,
+            next_request_generation: 0,
             last_progress_report: std::time::Instant::now(),
             skipped_bsl: FxHashSet::default(),
             degraded_files_count: 0,
@@ -613,7 +670,9 @@ impl GlobalState {
     /// defer a trim that is already safe, never trim while a snapshot is live.
     pub fn interactive_analysis_quiescent(&self) -> bool {
         let batch_guard = u32::from(self.workspace_batch_plan.is_some());
-        self.analysis_in_flight <= batch_guard && self.request_tokens.is_empty()
+        self.analysis_in_flight <= batch_guard
+            && self.request_tokens.is_empty()
+            && self.request_lifecycles.is_empty()
     }
 
     /// Record that a background analysis job finished. When the last one drains,
@@ -2777,6 +2836,52 @@ mod vfs_race_tests {
         assert!(!in_file_set(&state, inside_a), "descendant ObjectModule must be tombstoned");
         assert!(!in_file_set(&state, inside_b), "nested descendant must be tombstoned");
         assert!(in_file_set(&state, outside), "a sibling directory must be untouched");
+    }
+
+    #[test]
+    fn remove_directories_invalidates_open_origin_but_keeps_editor_buffer() {
+        use base_db::SourceDatabase;
+
+        let root = tempfile::tempdir().unwrap();
+        let editor_dir = root.path().join("Editor");
+        std::fs::create_dir_all(&editor_dir).unwrap();
+        let caller = editor_dir.join("Caller.bsl");
+        let text = "Процедура Caller()\nКонецПроцедуры\n";
+        std::fs::write(&caller, text).unwrap();
+
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new(sender);
+        state.init_empty_source_root();
+        state
+            .vfs
+            .write()
+            .set_file_contents(vfs::VfsPath::new(caller.clone()), Some(Arc::from(text)));
+        state.process_changes(false);
+        let file_id = state.vfs.read().file_id(&vfs::VfsPath::new(caller.clone())).unwrap();
+        let uri = lsp_types::Url::from_file_path(&caller).unwrap();
+        crate::handlers::notification::handle_did_open(
+            &mut state,
+            lsp_types::DidOpenTextDocumentParams {
+                text_document: lsp_types::TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "bsl".to_owned(),
+                    version: 1,
+                    text: text.to_owned(),
+                },
+            },
+        )
+        .expect("production didOpen installs the editor buffer overlay");
+        assert!(state.open_files.contains(&file_id));
+        assert!(state.analysis_host.raw_database().try_file_text(file_id).is_some());
+        let identity = state.mem_docs.identity(&uri).unwrap();
+
+        std::fs::remove_dir_all(&editor_dir).unwrap();
+        state.remove_directories(&[paths::AbsPathBuf::assert_utf8(editor_dir)]);
+
+        assert_ne!(state.mem_docs.identity(&uri), Some(identity));
+        assert_eq!(state.mem_docs.get(&uri).as_deref(), Some(text));
+        assert_eq!(&*state.analysis_host.raw_database().file_text(file_id), text);
+        assert!(state.vfs.read().exists(file_id), "open VFS buffer remains authoritative");
     }
 
     #[test]

@@ -48,7 +48,7 @@ bsl-analyzer (LSP server / CLI binary)
 | Metadata | `bsl-metadata`, `bsl-platform`                    |
 | Infra    | `base-db`, `vfs`, `project-model`                 |
 
-- **Salsa 0.26.x** drives incremental computation (auto-invalidate on input change, LRU eviction).
+- **Salsa 0.28.2** drives incremental computation (auto-invalidate on input change, LRU eviction); use the `itrous/salsa` revision pinned in `Cargo.lock` for its cancellation contract.
 - **Rowan** for the syntax tree (immutable, full-fidelity, typed AST wrappers).
 - **`bsl-platform`** is a process-wide singleton serving one platform help snapshot, loaded at startup by `platform-help` from the configured source (`[platform_help]`: installed platform HBK read in-process, help package, `auto` (saved snapshot, installed platform, then the built-in facts), `none`). No help corpus is checked in; tests that need it are `corpus_contract` tests run with `--cfg corpus_contract` and `BSL_PLATFORM_HELP_CORPUS` (see `docs/contributing/DEVELOPMENT_RULES.md`).
 - **`DiagnosticMetadata`** — compile-time const metadata per diagnostic; never hardcode severity / tags inline, always `ctx.severity(code)` / `ctx.tags(code)`.
