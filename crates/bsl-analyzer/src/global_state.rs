@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -8,7 +8,7 @@ use base_db::{DiagnosticsConfigInput, Locale};
 use crossbeam_channel::{Receiver, Sender};
 use hir::CallHierarchyReverseIndex;
 use ide::Analysis;
-use lsp_server::{Message, ReqQueue, Response};
+use lsp_server::{Message, ReqQueue, Request, RequestId, Response};
 use lsp_types::{PublishDiagnosticsParams, Url};
 use parking_lot::RwLock;
 use project_model::Project;
@@ -91,8 +91,10 @@ pub enum Task {
     PreloadExternalFiles {
         files: Vec<vfs::FileId>,
     },
-    RequestResult {
-        response: Response,
+    /// A latency worker's context has been dropped before this outcome reaches the loop.
+    LatencyRequestFinished {
+        key: RequestAttemptKey,
+        outcome: LatencyAttemptOutcome,
     },
     /// Debounce timer fired for a background-analysis busy burst. If the burst
     /// (`epoch`) is still the current one and still running, it promotes to a
@@ -156,6 +158,50 @@ pub enum Task {
     DiagnosticsBaselineRecheck {
         hold: u64,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestAttemptKey {
+    pub id: RequestId,
+    pub generation: u64,
+    pub attempt: u8,
+}
+
+#[derive(Debug)]
+pub enum LatencyAttemptOutcome {
+    Response(Response),
+    Cancelled { kind: salsa::Cancelled, revision: salsa::Revision },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestLifecyclePhase {
+    Running,
+    RetryQueued,
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestOriginGuard {
+    pub uri: Url,
+    pub identity: u64,
+    pub workspace_root: Option<PathBuf>,
+    pub source_roots: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+pub struct RequestLifecycle {
+    pub generation: u64,
+    pub method: String,
+    /// Retained only for the four replay-safe semantic methods.
+    pub request: Option<Request>,
+    /// Attempt currently running, or the next attempt waiting for admission.
+    pub attempt: u8,
+    pub phase: RequestLifecyclePhase,
+    /// Revision of the attempt that queued the retry, retained until the next
+    /// admission so a refusal can explain which snapshot became stale.
+    pub retry_origin_revision: Option<salsa::Revision>,
+    pub retry_eligible: bool,
+    pub origin: Option<RequestOriginGuard>,
+    pub client_cancelled: bool,
 }
 
 /// What a finished batch chunk carries back to the event loop.
@@ -286,6 +332,9 @@ pub struct GlobalState {
     pub loader: Box<dyn loader::Handle>,
     pub vfs_progress_config_version: u32,
     pub vfs_done: bool,
+    /// The initial project was rejected, so no load will ever open the readiness gate
+    /// in this session.
+    pub project_rejected: bool,
     /// When the baseline's ground was last compared with disk.
     ///
     /// The comparison is a handful of stats, and it stands on the loop's hottest path —
@@ -380,6 +429,12 @@ pub struct GlobalState {
     pub preload_external_tokens: HashMap<vfs::FileId, salsa::CancellationToken>,
 
     pub request_tokens: HashMap<lsp_server::RequestId, salsa::CancellationToken>,
+    pub request_token_owners: HashMap<RequestId, RequestAttemptKey>,
+    pub request_lifecycles: HashMap<RequestId, RequestLifecycle>,
+    pub pending_latency_retries: VecDeque<RequestAttemptKey>,
+    /// Set only while the event loop replays a retained request through `handle_request`.
+    pub retry_dispatch: Option<RequestAttemptKey>,
+    pub next_request_generation: u64,
     /// The in-flight `workspace/diagnostic` request, if any. A whole-workspace sweep can run
     /// for minutes; letting several pile onto the shared latency pool would starve interactive
     /// requests. Tracking the active one lets a newer sweep cancel the previous so at most one
@@ -510,6 +565,7 @@ impl GlobalState {
             loader_receiver,
             vfs_progress_config_version: 0,
             vfs_done: false,
+            project_rejected: false,
             diagnostics_baseline_checked_at: None,
             task_pool: task_pool::TaskPool::new_with_handle(),
             call_hierarchy_index: DeferredCallHierarchyIndexState::default(),
@@ -556,6 +612,11 @@ impl GlobalState {
             preload_tokens: HashMap::new(),
             preload_external_tokens: HashMap::new(),
             request_tokens: HashMap::new(),
+            request_token_owners: HashMap::new(),
+            request_lifecycles: HashMap::new(),
+            pending_latency_retries: VecDeque::new(),
+            retry_dispatch: None,
+            next_request_generation: 0,
             last_progress_report: std::time::Instant::now(),
             skipped_bsl: FxHashSet::default(),
             degraded_files_count: 0,
@@ -617,7 +678,9 @@ impl GlobalState {
     /// defer a trim that is already safe, never trim while a snapshot is live.
     pub fn interactive_analysis_quiescent(&self) -> bool {
         let batch_guard = u32::from(self.workspace_batch_plan.is_some());
-        self.analysis_in_flight <= batch_guard && self.request_tokens.is_empty()
+        self.analysis_in_flight <= batch_guard
+            && self.request_tokens.is_empty()
+            && self.request_lifecycles.is_empty()
     }
 
     /// Record that a background analysis job finished. When the last one drains,
@@ -1226,6 +1289,116 @@ mod vfs_race_tests {
         assert!(warnings(main.path()).is_empty(), "a main configuration stays silent");
     }
 
+    #[test]
+    fn legacy_extension_scope_warning_tracks_successful_project_reloads() {
+        #[derive(Debug)]
+        struct SilentLoader;
+        impl loader::Handle for SilentLoader {
+            fn spawn(_sender: loader::Sender) -> Self
+            where
+                Self: Sized,
+            {
+                unreachable!("injected via with_loader, never spawned")
+            }
+            fn set_config(&mut self, _config: loader::Config) {}
+            fn invalidate(&mut self, _path: paths::AbsPathBuf) {}
+            fn load_sync(&mut self, _path: &paths::AbsPath) -> Option<Vec<u8>> {
+                None
+            }
+        }
+
+        fn take_warnings(receiver: &Receiver<Message>) -> Vec<String> {
+            std::iter::from_fn(|| receiver.try_recv().ok())
+                .filter_map(|message| match message {
+                    Message::Notification(notification)
+                        if notification.method == "window/showMessage" =>
+                    {
+                        let params: lsp_types::ShowMessageParams =
+                            serde_json::from_value(notification.params).ok()?;
+                        (params.typ == lsp_types::MessageType::WARNING).then_some(params.message)
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let extension = root.join("ext");
+        std::fs::create_dir_all(&extension).unwrap();
+        std::fs::write(
+            extension.join("Configuration.xml"),
+            "<Properties><ConfigurationExtensionPurpose>Customization</ConfigurationExtensionPurpose></Properties>",
+        )
+        .unwrap();
+        let project_config = root.join("bsl-analyzer.toml");
+        let write_config = |scope: Option<&str>| {
+            let scope = scope.map_or_else(String::new, |scope| format!(", scope = \"{scope}\""));
+            std::fs::write(
+                &project_config,
+                format!(
+                    "[source]\nroot = \".\"\nextensions = [{{ name = \"Feature\", path = \"ext\"{scope} }}]\n"
+                ),
+            )
+            .unwrap();
+        };
+        write_config(None);
+
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let (_loader_tx, loader_receiver) = crossbeam_channel::bounded(4);
+        let mut state = GlobalState::with_loader(sender, Box::new(SilentLoader), loader_receiver);
+        // The injected loader intentionally never publishes file changes. Give the
+        // Salsa database the same valid empty root installed during normal startup,
+        // so config reloads can analyze snapshots without an unset SourceRoot(0).
+        state.init_empty_source_root();
+        state.set_workspace_root(root.to_path_buf()).expect("legacy project loads");
+        let legacy_snapshot = state.analysis_host.raw_database().workspace_configs_snapshot();
+        let legacy_extension = legacy_snapshot
+            .paths
+            .iter()
+            .position(|(_, path)| path == &root.join("ext"))
+            .expect("legacy extension is in the published workspace snapshot");
+        assert_eq!(legacy_snapshot.extension_scopes[legacy_extension], None);
+        let first = take_warnings(&receiver);
+        assert_eq!(first.len(), 1, "one warning per loaded snapshot: {first:?}");
+        assert!(first[0].contains("Feature") && first[0].contains("ext"), "{first:?}");
+        assert!(
+            first[0].contains("InfoBase") && first[0].contains("DataSeparation"),
+            "the warning explains explicit scope and its precision limit: {first:?}"
+        );
+
+        write_config(Some("InfoBase"));
+        assert!(state.reload_project_config(), "explicit scope reloads atomically");
+        let explicit_snapshot = state.analysis_host.raw_database().workspace_configs_snapshot();
+        let explicit_extension = explicit_snapshot
+            .paths
+            .iter()
+            .position(|(_, path)| path == &root.join("ext"))
+            .expect("explicit extension remains in the published workspace snapshot");
+        assert_eq!(
+            explicit_snapshot.extension_scopes[explicit_extension],
+            Some(bsl_metadata::ExtensionScope::InfoBase)
+        );
+        assert_eq!(
+            explicit_snapshot.extension_scopes.len(),
+            explicit_snapshot.paths.len(),
+            "scope fields publish with the entire root snapshot"
+        );
+        assert!(take_warnings(&receiver).is_empty(), "explicit scope removes the warning");
+
+        write_config(None);
+        assert!(state.reload_project_config(), "removing scope reloads atomically");
+        let restored_snapshot = state.analysis_host.raw_database().workspace_configs_snapshot();
+        let restored_extension = restored_snapshot
+            .paths
+            .iter()
+            .position(|(_, path)| path == &root.join("ext"))
+            .expect("restored extension remains in the published workspace snapshot");
+        assert_eq!(restored_snapshot.extension_scopes[restored_extension], None);
+        assert_eq!(take_warnings(&receiver).len(), 1, "legacy scope warns again");
+    }
+
     /// A live workspace reload that adds an extension root must emit a loader
     /// config whose include set covers the new root (and still watches the config
     /// files) — otherwise the VFS never scans the extension and no analysis sees
@@ -1359,13 +1532,12 @@ mod vfs_race_tests {
             "the undeclared extension is not scanned initially"
         );
 
-        std::fs::write(
-            root.join("bsl-analyzer.toml"),
+        let config_for_scope = |scope: &str| {
             format!(
-                "[source]\nroot = \".\"\nexclude = [\"generated\"]\nextensions = [{{ name = \"a\", path = {ext:?} }}]\n"
-            ),
-        )
-        .unwrap();
+                "[source]\nroot = \".\"\nexclude = [\"generated\"]\nextensions = [{{ name = \"a\", path = {ext:?}, scope = \"{scope}\" }}]\n"
+            )
+        };
+        std::fs::write(root.join("bsl-analyzer.toml"), config_for_scope("InfoBase")).unwrap();
         state.vfs_done = true;
         state.set_workspace_root(root.to_path_buf()).expect("live reload");
         let second = configs_rx.try_recv().expect("the reload emits a fresh loader config");
@@ -1379,6 +1551,28 @@ mod vfs_race_tests {
             "the analyzer config files stay watched after the reload"
         );
         assert!(second.version > first.version, "each loader config carries a fresh version");
+
+        let before_scope = state.analysis_host.raw_database().workspace_configs_snapshot();
+        let owner = before_scope.paths.iter().position(|(_, path)| path == ext).unwrap();
+        assert_eq!(
+            before_scope.extension_scopes[owner],
+            Some(bsl_metadata::ExtensionScope::InfoBase)
+        );
+        std::fs::write(root.join("bsl-analyzer.toml"), config_for_scope("DataSeparation")).unwrap();
+        assert!(state.reload_project_config());
+        let after_scope = state.analysis_host.raw_database().workspace_configs_snapshot();
+        assert_eq!(before_scope.paths, after_scope.paths);
+        assert_eq!(before_scope.kinds, after_scope.kinds);
+        assert_eq!(before_scope.canonical_paths, after_scope.canonical_paths);
+        assert_eq!(before_scope.closures, after_scope.closures);
+        assert_eq!(before_scope.topological_order, after_scope.topological_order);
+        assert_eq!(
+            after_scope.extension_scopes[owner],
+            Some(bsl_metadata::ExtensionScope::DataSeparation)
+        );
+        assert_ne!(before_scope.fingerprint, after_scope.fingerprint);
+        let scope_reload = configs_rx.try_recv().expect("Scope-only reload emits a loader config");
+        assert_eq!(includes(&second), includes(&scope_reload));
 
         std::fs::write(
             root.join("bsl-analyzer.toml"),
@@ -1757,7 +1951,10 @@ mod vfs_race_tests {
         let (sender, _receiver) = crossbeam_channel::unbounded();
         let mut state = GlobalState::new(sender);
         state.init_empty_source_root();
-        state.analysis_host.raw_database_mut().set_all_config_paths(vec![(None, root.clone())]);
+        state
+            .analysis_host
+            .raw_database_mut()
+            .set_all_config_paths(vec![(None, root.clone())], None);
 
         state.bootstrap_metadata_substrate();
 
@@ -1852,7 +2049,10 @@ mod vfs_race_tests {
         let (sender, _receiver) = crossbeam_channel::unbounded();
         let mut state = GlobalState::new(sender);
         state.init_empty_source_root();
-        state.analysis_host.raw_database_mut().set_all_config_paths(vec![(None, root.clone())]);
+        state
+            .analysis_host
+            .raw_database_mut()
+            .set_all_config_paths(vec![(None, root.clone())], None);
         state.bootstrap_metadata_substrate();
 
         let root_key = root.to_string_lossy().to_string();
@@ -1942,10 +2142,10 @@ mod vfs_race_tests {
         let (sender, _receiver) = crossbeam_channel::unbounded();
         let mut state = GlobalState::new(sender);
         state.init_empty_source_root();
-        state.analysis_host.raw_database_mut().set_all_config_paths(vec![
-            (None, main_root.clone()),
-            (Some("X".to_string()), ext_root.clone()),
-        ]);
+        state.analysis_host.raw_database_mut().set_all_config_paths(
+            vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+        );
         state.bootstrap_metadata_substrate();
 
         // A .bsl file living in the extension's scope: it must see the merged object.
@@ -2041,10 +2241,10 @@ mod vfs_race_tests {
         let (sender, _receiver) = crossbeam_channel::unbounded();
         let mut state = GlobalState::new(sender);
         state.init_empty_source_root();
-        state.analysis_host.raw_database_mut().set_all_config_paths(vec![
-            (None, main_root.clone()),
-            (Some("X".to_string()), ext_root.clone()),
-        ]);
+        state.analysis_host.raw_database_mut().set_all_config_paths(
+            vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+        );
         state.bootstrap_metadata_substrate();
 
         let bsl_path = ext_root.join("EventSubscriptionConsumer.bsl");
@@ -2149,10 +2349,10 @@ mod vfs_race_tests {
         let (sender, _receiver) = crossbeam_channel::unbounded();
         let mut state = GlobalState::new(sender);
         state.init_empty_source_root();
-        state.analysis_host.raw_database_mut().set_all_config_paths(vec![
-            (None, main_root.clone()),
-            (Some("X".to_string()), ext_root.clone()),
-        ]);
+        state.analysis_host.raw_database_mut().set_all_config_paths(
+            vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+        );
         state.bootstrap_metadata_substrate();
 
         let bsl_path = ext_root.join("ScheduledJobConsumer.bsl");
@@ -2272,10 +2472,10 @@ mod vfs_race_tests {
         let (sender, _receiver) = crossbeam_channel::unbounded();
         let mut state = GlobalState::new(sender);
         state.init_empty_source_root();
-        state.analysis_host.raw_database_mut().set_all_config_paths(vec![
-            (None, main_root.clone()),
-            (Some("X".to_string()), ext_root.clone()),
-        ]);
+        state.analysis_host.raw_database_mut().set_all_config_paths(
+            vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+        );
         state.bootstrap_metadata_substrate();
 
         let bsl_path = ext_root.join("RoleConsumer.bsl");
@@ -2375,10 +2575,10 @@ mod vfs_race_tests {
         let (sender, _receiver) = crossbeam_channel::unbounded();
         let mut state = GlobalState::new(sender);
         state.init_empty_source_root();
-        state.analysis_host.raw_database_mut().set_all_config_paths(vec![
-            (None, main_root.clone()),
-            (Some("X".to_string()), ext_root.clone()),
-        ]);
+        state.analysis_host.raw_database_mut().set_all_config_paths(
+            vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+        );
         state.bootstrap_metadata_substrate();
 
         let bsl_path = ext_root.join("RoleConsumer.bsl");
@@ -2477,7 +2677,7 @@ mod vfs_race_tests {
             db.set_file_text(bsl_file, "Функция Ф() Экспорт КонецФункции");
         }
 
-        state.analysis_host.raw_database_mut().set_all_config_paths(vec![(None, cf.clone())]);
+        state.analysis_host.raw_database_mut().set_all_config_paths(vec![(None, cf.clone())], None);
         state.bootstrap_metadata_substrate();
 
         let db = state.analysis_host.raw_database();
@@ -2540,11 +2740,14 @@ mod vfs_race_tests {
         let (sender, _receiver) = crossbeam_channel::unbounded();
         let mut state = GlobalState::new(sender);
         state.init_empty_source_root();
-        state.analysis_host.raw_database_mut().set_all_config_paths(vec![
-            (None, base.clone()),
-            (Some("A".to_string()), ext_a.clone()),
-            (Some("B".to_string()), ext_b.clone()),
-        ]);
+        state.analysis_host.raw_database_mut().set_all_config_paths(
+            vec![
+                (None, base.clone()),
+                (Some("A".to_string()), ext_a.clone()),
+                (Some("B".to_string()), ext_b.clone()),
+            ],
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+        );
         state.bootstrap_metadata_substrate();
 
         // A .bsl file living in extension A (after bootstrap, so its FileId does not
@@ -2620,11 +2823,14 @@ mod vfs_race_tests {
         let (sender, _receiver) = crossbeam_channel::unbounded();
         let mut state = GlobalState::new(sender);
         state.init_empty_source_root();
-        state.analysis_host.raw_database_mut().set_all_config_paths(vec![
-            (None, base.clone()),
-            (Some("A".to_string()), ext_a.clone()),
-            (Some("B".to_string()), ext_b.clone()),
-        ]);
+        state.analysis_host.raw_database_mut().set_all_config_paths(
+            vec![
+                (None, base.clone()),
+                (Some("A".to_string()), ext_a.clone()),
+                (Some("B".to_string()), ext_b.clone()),
+            ],
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+        );
         state.bootstrap_metadata_substrate();
 
         // Allocate one .bsl file per scope (after the bootstrap, so FileIds don't
@@ -2682,7 +2888,10 @@ mod vfs_race_tests {
         let (sender, _receiver) = crossbeam_channel::unbounded();
         let mut state = GlobalState::new(sender);
         state.init_empty_source_root();
-        state.analysis_host.raw_database_mut().set_all_config_paths(vec![(None, root.clone())]);
+        state
+            .analysis_host
+            .raw_database_mut()
+            .set_all_config_paths(vec![(None, root.clone())], None);
         state.bootstrap_metadata_substrate();
 
         let bsl_path = root.join("CommonModules/М/Ext/Module.bsl");
@@ -2785,6 +2994,52 @@ mod vfs_race_tests {
         assert!(!in_file_set(&state, inside_a), "descendant ObjectModule must be tombstoned");
         assert!(!in_file_set(&state, inside_b), "nested descendant must be tombstoned");
         assert!(in_file_set(&state, outside), "a sibling directory must be untouched");
+    }
+
+    #[test]
+    fn remove_directories_invalidates_open_origin_but_keeps_editor_buffer() {
+        use base_db::SourceDatabase;
+
+        let root = tempfile::tempdir().unwrap();
+        let editor_dir = root.path().join("Editor");
+        std::fs::create_dir_all(&editor_dir).unwrap();
+        let caller = editor_dir.join("Caller.bsl");
+        let text = "Процедура Caller()\nКонецПроцедуры\n";
+        std::fs::write(&caller, text).unwrap();
+
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new(sender);
+        state.init_empty_source_root();
+        state
+            .vfs
+            .write()
+            .set_file_contents(vfs::VfsPath::new(caller.clone()), Some(Arc::from(text)));
+        state.process_changes(false);
+        let file_id = state.vfs.read().file_id(&vfs::VfsPath::new(caller.clone())).unwrap();
+        let uri = lsp_types::Url::from_file_path(&caller).unwrap();
+        crate::handlers::notification::handle_did_open(
+            &mut state,
+            lsp_types::DidOpenTextDocumentParams {
+                text_document: lsp_types::TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "bsl".to_owned(),
+                    version: 1,
+                    text: text.to_owned(),
+                },
+            },
+        )
+        .expect("production didOpen installs the editor buffer overlay");
+        assert!(state.open_files.contains(&file_id));
+        assert!(state.analysis_host.raw_database().try_file_text(file_id).is_some());
+        let identity = state.mem_docs.identity(&uri).unwrap();
+
+        std::fs::remove_dir_all(&editor_dir).unwrap();
+        state.remove_directories(&[paths::AbsPathBuf::assert_utf8(editor_dir)]);
+
+        assert_ne!(state.mem_docs.identity(&uri), Some(identity));
+        assert_eq!(state.mem_docs.get(&uri).as_deref(), Some(text));
+        assert_eq!(&*state.analysis_host.raw_database().file_text(file_id), text);
+        assert!(state.vfs.read().exists(file_id), "open VFS buffer remains authoritative");
     }
 
     #[test]
@@ -3044,10 +3299,10 @@ mod vfs_race_tests {
         let (sender, _receiver) = crossbeam_channel::unbounded();
         let mut state = GlobalState::new(sender);
         state.init_empty_source_root();
-        state.analysis_host.raw_database_mut().set_all_config_paths(vec![
-            (None, main_root.clone()),
-            (Some("X".to_string()), ext_root.clone()),
-        ]);
+        state.analysis_host.raw_database_mut().set_all_config_paths(
+            vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+        );
         state.bootstrap_metadata_substrate();
 
         let bsl_path = ext_root.join("HTTPServiceConsumer.bsl");
@@ -3142,10 +3397,10 @@ mod vfs_race_tests {
         let (sender, _receiver) = crossbeam_channel::unbounded();
         let mut state = GlobalState::new(sender);
         state.init_empty_source_root();
-        state.analysis_host.raw_database_mut().set_all_config_paths(vec![
-            (None, main_root.clone()),
-            (Some("X".to_string()), ext_root.clone()),
-        ]);
+        state.analysis_host.raw_database_mut().set_all_config_paths(
+            vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+        );
         state.bootstrap_metadata_substrate();
 
         let bsl_path = ext_root.join("WebServiceConsumer.bsl");
@@ -3240,10 +3495,10 @@ mod vfs_race_tests {
         let (sender, _receiver) = crossbeam_channel::unbounded();
         let mut state = GlobalState::new(sender);
         state.init_empty_source_root();
-        state.analysis_host.raw_database_mut().set_all_config_paths(vec![
-            (None, main_root.clone()),
-            (Some("X".to_string()), ext_root.clone()),
-        ]);
+        state.analysis_host.raw_database_mut().set_all_config_paths(
+            vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+        );
         state.bootstrap_metadata_substrate();
 
         let bsl_path = ext_root.join("IntegrationServiceConsumer.bsl");
@@ -3355,7 +3610,7 @@ mod vfs_race_tests {
         let web_module = intern_module("WebServices/WebСервис1/Ext/Module.bsl");
         let isvc_module = intern_module("IntegrationServices/ОбменСообщениями/Ext/Module.bsl");
 
-        state.analysis_host.raw_database_mut().set_all_config_paths(vec![(None, cf.clone())]);
+        state.analysis_host.raw_database_mut().set_all_config_paths(vec![(None, cf.clone())], None);
         state.bootstrap_metadata_substrate();
 
         let db = state.analysis_host.raw_database();
@@ -3427,10 +3682,10 @@ mod vfs_race_tests {
         let (sender, _receiver) = crossbeam_channel::unbounded();
         let mut state = GlobalState::new(sender);
         state.init_empty_source_root();
-        state.analysis_host.raw_database_mut().set_all_config_paths(vec![
-            (None, main_root.clone()),
-            (Some("X".to_string()), ext_root.clone()),
-        ]);
+        state.analysis_host.raw_database_mut().set_all_config_paths(
+            vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+        );
         state.bootstrap_metadata_substrate();
 
         let bsl_path = ext_root.join("HTTPServiceConsumer.bsl");
@@ -3540,7 +3795,7 @@ mod vfs_race_tests {
         db.set_source_root(BSL_SOURCE_ROOT, SourceRoot::new_local(file_set));
         db.set_file_source_root(service_a_module_file, BSL_SOURCE_ROOT);
         db.set_file_text(service_a_module_file, "Процедура HandlerA() КонецПроцедуры");
-        db.set_all_config_paths(vec![(None, main_root.clone())]);
+        db.set_all_config_paths(vec![(None, main_root.clone())], None);
         state.bootstrap_metadata_substrate();
 
         let service_a_module_id = ModuleId::new(service_a_module_file);
@@ -3637,7 +3892,7 @@ mod vfs_race_tests {
         db.set_source_root(BSL_SOURCE_ROOT, SourceRoot::new_local(file_set));
         db.set_file_source_root(service_a_module_file, BSL_SOURCE_ROOT);
         db.set_file_text(service_a_module_file, "Процедура ProcedureA() КонецПроцедуры");
-        db.set_all_config_paths(vec![(None, main_root.clone())]);
+        db.set_all_config_paths(vec![(None, main_root.clone())], None);
         state.bootstrap_metadata_substrate();
 
         let service_a_module_id = ModuleId::new(service_a_module_file);
@@ -3741,10 +3996,10 @@ mod vfs_race_tests {
         let (sender, _receiver) = crossbeam_channel::unbounded();
         let mut state = GlobalState::new(sender);
         state.init_empty_source_root();
-        state.analysis_host.raw_database_mut().set_all_config_paths(vec![
-            (None, main_root.clone()),
-            (Some("X".to_string()), ext_root.clone()),
-        ]);
+        state.analysis_host.raw_database_mut().set_all_config_paths(
+            vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+        );
         state.bootstrap_metadata_substrate();
 
         let bsl_path = ext_root.join("SubsystemConsumer.bsl");

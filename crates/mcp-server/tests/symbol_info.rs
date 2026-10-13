@@ -459,7 +459,7 @@ fn stage_woven_workspace() -> (TempDir, PathBuf) {
 
     std::fs::write(
         ws.join("bsl-analyzer.toml"),
-        format!("[source]\nroot = \".\"\nextensions = [{{ name = \"расш\", path = {ext:?} }}]\n"),
+        format!("[source]\nroot = \".\"\nextensions = [{{ name = \"расш\", path = {ext:?}, scope = \"InfoBase\" }}]\n"),
     )
     .expect("declare the extension");
     (dir, ws)
@@ -644,7 +644,7 @@ async fn an_inapplicable_interception_is_not_published_as_a_site() {
     );
     std::fs::write(
         ws.join("bsl-analyzer.toml"),
-        format!("[source]\nroot = \".\"\nextensions = [{{ name = \"расш\", path = {ext:?} }}]\n"),
+        format!("[source]\nroot = \".\"\nextensions = [{{ name = \"расш\", path = {ext:?}, scope = \"InfoBase\" }}]\n"),
     )
     .expect("declare the extension");
 
@@ -811,7 +811,7 @@ async fn an_object_module_method_publishes_its_interceptors_too() {
     .expect("write the extension body");
     std::fs::write(
         ws.join("bsl-analyzer.toml"),
-        format!("[source]\nroot = \".\"\nextensions = [{{ name = \"расш\", path = {ext:?} }}]\n"),
+        format!("[source]\nroot = \".\"\nextensions = [{{ name = \"расш\", path = {ext:?}, scope = \"InfoBase\" }}]\n"),
     )
     .expect("declare the extension");
 
@@ -881,7 +881,7 @@ async fn the_container_context_comes_from_the_declaring_body() {
     );
     std::fs::write(
         ws.join("bsl-analyzer.toml"),
-        format!("[source]\nroot = \".\"\nextensions = [{{ name = \"расш\", path = {ext:?} }}]\n"),
+        format!("[source]\nroot = \".\"\nextensions = [{{ name = \"расш\", path = {ext:?}, scope = \"InfoBase\" }}]\n"),
     )
     .expect("declare the extension");
 
@@ -935,7 +935,7 @@ async fn a_manager_module_method_follows_root_rank() {
         .expect("write the extension body");
     std::fs::write(
         ws.join("bsl-analyzer.toml"),
-        format!("[source]\nroot = \".\"\nextensions = [{{ name = \"расш\", path = {ext:?} }}]\n"),
+        format!("[source]\nroot = \".\"\nextensions = [{{ name = \"расш\", path = {ext:?}, scope = \"InfoBase\" }}]\n"),
     )
     .expect("declare the extension");
 
@@ -1006,7 +1006,7 @@ async fn a_private_base_method_does_not_hide_an_exported_one() {
 
     std::fs::write(
         ws.join("bsl-analyzer.toml"),
-        format!("[source]\nroot = \".\"\nextensions = [{{ name = \"расш\", path = {ext:?} }}]\n"),
+        format!("[source]\nroot = \".\"\nextensions = [{{ name = \"расш\", path = {ext:?}, scope = \"InfoBase\" }}]\n"),
     )
     .expect("declare the extension");
 
@@ -1152,7 +1152,7 @@ async fn an_interceptor_of_a_private_method_is_not_a_site() {
     );
     std::fs::write(
         ws.join("bsl-analyzer.toml"),
-        format!("[source]\nroot = \".\"\nextensions = [{{ name = \"расш\", path = {ext:?} }}]\n"),
+        format!("[source]\nroot = \".\"\nextensions = [{{ name = \"расш\", path = {ext:?}, scope = \"InfoBase\" }}]\n"),
     )
     .expect("declare the extension");
 
@@ -1259,8 +1259,8 @@ async fn a_name_from_another_extension_needs_a_declared_dependency() {
         std::fs::write(
             ws.join("bsl-analyzer.toml"),
             format!(
-                "[source]\nroot = \".\"\nextensions = [\n  {{ name = \"Поставщик\", path = {provider:?} }},\n  \
-                 {{ name = \"Потребитель\", path = {consumer:?}{dependency} }},\n]\n"
+                "[source]\nroot = \".\"\nextensions = [\n  {{ name = \"Поставщик\", path = {provider:?}, scope = \"InfoBase\" }},\n  \
+                 {{ name = \"Потребитель\", path = {consumer:?}, scope = \"InfoBase\"{dependency} }},\n]\n"
             ),
         )
         .expect("declare the extensions");

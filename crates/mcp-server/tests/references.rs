@@ -902,7 +902,7 @@ fn stage_two_roots() -> (TempDir, TempDir) {
     let path = ext.path();
     std::fs::write(
         ws.path().join("bsl-analyzer.toml"),
-        format!("[source]\nroot = \".\"\nextensions = [{{ name = \"расш\", path = {path:?} }}]\n"),
+        format!("[source]\nroot = \".\"\nextensions = [{{ name = \"расш\", path = {path:?}, scope = \"InfoBase\" }}]\n"),
     )
     .expect("declare the extension");
     (ws, ext)

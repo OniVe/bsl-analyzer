@@ -48,7 +48,7 @@ fn setup_at(caller_rel: &str, caller_text: &str) -> (RootDatabaseImpl, FileId) {
         db.set_file_source_root(id, SourceRootId(0));
         db.set_file_text(id, text);
     }
-    db.set_all_config_paths(vec![(None, designer_path())]);
+    db.set_all_config_paths(vec![(None, designer_path())], None);
     (db, caller_id)
 }
 

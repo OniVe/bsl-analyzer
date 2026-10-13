@@ -42,7 +42,7 @@ fn write_config(root: &Path, include: &[&str], extra: &str) {
         format!(
             r#"[source]
 root = "src/cf"
-extensions = [{{ name = "Ext", path = "src/cfe/Ext" }}]
+extensions = [{{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }}]
 
 [diagnostics.baseline]
 directory = "baselines"
@@ -311,7 +311,7 @@ fn repairing_a_damaged_object_keeps_dormant_partition_objects() {
         root.join("bsl-analyzer.toml"),
         r#"[source]
 root = "src/cf"
-extensions = [{ name = "Ext", path = "src/cfe/Ext" }]
+extensions = [{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }]
 
 [diagnostics.baseline]
 directory = "baselines"

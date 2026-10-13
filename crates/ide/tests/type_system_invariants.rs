@@ -154,13 +154,16 @@ fn single_field_lookup_path_agrees_across_infer_and_facade() {
 КонецФункции
 "#;
     let (mut db, file_id) = setup(fixture);
-    db.set_all_config_paths(vec![(
+    db.set_all_config_paths(
+        vec![(
+            None,
+            std::path::PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../bsl-metadata/fixtures/designer"
+            )),
+        )],
         None,
-        std::path::PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../bsl-metadata/fixtures/designer"
-        )),
-    )]);
+    );
 
     let infer = db.infer(file_id);
     let infer_ty =

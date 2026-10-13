@@ -124,7 +124,7 @@ pub(crate) fn workspace_with_an_outside_extension() -> (tempfile::TempDir, PathB
     fs::write(
         workspace.join("bsl-analyzer.toml"),
         format!(
-            "[source]\nroot = \".\"\nextensions = [{{ name = \"a\", path = {extension:?} }}]\n"
+            "[source]\nroot = \".\"\nextensions = [{{ name = \"a\", path = {extension:?}, scope = \"InfoBase\" }}]\n"
         ),
     )
     .unwrap();

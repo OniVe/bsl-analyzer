@@ -3,6 +3,7 @@ mod common;
 use ide::diagnostics_baseline::{
     diagnostic_fingerprint, DiagnosticsBaseline, DiagnosticsBaselineEntry, DiagnosticsBaselineRange,
 };
+use serde_json::{json, Value};
 
 use std::time::Duration;
 
@@ -69,6 +70,108 @@ fn partial_document() {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+}
+
+#[test]
+fn legacy_extension_scope_warning_uses_lsp_channel_and_tracks_config_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("src/cf");
+    let extension = dir.path().join("ext");
+    std::fs::create_dir_all(&main).unwrap();
+    std::fs::create_dir_all(&extension).unwrap();
+    std::fs::write(main.join("Configuration.xml"), "<Configuration/>").unwrap();
+    std::fs::write(
+        extension.join("Configuration.xml"),
+        "<Properties><ConfigurationExtensionPurpose>Customization</ConfigurationExtensionPurpose></Properties>",
+    )
+    .unwrap();
+    std::fs::write(main.join("Main.bsl"), "Процедура Проверка()\nКонецПроцедуры\n").unwrap();
+    let config = dir.path().join("bsl-analyzer.toml");
+    let write_config = |scope: Option<&str>| {
+        let scope = scope.map_or_else(String::new, |scope| format!(", scope = \"{scope}\""));
+        std::fs::write(
+            &config,
+            format!(
+                "[source]\nroot = \"src/cf\"\nextensions = [{{ name = \"Feature\", path = \"ext\"{scope} }}]\n"
+            ),
+        )
+        .unwrap();
+    };
+    write_config(None);
+
+    // initialize and all following traffic pass through the real Content-Length LSP
+    // transport. The harness retains notifications delivered before initialize's reply.
+    let mut lsp = Lsp::start(dir.path());
+    let warning = lsp.wait_for(|message| message["method"] == "window/showMessage");
+    assert_eq!(warning["params"]["type"], 2, "warning severity: {warning}");
+    let warning_text = warning["params"]["message"].as_str().unwrap();
+    assert!(warning_text.contains("Feature") && warning_text.contains("ext"), "{warning}");
+    assert!(
+        warning_text.contains("InfoBase") && warning_text.contains("DataSeparation"),
+        "the client gets the explicit-scope action and precision limit: {warning}"
+    );
+
+    let main_uri = lsp_types::Url::from_file_path(main.join("Main.bsl")).unwrap();
+    let diagnostics = lsp.open(&main.join("Main.bsl"), "Процедура Проверка()\nКонецПроцедуры\n");
+    assert_eq!(diagnostics["method"], "textDocument/publishDiagnostics");
+    for id in [2, 3] {
+        lsp.send(json!({
+            "jsonrpc": "2.0", "id": id, "method": "textDocument/hover",
+            "params": {"textDocument": {"uri": main_uri.clone()}, "position": {"line": 0, "character": 10}}
+        }));
+        let response = lsp.wait_for(|message| message["id"] == id);
+        assert!(response.get("result").is_some(), "hover is answered: {response}");
+    }
+    assert!(
+        lsp.wait_for_within(Duration::from_millis(250), |message| {
+            message["method"] == "window/showMessage"
+        })
+        .is_none(),
+        "ordinary document requests do not repeat the snapshot warning"
+    );
+
+    // didSave is the existing project-config reload path. The explicit snapshot loses
+    // the warning; deleting the field later produces one new warning for that snapshot.
+    write_config(Some("InfoBase"));
+    lsp.send(json!({
+        "jsonrpc": "2.0", "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": lsp_types::Url::from_file_path(&config).unwrap()}}
+    }));
+    // The save can cancel requests already running against the old snapshot: a write
+    // cancellation the server could not replay internally reaches the client as
+    // ContentModified, an explicit cancellation as RequestCanceled. Retry only those;
+    // any other error remains a test failure.
+    let mut response = Value::Null;
+    for id in 4..=8 {
+        lsp.send(json!({
+            "jsonrpc": "2.0", "id": id, "method": "textDocument/hover",
+            "params": {"textDocument": {"uri": main_uri.clone()}, "position": {"line": 0, "character": 10}}
+        }));
+        response = lsp.wait_for(|message| message["id"] == id);
+        if response.get("result").is_some() {
+            break;
+        }
+        assert!(
+            matches!(response["error"]["code"].as_i64(), Some(-32800 | -32801)),
+            "only a reload cancellation may be retried: {response}"
+        );
+    }
+    assert!(response.get("result").is_some(), "explicit snapshot serves hover: {response}");
+    assert!(
+        lsp.wait_for_within(Duration::from_millis(250), |message| {
+            message["method"] == "window/showMessage"
+        })
+        .is_none(),
+        "the explicit snapshot removes the compatibility warning"
+    );
+
+    write_config(None);
+    lsp.send(json!({
+        "jsonrpc": "2.0", "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": lsp_types::Url::from_file_path(&config).unwrap()}}
+    }));
+    let warning = lsp.wait_for(|message| message["method"] == "window/showMessage");
+    assert!(warning["params"]["message"].as_str().unwrap().contains("Feature"));
 }
 
 /// The control for the harness's own judgement: a wait on a server that is idle and

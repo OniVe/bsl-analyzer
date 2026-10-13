@@ -507,6 +507,9 @@ pub fn migrate_v1_to_partitioned(
     // Reuse the unchanged schema-v1 validator; migration must not define a second recipe.
     crate::diagnostics_baseline::diagnostics_baseline_json(baseline)?;
     let expected_scope = expected_v1_scope(plan);
+    if !crate::diagnostics_baseline::legacy_scope_markers_are_valid(&expected_scope) {
+        return Err(PartitionedDiagnosticsBaselineError::InvalidLegacyScopeMarker);
+    }
     if !crate::diagnostics_baseline::scopes_match(&baseline.scope, &expected_scope) {
         return Err(PartitionedDiagnosticsBaselineError::ScopeMismatch);
     }
@@ -552,7 +555,13 @@ where
         }
         .into());
     }
-    if !crate::diagnostics_baseline::scopes_match(&parsed.scope, &expected_v1_scope(plan)) {
+    let expected_scope = expected_v1_scope(plan);
+    if !crate::diagnostics_baseline::legacy_scope_markers_are_valid(&parsed.scope)
+        || !crate::diagnostics_baseline::legacy_scope_markers_are_valid(&expected_scope)
+    {
+        return Err(PartitionedDiagnosticsBaselineError::InvalidLegacyScopeMarker);
+    }
+    if !crate::diagnostics_baseline::scopes_match(&parsed.scope, &expected_scope) {
         return Err(PartitionedDiagnosticsBaselineError::ScopeMismatch);
     }
     Ok(parsed.entries)
@@ -563,16 +572,7 @@ fn expected_v1_scope(
 ) -> crate::diagnostics_baseline::DiagnosticsBaselineScope {
     crate::diagnostics_baseline::DiagnosticsBaselineScope {
         source_root: plan.project_scope.source_root.clone(),
-        extensions: plan
-            .project_scope
-            .extensions
-            .iter()
-            .map(|extension| crate::diagnostics_baseline::DiagnosticsBaselineExtension {
-                name: extension.name.clone(),
-                path: extension.path.clone(),
-                depends_on: extension.depends_on.clone(),
-            })
-            .collect(),
+        extensions: plan.project_scope.extensions.clone(),
     }
 }
 
@@ -885,11 +885,6 @@ fn load_diagnostics_baseline_set_once(
             let hashing = reader.into_inner();
             stats.object_reads += hashing.reads();
             let actual_hash = hashing.finalize();
-            if parsed.identity != expected_partition.identity {
-                return Err(PartitionedDiagnosticsBaselineError::PartitionIdentityMismatch(
-                    manifest_entry.partition_id.clone(),
-                ));
-            }
             let expected_path = partition_object_path(
                 &expected_partition.id,
                 &expected_partition.key,
@@ -908,6 +903,14 @@ fn load_diagnostics_baseline_set_once(
             if parsed.schema_version != DIAGNOSTICS_BASELINE_PARTITION_SCHEMA_VERSION {
                 return Err(PartitionedDiagnosticsBaselineError::UnsupportedPartitionSchema(
                     parsed.schema_version,
+                ));
+            }
+            if !parsed.identity.legacy_scope_marker_is_valid() {
+                return Err(PartitionedDiagnosticsBaselineError::InvalidLegacyScopeMarker);
+            }
+            if parsed.identity != expected_partition.identity {
+                return Err(PartitionedDiagnosticsBaselineError::PartitionIdentityMismatch(
+                    manifest_entry.partition_id.clone(),
                 ));
             }
             for entry in &parsed.entries {
@@ -1135,6 +1138,9 @@ pub fn diagnostics_partition_json(
     identity: DiagnosticsBaselinePartitionIdentity,
     mut diagnostics: Vec<DiagnosticsBaselineEntry>,
 ) -> Result<Vec<u8>, PartitionedDiagnosticsBaselineError> {
+    if !identity.legacy_scope_marker_is_valid() {
+        return Err(PartitionedDiagnosticsBaselineError::InvalidLegacyScopeMarker);
+    }
     diagnostics.sort_by(entry_sort);
     validate_entries(&diagnostics)?;
     let file = DiagnosticsBaselinePartitionFile {
@@ -1358,6 +1364,8 @@ pub enum PartitionedDiagnosticsBaselineError {
     ScopeMismatch,
     #[error("partition identity does not match: {0}")]
     PartitionIdentityMismatch(String),
+    #[error("legacy scope marker must be true and cannot accompany an explicit scope")]
+    InvalidLegacyScopeMarker,
     #[error("missing diagnostics baseline partitions: {ids:?}")]
     MissingPartitions { ids: Vec<String>, orphan_ids: Vec<String> },
     #[error("orphan diagnostics baseline partitions: {0:?}")]
@@ -1487,6 +1495,9 @@ mod tests {
         let extension = DiagnosticsBaselinePartitionIdentity::Extension {
             name: "Ext".to_owned(),
             path: "src/cfe/Ext".to_owned(),
+            scope: Some(bsl_metadata::ExtensionScope::InfoBase),
+            legacy_scope: None,
+            dependency_scopes: vec![],
             depends_on: vec![],
         };
         DiagnosticsBaselinePartitionPlan {
@@ -1495,6 +1506,9 @@ mod tests {
                 extensions: vec![project_model::DiagnosticsBaselineProjectExtension {
                     name: "Ext".to_owned(),
                     path: "src/cfe/Ext".to_owned(),
+                    scope: Some(bsl_metadata::ExtensionScope::InfoBase),
+                    legacy_scope: None,
+                    dependency_scopes: vec![],
                     depends_on: vec![],
                 }],
                 externals: vec![],
@@ -1573,6 +1587,43 @@ mod tests {
         manifest
     }
 
+    fn replace_extension_object_identity(
+        root: &std::path::Path,
+        directory: &ManagedBaselineDirectory,
+        manifest: &DiagnosticsBaselineManifest,
+        plan: &DiagnosticsBaselinePartitionPlan,
+        identity: DiagnosticsBaselinePartitionIdentity,
+    ) -> (String, Vec<u8>) {
+        let partition =
+            plan.partitions.iter().find(|partition| partition.id == "extension:Ext").unwrap();
+        let bytes = serde_json::to_vec(&DiagnosticsBaselinePartitionFile {
+            schema_version: DIAGNOSTICS_BASELINE_PARTITION_SCHEMA_VERSION,
+            partition: identity,
+            diagnostics: vec![entry(
+                "src/cfe/Ext/CommonModules/B/Ext/Module.bsl",
+                "IfElseDuplicatedCodeBlock",
+            )],
+        })
+        .unwrap();
+        let mut bytes = bytes;
+        bytes.push(b'\n');
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        let file = partition_object_path(&partition.id, &partition.key, &hash).unwrap();
+        directory.create_file_new(&file).unwrap().write_all(&bytes).unwrap();
+        let replaced_file = file.clone();
+        let mut files = manifest.partitions.clone();
+        let extension = files.iter_mut().find(|file| file.partition_id == "extension:Ext").unwrap();
+        extension.file = file;
+        extension.blake3 = hash;
+        let updated = diagnostics_manifest(plan.project_scope_fingerprint.clone(), files);
+        std::fs::write(
+            root.join("baselines/manifest.json"),
+            diagnostics_manifest_json(&updated).unwrap(),
+        )
+        .unwrap();
+        (replaced_file, bytes)
+    }
+
     #[test]
     fn partitioned_baseline_schema_v2_generation_is_byte_deterministic() {
         let plan = plan();
@@ -1602,6 +1653,173 @@ mod tests {
             diagnostics_manifest_json(&second).unwrap()
         );
         assert_eq!(first.generation, second.generation);
+    }
+
+    #[test]
+    fn contradictory_legacy_scope_markers_are_rejected_at_baseline_boundary() {
+        let identity = |dependency_scopes| DiagnosticsBaselinePartitionIdentity::Extension {
+            name: "Ext".to_owned(),
+            path: "src/cfe/Ext".to_owned(),
+            scope: Some(bsl_metadata::ExtensionScope::InfoBase),
+            legacy_scope: None,
+            dependency_scopes,
+            depends_on: vec![],
+        };
+        let contradictory_root = DiagnosticsBaselinePartitionIdentity::Extension {
+            name: "Ext".to_owned(),
+            path: "src/cfe/Ext".to_owned(),
+            scope: Some(bsl_metadata::ExtensionScope::InfoBase),
+            legacy_scope: Some(true),
+            dependency_scopes: vec![],
+            depends_on: vec![],
+        };
+        assert!(matches!(
+            diagnostics_partition_json(contradictory_root, vec![]),
+            Err(PartitionedDiagnosticsBaselineError::InvalidLegacyScopeMarker)
+        ));
+        let contradictory_dependency =
+            identity(vec![project_model::DiagnosticsBaselineDependencyScope {
+                name: "Base".to_owned(),
+                scope: Some(bsl_metadata::ExtensionScope::DataSeparation),
+                legacy_scope: Some(true),
+            }]);
+        assert!(matches!(
+            diagnostics_partition_json(contradictory_dependency, vec![]),
+            Err(PartitionedDiagnosticsBaselineError::InvalidLegacyScopeMarker)
+        ));
+    }
+
+    #[test]
+    fn fresh_legacy_root_and_dependency_baselines_load_but_old_or_contradictory_markers_fail_read_only(
+    ) {
+        for legacy_dependency in [false, true] {
+            let root = tempdir().unwrap();
+            let directory = ManagedBaselineDirectory::open(root.path(), "baselines", true).unwrap();
+            let mut plan = plan();
+            let extension =
+                plan.partitions.iter_mut().find(|part| part.id == "extension:Ext").unwrap();
+            let project_extension = &mut plan.project_scope.extensions[0];
+            match &mut extension.identity {
+                DiagnosticsBaselinePartitionIdentity::Extension {
+                    scope,
+                    legacy_scope,
+                    dependency_scopes,
+                    ..
+                } => {
+                    if legacy_dependency {
+                        *dependency_scopes =
+                            vec![project_model::DiagnosticsBaselineDependencyScope {
+                                name: "Base".to_owned(),
+                                scope: None,
+                                legacy_scope: Some(true),
+                            }];
+                        project_extension.dependency_scopes = dependency_scopes.clone();
+                    } else {
+                        *scope = None;
+                        *legacy_scope = Some(true);
+                        project_extension.scope = None;
+                        project_extension.legacy_scope = Some(true);
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let expected_identity = extension.identity.clone();
+            let manifest = write_set(&directory, &plan);
+            let (accepted, _) =
+                load_diagnostics_baseline_set_reusing(&directory, &plan, None, &BTreeSet::new())
+                    .unwrap();
+            assert_eq!(accepted.partitions["extension:Ext"].identity, expected_identity);
+
+            let markerless = match expected_identity.clone() {
+                DiagnosticsBaselinePartitionIdentity::Extension {
+                    scope,
+                    dependency_scopes,
+                    ..
+                } => DiagnosticsBaselinePartitionIdentity::Extension {
+                    name: "Ext".to_owned(),
+                    path: "src/cfe/Ext".to_owned(),
+                    scope,
+                    legacy_scope: None,
+                    dependency_scopes: dependency_scopes
+                        .into_iter()
+                        .map(|dependency| project_model::DiagnosticsBaselineDependencyScope {
+                            legacy_scope: None,
+                            ..dependency
+                        })
+                        .collect(),
+                    depends_on: vec![],
+                },
+                _ => unreachable!(),
+            };
+            let (markerless_file, markerless_bytes) = replace_extension_object_identity(
+                root.path(),
+                &directory,
+                &manifest,
+                &plan,
+                markerless,
+            );
+            let manifest_before =
+                std::fs::read(root.path().join("baselines/manifest.json")).unwrap();
+            let error =
+                load_diagnostics_baseline_set_reusing(&directory, &plan, None, &BTreeSet::new())
+                    .unwrap_err();
+            assert!(matches!(
+                error,
+                PartitionedDiagnosticsBaselineError::PartitionIdentityMismatch(_)
+            ));
+            assert_eq!(
+                std::fs::read(root.path().join("baselines/manifest.json")).unwrap(),
+                manifest_before
+            );
+            assert_eq!(
+                std::fs::read(root.path().join("baselines").join(markerless_file)).unwrap(),
+                markerless_bytes
+            );
+
+            let contradictory = match expected_identity {
+                DiagnosticsBaselinePartitionIdentity::Extension {
+                    scope,
+                    mut dependency_scopes,
+                    ..
+                } => {
+                    if legacy_dependency {
+                        dependency_scopes[0].scope = Some(bsl_metadata::ExtensionScope::InfoBase);
+                        dependency_scopes[0].legacy_scope = Some(true);
+                    }
+                    DiagnosticsBaselinePartitionIdentity::Extension {
+                        name: "Ext".to_owned(),
+                        path: "src/cfe/Ext".to_owned(),
+                        scope: if legacy_dependency {
+                            scope
+                        } else {
+                            Some(bsl_metadata::ExtensionScope::InfoBase)
+                        },
+                        legacy_scope: if legacy_dependency { None } else { Some(true) },
+                        dependency_scopes,
+                        depends_on: vec![],
+                    }
+                }
+                _ => unreachable!(),
+            };
+            let latest: DiagnosticsBaselineManifest = serde_json::from_slice(
+                &std::fs::read(root.path().join("baselines/manifest.json")).unwrap(),
+            )
+            .unwrap();
+            replace_extension_object_identity(
+                root.path(),
+                &directory,
+                &latest,
+                &plan,
+                contradictory,
+            );
+            let error =
+                load_diagnostics_baseline_set_reusing(&directory, &plan, None, &BTreeSet::new())
+                    .unwrap_err();
+            assert!(
+                matches!(&error, PartitionedDiagnosticsBaselineError::InvalidLegacyScopeMarker),
+                "contradictory root/dependency scope should be rejected specifically: {error:?}"
+            );
+        }
     }
 
     #[test]
@@ -1860,6 +2078,9 @@ mod tests {
         changed.partitions[1].identity = DiagnosticsBaselinePartitionIdentity::Extension {
             name: "Ext".to_owned(),
             path: "src/cfe/Renamed".to_owned(),
+            scope: Some(bsl_metadata::ExtensionScope::InfoBase),
+            legacy_scope: None,
+            dependency_scopes: vec![],
             depends_on: vec![],
         };
         let snapshot = load_diagnostics_baseline_set(&directory, &changed).unwrap();
@@ -1995,6 +2216,9 @@ mod tests {
                     extensions: vec![crate::diagnostics_baseline::DiagnosticsBaselineExtension {
                         name: "Ext".to_owned(),
                         path: "src/cfe/Ext".to_owned(),
+                        scope: Some(bsl_metadata::ExtensionScope::InfoBase),
+                        legacy_scope: None,
+                        dependency_scopes: vec![],
                         depends_on: vec![],
                     }],
                 },
@@ -2355,6 +2579,9 @@ mod tests {
                     .map(|extension| crate::diagnostics_baseline::DiagnosticsBaselineExtension {
                         name: extension.name.clone(),
                         path: extension.path.clone(),
+                        scope: extension.scope,
+                        legacy_scope: extension.legacy_scope,
+                        dependency_scopes: extension.dependency_scopes.clone(),
                         depends_on: extension.depends_on.clone(),
                     })
                     .collect(),
@@ -2369,6 +2596,65 @@ mod tests {
             crate::diagnostics_baseline::diagnostics_baseline_json(&baseline).unwrap(),
             before
         );
+    }
+
+    #[test]
+    fn v1_migration_accepts_fresh_legacy_root_and_dependency_but_rejects_old_or_contradictory_scope(
+    ) {
+        for legacy_root in [true, false] {
+            let mut plan = plan();
+            let extension = &mut plan.project_scope.extensions[0];
+            if legacy_root {
+                extension.scope = None;
+                extension.legacy_scope = Some(true);
+            } else {
+                extension.dependency_scopes =
+                    vec![project_model::DiagnosticsBaselineDependencyScope {
+                        name: "Base".to_owned(),
+                        scope: None,
+                        legacy_scope: Some(true),
+                    }];
+                if let DiagnosticsBaselinePartitionIdentity::Extension {
+                    dependency_scopes, ..
+                } = &mut plan.partitions[1].identity
+                {
+                    *dependency_scopes = extension.dependency_scopes.clone();
+                }
+            }
+            let scope = expected_v1_scope(&plan);
+            let fresh = DiagnosticsBaseline {
+                schema_version: crate::diagnostics_baseline::DIAGNOSTICS_BASELINE_SCHEMA_VERSION,
+                scope: scope.clone(),
+                diagnostics: vec![],
+            };
+            assert!(migrate_v1_to_partitioned(&fresh, &plan).is_ok());
+
+            let mut markerless = fresh.clone();
+            if legacy_root {
+                markerless.scope.extensions[0].legacy_scope = None;
+            } else {
+                markerless.scope.extensions[0].dependency_scopes[0].legacy_scope = None;
+            }
+            assert!(matches!(
+                migrate_v1_to_partitioned(&markerless, &plan),
+                Err(PartitionedDiagnosticsBaselineError::ScopeMismatch)
+            ));
+
+            let mut contradictory = fresh;
+            if legacy_root {
+                contradictory.scope.extensions[0].scope =
+                    Some(bsl_metadata::ExtensionScope::InfoBase);
+            } else {
+                contradictory.scope.extensions[0].dependency_scopes[0].scope =
+                    Some(bsl_metadata::ExtensionScope::DataSeparation);
+            }
+            assert!(matches!(
+                migrate_v1_to_partitioned(&contradictory, &plan),
+                Err(PartitionedDiagnosticsBaselineError::Legacy(
+                    DiagnosticsBaselineError::InvalidLegacyScopeMarker
+                ))
+            ));
+        }
     }
 
     #[test]
@@ -2395,6 +2681,9 @@ mod tests {
                 .map(|extension| crate::diagnostics_baseline::DiagnosticsBaselineExtension {
                     name: extension.name.clone(),
                     path: extension.path.clone(),
+                    scope: extension.scope,
+                    legacy_scope: extension.legacy_scope,
+                    dependency_scopes: extension.dependency_scopes.clone(),
                     depends_on: extension.depends_on.clone(),
                 })
                 .collect(),

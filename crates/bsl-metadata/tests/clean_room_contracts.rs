@@ -290,7 +290,12 @@ fn duplicate_name_and_uri_indexes_keep_distinct_winners_after_add_and_rebuild() 
     }
     for rebuilt in [false, true] {
         if rebuilt {
-            config.merge_extension_overlay(&Configuration::new("Empty"));
+            let raw = config.common_attribute_set().clone();
+            config.merge_extension_overlay(
+                &Configuration::new("Empty"),
+                Some(bsl_metadata::ExtensionScope::InfoBase),
+                Some(&raw),
+            );
         }
         assert_eq!(config.find_common_module("ёЖmODULE").unwrap().uuid(), &last_id);
         assert_eq!(config.find_module_by_uri(uri).unwrap().uuid(), &last_id);

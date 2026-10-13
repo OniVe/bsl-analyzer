@@ -666,7 +666,7 @@ fn resolve_event_subscription_for_file_uses_bootstrapped_listing() {
     );
     db.set_file_text(module_file, "Процедура Т() КонецПроцедуры");
 
-    db.set_all_config_paths(vec![(None, root.clone())]);
+    db.set_all_config_paths(vec![(None, root.clone())], None);
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
@@ -753,7 +753,10 @@ fn main_event_subscription_names_fall_back_to_the_chain_for_an_extension_only_pr
     db.set_file_text(module_file, "Процедура Т() КонецПроцедуры");
 
     // Единственная конфигурация — расширение X: главной нет вовсе.
-    db.set_all_config_paths(vec![(Some("X".to_string()), root.clone())]);
+    db.set_all_config_paths(
+        vec![(Some("X".to_string()), root.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
@@ -836,10 +839,10 @@ fn main_event_subscription_names_stay_main_only_without_the_substrate() {
     db.set_file_source_root(module_file, SourceRootId(0));
     db.set_file_text(module_file, "Процедура Т() КонецПроцедуры");
 
-    db.set_all_config_paths(vec![
-        (None, main_root.clone()),
-        (Some("X".to_string()), ext_root.clone()),
-    ]);
+    db.set_all_config_paths(
+        vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
     // Субстрат намеренно не поднят: `set_metadata_listing` не зовётся.
 
     assert_eq!(
@@ -1023,7 +1026,7 @@ fn resolve_scheduled_job_for_file_uses_bootstrapped_listing() {
     );
     db.set_file_text(module_file, "Процедура Т() КонецПроцедуры");
 
-    db.set_all_config_paths(vec![(None, root.clone())]);
+    db.set_all_config_paths(vec![(None, root.clone())], None);
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
@@ -1269,7 +1272,7 @@ fn resolve_role_for_file_uses_bootstrapped_listing() {
     db.set_file_text(role_rights, rights_xml());
     db.set_file_text(consumer_file, "Процедура Т() КонецПроцедуры");
 
-    db.set_all_config_paths(vec![(None, root.clone())]);
+    db.set_all_config_paths(vec![(None, root.clone())], None);
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
@@ -1362,6 +1365,10 @@ fn a_chain_resolves_the_owning_extension_first_and_lists_each_name_once() {
     // Slot 0 is the dependency, slot 1 the borrower whose closure names it. No base
     // slot: this is the extension-only shape, where the chain is all there is.
     db.set_workspace_configs_snapshot(WorkspaceConfigsSnapshot {
+        extension_scopes: vec![
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+        ],
         paths: vec![
             (Some("A".to_owned()), dep_root.clone()),
             (Some("B".to_owned()), own_root.clone()),
@@ -1428,8 +1435,8 @@ fn per_file_lookups_serve_an_extension_only_project_from_its_chain() {
         )
     }
 
-    // `label` is what makes this an extension root rather than a base one; the rest
-    // of the stand is identical, so the label is the only variable under test.
+    // The label and its explicit Scope distinguish an extension from a base root;
+    // both roots declare the same metadata.
     let resolve_with = |label: Option<String>| -> Option<String> {
         let root = std::env::temp_dir().join(format!(
             "bsl_extension_only_lookup_{}_{:?}",
@@ -1454,7 +1461,8 @@ fn per_file_lookups_serve_an_extension_only_project_from_its_chain() {
         db.set_file_text(role_main, &role_xml("РольРасширения"));
         db.set_file_text(consumer_file, "Процедура Т() КонецПроцедуры");
 
-        db.set_all_config_paths(vec![(label, root.clone())]);
+        let scope = label.as_ref().map(|_| bsl_metadata::ExtensionScope::InfoBase);
+        db.set_all_config_paths(vec![(label, root.clone())], scope);
         db.set_metadata_listing(
             &root.to_string_lossy(),
             MetadataListingData {
@@ -1574,7 +1582,7 @@ fn role_links_to_object_rights_and_rls_condition_object_from_listed_substrate() 
     );
     db.set_file_text(consumer_file, "Процедура Т() КонецПроцедуры");
 
-    db.set_all_config_paths(vec![(None, root.clone())]);
+    db.set_all_config_paths(vec![(None, root.clone())], None);
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
@@ -1681,7 +1689,7 @@ fn role_names_for_file_uses_bootstrapped_listing() {
     db.set_file_text(role_rights, rights_xml());
     db.set_file_text(consumer_file, "Процедура Т() КонецПроцедуры");
 
-    db.set_all_config_paths(vec![(None, root.clone())]);
+    db.set_all_config_paths(vec![(None, root.clone())], None);
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
@@ -2113,7 +2121,7 @@ fn test_resolver_cross_module_gated_by_configurations() {
         before
     );
 
-    db.set_all_config_paths(vec![(None, std::path::PathBuf::from("/does-not-exist"))]);
+    db.set_all_config_paths(vec![(None, std::path::PathBuf::from("/does-not-exist"))], None);
 
     let after = resolver.resolve_path(&db, &path);
     assert!(
@@ -2138,7 +2146,7 @@ fn resolve_register_by_name_maps_to_configured_mdo_type() {
 
     let config_path =
         concat!(env!("CARGO_MANIFEST_DIR"), "/../bsl-metadata/fixtures/designer").to_string();
-    db.set_all_config_paths(vec![(None, std::path::PathBuf::from(config_path))]);
+    db.set_all_config_paths(vec![(None, std::path::PathBuf::from(config_path))], None);
 
     let resolver = Resolver::with_workspace_scope(ModuleId::new(file));
 
@@ -2209,7 +2217,7 @@ fn sdbl_hir_resolves_tables_via_per_mdo_accessors() {
         if with_config {
             let config_path =
                 concat!(env!("CARGO_MANIFEST_DIR"), "/../bsl-metadata/fixtures/designer");
-            db.set_all_config_paths(vec![(None, std::path::PathBuf::from(config_path))]);
+            db.set_all_config_paths(vec![(None, std::path::PathBuf::from(config_path))], None);
         }
         (db, file_id)
     }
@@ -2462,10 +2470,10 @@ fn metadata_xml_change_invalidates_only_its_config_root() {
     write_catalog(&ext_root, "ДопДанные", "00000000-0000-0000-0000-000000000002");
 
     let mut db = RootDatabaseImpl::new();
-    db.set_all_config_paths(vec![
-        (None, main_root.clone()),
-        (Some("X".to_string()), ext_root.clone()),
-    ]);
+    db.set_all_config_paths(
+        vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
 
     let main_file = FileId(0);
     let ext_file = FileId(1);
@@ -2521,10 +2529,10 @@ fn infer_effective_resolves_base_sibling_in_insertion() {
     std::fs::create_dir_all(&ext_root).unwrap();
 
     let mut db = RootDatabaseImpl::new();
-    db.set_all_config_paths(vec![
-        (None, main_root.clone()),
-        (Some("X".to_string()), ext_root.clone()),
-    ]);
+    db.set_all_config_paths(
+        vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
 
     let main_file = FileId(0);
     let ext_file = FileId(1);
@@ -2598,10 +2606,10 @@ fn infer_effective_uses_changed_method_return_for_sibling_call() {
     std::fs::create_dir_all(&ext_root).unwrap();
 
     let mut db = RootDatabaseImpl::new();
-    db.set_all_config_paths(vec![
-        (None, main_root.clone()),
-        (Some("X".to_string()), ext_root.clone()),
-    ]);
+    db.set_all_config_paths(
+        vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
 
     let main_file = FileId(0);
     let ext_file = FileId(1);
@@ -2731,10 +2739,10 @@ fn sdbl_hir_for_extension_file_uses_base_configuration_standard_attributes() {
     .unwrap();
 
     let mut db = RootDatabaseImpl::new();
-    db.set_all_config_paths(vec![
-        (None, main_root.clone()),
-        (Some("BMS_RU_UT".to_string()), extension_root.clone()),
-    ]);
+    db.set_all_config_paths(
+        vec![(None, main_root.clone()), (Some("BMS_RU_UT".to_string()), extension_root.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
 
     let file_id = FileId(0);
     let file_path = extension_root.join("CommonModules/Модуль/Ext/Module.bsl");
@@ -3347,7 +3355,7 @@ fn test_workspace_call_graph_query_ref_links_method_to_mdo() {
     .unwrap();
 
     let mut db = RootDatabaseImpl::new();
-    db.set_all_config_paths(vec![(None, root.clone())]);
+    db.set_all_config_paths(vec![(None, root.clone())], None);
 
     let file_id = FileId(0);
     let file_path = root.join("CommonModules/Отчеты/Ext/Module.bsl");
@@ -3902,7 +3910,7 @@ fn call_hierarchy_index_cfe_parity() {
     db.set_file_text(base_file, base_source);
     db.set_file_text(extension_file, extension_source);
     let config_paths = fixture.config_paths();
-    db.set_all_config_paths(config_paths.clone());
+    db.set_all_config_paths(config_paths.clone(), Some(bsl_metadata::ExtensionScope::InfoBase));
     let modules = [ModuleId::new(base_file), ModuleId::new(extension_file)];
     let mut paths = FxHashMap::default();
     paths.insert(base_file, base_path.to_string_lossy().into_owned());
@@ -4002,7 +4010,7 @@ fn cfe_db_with_two_server_bodies(
     } else {
         db.set_file_text(base, "Процедура П() Экспорт КонецПроцедуры");
     }
-    db.set_all_config_paths(fixture.config_paths());
+    db.set_all_config_paths(fixture.config_paths(), Some(bsl_metadata::ExtensionScope::InfoBase));
 
     (db, [ModuleId::new(base), ModuleId::new(ext_server), ModuleId::new(caller)])
 }
@@ -4105,7 +4113,10 @@ fn global_common_module_exports_stop_at_an_unread_body() {
                 db.set_file_text(base, "Функция П() Экспорт КонецФункции");
             }
         }
-        db.set_all_config_paths(fixture.config_paths());
+        db.set_all_config_paths(
+            fixture.config_paths(),
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+        );
 
         let surface = hir::Resolver::with_workspace_scope(ModuleId::new(caller))
             .global_common_module_exports(&db);
@@ -4192,7 +4203,10 @@ fn application_module_exports_are_typed_and_preserve_unread_gaps() {
             db.set_file_text(app, app_source);
         }
         db.set_file_text(caller, "Процедура Тест() Экспорт КонецПроцедуры");
-        db.set_all_config_paths(fixture.config_paths());
+        db.set_all_config_paths(
+            fixture.config_paths(),
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+        );
 
         hir::Resolver::with_workspace_scope(ModuleId::new(caller)).application_module_exports(&db)
     }
@@ -4261,7 +4275,7 @@ fn common_module_body_lookup_marks_declared_but_unmapped_body() {
     db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
     db.set_file_source_root(caller, SourceRootId(0));
     db.set_file_text(caller, caller_source);
-    db.set_all_config_paths(fixture.config_paths());
+    db.set_all_config_paths(fixture.config_paths(), Some(bsl_metadata::ExtensionScope::InfoBase));
 
     let bodies = db.resolve_common_module_files_for_file(caller, "DeclaredWithoutBody");
     assert!(bodies.is_empty());
@@ -4313,7 +4327,7 @@ fn application_module_path_scan_is_memoized_across_method_bodies() {
     db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
     db.set_file_source_root(caller, SourceRootId(0));
     db.set_file_text(caller, &source);
-    db.set_all_config_paths(fixture.config_paths());
+    db.set_all_config_paths(fixture.config_paths(), Some(bsl_metadata::ExtensionScope::InfoBase));
 
     let _ = db.infer(caller);
     let rows = db.salsa_event_report().expect("event counters enabled");
@@ -4348,7 +4362,7 @@ fn application_module_path_scan_is_memoized_across_files_of_one_root() {
     db.set_file_source_root(second, SourceRootId(0));
     db.set_file_text(first, source);
     db.set_file_text(second, source);
-    db.set_all_config_paths(fixture.config_paths());
+    db.set_all_config_paths(fixture.config_paths(), Some(bsl_metadata::ExtensionScope::InfoBase));
 
     let _ = db.infer(first);
     let _ = db.infer(second);
@@ -4393,7 +4407,7 @@ fn application_export_shadows_same_named_platform_property_for_reads() {
     }
     db.set_file_text(app, app_source);
     db.set_file_text(caller, caller_source);
-    db.set_all_config_paths(fixture.config_paths());
+    db.set_all_config_paths(fixture.config_paths(), Some(bsl_metadata::ExtensionScope::InfoBase));
 
     assert!(
         !db.infer(caller).var_types.contains_key("результат"),
@@ -4419,7 +4433,7 @@ fn target_platform_version_invalidates_unresolved_name_certainty() {
     db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
     db.set_file_source_root(caller, SourceRootId(0));
     db.set_file_text(caller, source);
-    db.set_all_config_paths(fixture.config_paths());
+    db.set_all_config_paths(fixture.config_paths(), Some(bsl_metadata::ExtensionScope::InfoBase));
 
     let unresolved_count = |db: &RootDatabaseImpl| {
         db.infer(caller)
@@ -4455,7 +4469,7 @@ fn boot_window_keeps_user_global_surface_indeterminate() {
     db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
     db.set_file_source_root(caller, SourceRootId(0));
     db.set_file_text(caller, source);
-    db.set_all_config_paths(fixture.config_paths());
+    db.set_all_config_paths(fixture.config_paths(), Some(bsl_metadata::ExtensionScope::InfoBase));
     db.set_workspace_load_complete(false);
 
     let unresolved_count = |db: &RootDatabaseImpl| {
@@ -4503,7 +4517,7 @@ fn register_movement_resolves_to_register_mdo_in_both_paths() {
 
     let config_path =
         concat!(env!("CARGO_MANIFEST_DIR"), "/../bsl-metadata/fixtures/designer").to_string();
-    db.set_all_config_paths(vec![(None, std::path::PathBuf::from(config_path))]);
+    db.set_all_config_paths(vec![(None, std::path::PathBuf::from(config_path))], None);
 
     let is_register_edge = |e: &hir::ResolvedCallEdge| {
         e.kind == EdgeKind::RegisterMovement
@@ -4556,7 +4570,7 @@ fn idle_handler_resolves_to_a_global_common_module() {
 
     let config_path =
         concat!(env!("CARGO_MANIFEST_DIR"), "/../bsl-metadata/fixtures/designer").to_string();
-    db.set_all_config_paths(vec![(None, std::path::PathBuf::from(config_path))]);
+    db.set_all_config_paths(vec![(None, std::path::PathBuf::from(config_path))], None);
 
     let is_global_idle = |e: &hir::ResolvedCallEdge| {
         e.kind == EdgeKind::IdleHandler
@@ -4689,7 +4703,7 @@ fn event_subscription_links_to_its_exported_handler() {
     .unwrap();
 
     let mut db = RootDatabaseImpl::new();
-    db.set_all_config_paths(vec![(None, root.clone())]);
+    db.set_all_config_paths(vec![(None, root.clone())], None);
 
     let file_id = FileId(0);
     let file_path = root.join("CommonModules/ОбщийМодуль/Ext/Module.bsl");
@@ -4732,7 +4746,7 @@ fn subsystem_membership_links_to_member_objects() {
         env!("CARGO_MANIFEST_DIR"),
         "/../bsl-metadata/fixtures/designer"
     ));
-    db.set_all_config_paths(vec![(None, config_path)]);
+    db.set_all_config_paths(vec![(None, config_path)], None);
 
     let file_id = FileId(0);
     let mut file_set = FileSet::new();
@@ -4773,7 +4787,7 @@ fn document_links_to_posted_registers_via_register_records() {
         env!("CARGO_MANIFEST_DIR"),
         "/../bsl-metadata/fixtures/designer"
     ));
-    db.set_all_config_paths(vec![(None, config_path)]);
+    db.set_all_config_paths(vec![(None, config_path)], None);
 
     let file_id = FileId(0);
     let mut file_set = FileSet::new();
@@ -4887,7 +4901,7 @@ fn role_links_to_object_rights_and_rls_condition_object() {
     .unwrap();
 
     let mut db = RootDatabaseImpl::new();
-    db.set_all_config_paths(vec![(None, root.clone())]);
+    db.set_all_config_paths(vec![(None, root.clone())], None);
     let file_id = FileId(0);
     let mut file_set = FileSet::new();
     file_set.insert(file_id, VfsPath::new(root.join("X.bsl").to_string_lossy().as_ref()));
@@ -4943,7 +4957,7 @@ fn event_subscription_with_missing_handler_yields_no_edge() {
     .unwrap();
 
     let mut db = RootDatabaseImpl::new();
-    db.set_all_config_paths(vec![(None, root.clone())]);
+    db.set_all_config_paths(vec![(None, root.clone())], None);
 
     let file_id = FileId(0);
     let file_path = root.join("CommonModules/ОбщийМодуль/Ext/Module.bsl");
@@ -4985,10 +4999,10 @@ fn infer_weaving_resolves_base_sibling() {
     std::fs::create_dir_all(&ext_root).unwrap();
 
     let mut db = RootDatabaseImpl::new();
-    db.set_all_config_paths(vec![
-        (None, main_root.clone()),
-        (Some("X".to_string()), ext_root.clone()),
-    ]);
+    db.set_all_config_paths(
+        vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
 
     let main_file = FileId(0);
     let ext_file = FileId(1);
@@ -5055,10 +5069,10 @@ fn infer_weaving_types_proceed_with_call_return() {
     std::fs::create_dir_all(&ext_root).unwrap();
 
     let mut db = RootDatabaseImpl::new();
-    db.set_all_config_paths(vec![
-        (None, main_root.clone()),
-        (Some("X".to_string()), ext_root.clone()),
-    ]);
+    db.set_all_config_paths(
+        vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
 
     let main_file = FileId(0);
     let ext_file = FileId(1);
@@ -5110,10 +5124,10 @@ fn weaving_target_none_for_base_file() {
     std::fs::create_dir_all(&ext_root).unwrap();
 
     let mut db = RootDatabaseImpl::new();
-    db.set_all_config_paths(vec![
-        (None, main_root.clone()),
-        (Some("X".to_string()), ext_root.clone()),
-    ]);
+    db.set_all_config_paths(
+        vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
 
     let main_file = FileId(0);
     let mut file_set = FileSet::new();
@@ -5419,7 +5433,7 @@ fn module_metadata_http_service_late_module_file_registration_falls_back_to_whol
     std::fs::write(&module_path, "Процедура GET() КонецПроцедуры").unwrap();
 
     let mut db = RootDatabaseImpl::new();
-    db.set_all_config_paths(vec![(None, root.clone())]);
+    db.set_all_config_paths(vec![(None, root.clone())], None);
 
     let service_file = FileId(0);
     let module_file = FileId(1);
@@ -5486,7 +5500,7 @@ fn module_metadata_web_service_late_module_file_registration_falls_back_to_whole
     std::fs::write(&module_path, "Процедура Операция1() КонецПроцедуры").unwrap();
 
     let mut db = RootDatabaseImpl::new();
-    db.set_all_config_paths(vec![(None, root.clone())]);
+    db.set_all_config_paths(vec![(None, root.clone())], None);
 
     let service_file = FileId(0);
     let module_file = FileId(1);
@@ -5567,7 +5581,7 @@ fn subsystem_index_is_case_insensitive() {
     db.set_file_text(sub_main, &subsystem_xml("МояПодсистема"));
     db.set_file_text(consumer_file, "Процедура Т() КонецПроцедуры");
 
-    db.set_all_config_paths(vec![(None, root.clone())]);
+    db.set_all_config_paths(vec![(None, root.clone())], None);
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
@@ -5709,10 +5723,10 @@ fn subsystem_membership_from_listed_substrate() {
     db.set_file_text(ext_sub_main, &subsystem_xml("МояПодсистема", &["Catalog.Услуги"], &[]));
     db.set_file_text(consumer_file, "Процедура Т() КонецПроцедуры");
 
-    db.set_all_config_paths(vec![
-        (None, main_root.clone()),
-        (Some("X".to_string()), ext_root.clone()),
-    ]);
+    db.set_all_config_paths(
+        vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
     db.set_metadata_listing(
         &main_root.to_string_lossy(),
         MetadataListingData {
@@ -5835,10 +5849,10 @@ fn subsystem_reference_resolver_uses_listed_substrate() {
     db.set_file_text(ext_only_file, &subsystem_xml("ТолькоРасширение"));
     db.set_file_text(consumer_file, "Процедура Т() КонецПроцедуры");
 
-    db.set_all_config_paths(vec![
-        (None, root.clone()),
-        (Some("Ext".to_string()), ext_root.clone()),
-    ]);
+    db.set_all_config_paths(
+        vec![(None, root.clone()), (Some("Ext".to_string()), ext_root.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
@@ -5979,10 +5993,13 @@ fn resolve_metadata_object_across_roots_merges_base_and_extension() {
         main,
         predefined: None,
     };
-    db.set_all_config_paths(vec![
-        (None, std::path::PathBuf::from("/base")),
-        (Some("Расш".to_string()), std::path::PathBuf::from("/ext")),
-    ]);
+    db.set_all_config_paths(
+        vec![
+            (None, std::path::PathBuf::from("/base")),
+            (Some("Расш".to_string()), std::path::PathBuf::from("/ext")),
+        ],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
     db.set_metadata_listing(
         "/base",
         MetadataListingData {
@@ -6070,6 +6087,10 @@ fn effective_metadata_members_keep_topological_winner_and_source() {
         (Some("Нечитаемое".to_string()), roots[4].into()),
     ];
     db.set_workspace_configs_snapshot(WorkspaceConfigsSnapshot {
+        extension_scopes: paths
+            .iter()
+            .map(|(label, _)| label.as_ref().map(|_| bsl_metadata::ExtensionScope::InfoBase))
+            .collect(),
         canonical_paths: paths.iter().map(|(_, path)| path.clone()).collect(),
         kinds: paths
             .iter()
@@ -6224,6 +6245,10 @@ fn effective_module_exports_cover_composition_matrix_for_all_module_roles() {
     ];
     let mut db = RootDatabaseImpl::new();
     db.set_workspace_configs_snapshot(WorkspaceConfigsSnapshot {
+        extension_scopes: paths
+            .iter()
+            .map(|(label, _)| label.as_ref().map(|_| bsl_metadata::ExtensionScope::InfoBase))
+            .collect(),
         canonical_paths: paths.iter().map(|(_, path)| path.clone()).collect(),
         kinds: paths
             .iter()
@@ -6359,6 +6384,10 @@ fn ba010_effective_module_variables_resolve_for_object_and_manager_facets() {
     ];
     let mut db = RootDatabaseImpl::new();
     db.set_workspace_configs_snapshot(WorkspaceConfigsSnapshot {
+        extension_scopes: paths
+            .iter()
+            .map(|(label, _)| label.as_ref().map(|_| bsl_metadata::ExtensionScope::InfoBase))
+            .collect(),
         canonical_paths: paths.iter().map(|(_, path)| path.clone()).collect(),
         kinds: paths
             .iter()
@@ -6477,6 +6506,10 @@ fn ba021_module_exports_follow_the_callers_extension_visibility_chain() {
     ];
     let mut db = RootDatabaseImpl::new();
     db.set_workspace_configs_snapshot(WorkspaceConfigsSnapshot {
+        extension_scopes: paths
+            .iter()
+            .map(|(label, _)| label.as_ref().map(|_| bsl_metadata::ExtensionScope::InfoBase))
+            .collect(),
         canonical_paths: paths.iter().map(|(_, path)| path.clone()).collect(),
         kinds: paths
             .iter()
@@ -6552,10 +6585,13 @@ fn resolve_register_across_roots_finds_extension_register() {
         )),
     );
 
-    db.set_all_config_paths(vec![
-        (None, std::path::PathBuf::from("/base")),
-        (Some("Расш".to_string()), std::path::PathBuf::from("/ext")),
-    ]);
+    db.set_all_config_paths(
+        vec![
+            (None, std::path::PathBuf::from("/base")),
+            (Some("Расш".to_string()), std::path::PathBuf::from("/ext")),
+        ],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
     db.set_metadata_listing("/base", empty_listing_data());
     db.set_metadata_listing(
         "/ext",
@@ -6616,10 +6652,13 @@ fn resolve_event_subscription_across_roots_surfaces_base_and_extension() {
     db.set_file_text(base_sub, &sub_xml("ПодпискаБаза", "BeforeWrite"));
     db.set_file_text(ext_sub, &sub_xml("ПодпискаРасш", "OnWrite"));
 
-    db.set_all_config_paths(vec![
-        (None, std::path::PathBuf::from("/base")),
-        (Some("Расш".to_string()), std::path::PathBuf::from("/ext")),
-    ]);
+    db.set_all_config_paths(
+        vec![
+            (None, std::path::PathBuf::from("/base")),
+            (Some("Расш".to_string()), std::path::PathBuf::from("/ext")),
+        ],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
     db.set_metadata_listing(
         "/base",
         MetadataListingData {
@@ -6697,10 +6736,13 @@ fn resolve_register_across_roots_folds_extension_overlay() {
         main,
         predefined: None,
     };
-    db.set_all_config_paths(vec![
-        (None, std::path::PathBuf::from("/base")),
-        (Some("Расш".to_string()), std::path::PathBuf::from("/ext")),
-    ]);
+    db.set_all_config_paths(
+        vec![
+            (None, std::path::PathBuf::from("/base")),
+            (Some("Расш".to_string()), std::path::PathBuf::from("/ext")),
+        ],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
     db.set_metadata_listing(
         "/base",
         MetadataListingData { entries: vec![entry(base_reg)], ..empty_listing_data() },
@@ -6787,10 +6829,10 @@ fn extension_metadata_db_fixture(with_listings: bool) -> ExtensionMetadataDbFixt
             .unwrap_or_else(|_| "Процедура Тест() КонецПроцедуры".to_string());
         db.set_file_text(*file_id, &text);
     }
-    db.set_all_config_paths(vec![
-        (None, base.clone()),
-        (Some("Расширение".to_string()), extension.clone()),
-    ]);
+    db.set_all_config_paths(
+        vec![(None, base.clone()), (Some("Расширение".to_string()), extension.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
 
     if with_listings {
         db.set_metadata_listing(
@@ -7138,7 +7180,10 @@ fn extension_metadata_filesystem_fallback_keeps_own_namesake_common_module_indep
     db.set_source_root(SourceRootId(4), SourceRoot::new_local(file_set));
     db.set_file_source_root(module_file, SourceRootId(4));
     db.set_file_text(module_file, "Процедура Тест() Экспорт\nКонецПроцедуры");
-    db.set_all_config_paths(vec![(None, base), (Some("Extension".to_string()), extension)]);
+    db.set_all_config_paths(
+        vec![(None, base), (Some("Extension".to_string()), extension)],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
 
     let module = db
         .resolve_common_module_for_file(module_file, "Shared")
@@ -7190,6 +7235,11 @@ fn extension_metadata_dependency_chain_composes_only_visible_overlays() {
         (Some("Зависимое".to_string()), dependent.clone()),
     ];
     db.set_workspace_configs_snapshot(crate::metadata::WorkspaceConfigsSnapshot {
+        extension_scopes: vec![
+            None,
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+        ],
         canonical_paths: paths.iter().map(|(_, path)| path.clone()).collect(),
         kinds: vec![RootKind::Base, RootKind::Extension, RootKind::Extension],
         paths,
@@ -7272,6 +7322,11 @@ fn extension_metadata_dependency_chain_composes_in_substrate() {
         (Some("Зависимое".to_string()), dependent.clone()),
     ];
     db.set_workspace_configs_snapshot(crate::metadata::WorkspaceConfigsSnapshot {
+        extension_scopes: vec![
+            None,
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+        ],
         canonical_paths: paths.iter().map(|(_, path)| path.clone()).collect(),
         kinds: vec![RootKind::Base, RootKind::Extension, RootKind::Extension],
         paths,
@@ -7446,7 +7501,7 @@ fn configuration_for_root_reads_objects_and_rereads_after_bump() {
     std::fs::write(root.join("Catalogs/Товары.xml"), catalog_xml("Товары")).unwrap();
 
     let mut db = RootDatabaseImpl::new();
-    db.set_all_config_paths(vec![(None, root.to_path_buf())]);
+    db.set_all_config_paths(vec![(None, root.to_path_buf())], None);
 
     let cfg = db.configuration_for_root(root);
     assert!(
@@ -7627,7 +7682,7 @@ fn warming_loads_the_attributed_root_of_a_service_module() {
     db.set_source_root(SourceRootId(1), SourceRoot::new_local(file_set));
     db.set_file_source_root(service_file, SourceRootId(1));
     db.set_file_source_root(module_file, SourceRootId(1));
-    db.set_all_config_paths(vec![(None, ws.clone())]);
+    db.set_all_config_paths(vec![(None, ws.clone())], None);
 
     // The service module first, so it is the representative the dedup keeps.
     db.warm_config_roots(&[ModuleId::new(service_file), ModuleId::new(module_file)]);
@@ -7705,10 +7760,13 @@ fn resolve_defined_type_across_roots_lets_an_extension_replace_the_base() {
     db.set_file_text(ext_shared, &defined_type_xml("Цена", "xs:string"));
     db.set_file_text(base_only, &defined_type_xml("ТолькоБаза", "xs:boolean"));
 
-    db.set_all_config_paths(vec![
-        (None, std::path::PathBuf::from("/base")),
-        (Some("Расш".to_string()), std::path::PathBuf::from("/ext")),
-    ]);
+    db.set_all_config_paths(
+        vec![
+            (None, std::path::PathBuf::from("/base")),
+            (Some("Расш".to_string()), std::path::PathBuf::from("/ext")),
+        ],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
     db.set_metadata_listing(
         "/base",
         MetadataListingData {
@@ -7789,6 +7847,7 @@ fn an_external_root_binds_its_files_through_the_snapshot_not_the_disk() {
         (Some("EPF".to_owned()), epf.clone()),
     ];
     db.set_workspace_configs_snapshot(crate::metadata::WorkspaceConfigsSnapshot {
+        extension_scopes: vec![None, Some(bsl_metadata::ExtensionScope::InfoBase), None],
         canonical_paths: paths.iter().map(|(_, path)| path.clone()).collect(),
         kinds: vec![
             RootKind::Base,
@@ -7855,6 +7914,7 @@ fn an_external_root_matches_its_canonical_spelling_and_keys_by_the_configured_on
     let mut db = RootDatabaseImpl::new();
     let paths = vec![(Some("EPF".to_owned()), epf_link.clone())];
     db.set_workspace_configs_snapshot(crate::metadata::WorkspaceConfigsSnapshot {
+        extension_scopes: vec![None],
         canonical_paths: vec![epf_real.clone()],
         kinds: vec![RootKind::External(bsl_metadata::ExternalObjectKind::DataProcessor)],
         paths,
@@ -7877,6 +7937,7 @@ fn an_external_root_matches_its_canonical_spelling_and_keys_by_the_configured_on
     std::fs::create_dir_all(cf_real.join("CommonModules/Foo/Ext")).unwrap();
     std::os::unix::fs::symlink(&cf_real, &cf_link).unwrap();
     db.set_workspace_configs_snapshot(crate::metadata::WorkspaceConfigsSnapshot {
+        extension_scopes: vec![None],
         paths: vec![(None, cf_link.clone())],
         kinds: vec![RootKind::Base],
         canonical_paths: vec![cf_real.clone()],
@@ -7958,6 +8019,16 @@ fn borrowed_form_db(
         .map(|(label, path, _)| (label.map(str::to_string), path.to_path_buf()))
         .collect();
     db.set_workspace_configs_snapshot(crate::metadata::WorkspaceConfigsSnapshot {
+        extension_scopes: roots
+            .iter()
+            .map(|(_, _, kind)| {
+                if *kind == RootKind::Extension {
+                    Some(bsl_metadata::ExtensionScope::InfoBase)
+                } else {
+                    None
+                }
+            })
+            .collect(),
         canonical_paths: paths
             .iter()
             .map(|(_, path)| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))

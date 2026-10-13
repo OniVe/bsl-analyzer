@@ -23,13 +23,16 @@ fn unresolved_fields(code: &str) -> Vec<String> {
         db.set_file_source_root(*file_id, SourceRootId(0));
         db.set_file_text(*file_id, &file.content);
     }
-    db.set_all_config_paths(vec![(
+    db.set_all_config_paths(
+        vec![(
+            None,
+            PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../bsl-metadata/fixtures/common_attributes"
+            )),
+        )],
         None,
-        PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../bsl-metadata/fixtures/common_attributes"
-        )),
-    )]);
+    );
     let (file_id, _) = fixture.files.iter().next().expect("one file");
 
     db.infer(*file_id)

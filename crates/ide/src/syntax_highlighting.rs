@@ -1277,7 +1277,7 @@ EndFunction
 "#;
 
         let (mut db, file_id) = create_db_with_file(code);
-        db.set_all_config_paths(vec![(None, designer_fixture_path())]);
+        db.set_all_config_paths(vec![(None, designer_fixture_path())], None);
         let highlights = highlight(&db, file_id);
 
         let plural_highlight = highlights.highlights.iter().any(|hl| {
@@ -1338,7 +1338,7 @@ EndFunction
 "#;
 
         let (mut db, file_id) = create_db_with_file(code);
-        db.set_all_config_paths(vec![(None, designer_fixture_path())]);
+        db.set_all_config_paths(vec![(None, designer_fixture_path())], None);
         let highlights = highlight(&db, file_id);
 
         let local_count = highlights

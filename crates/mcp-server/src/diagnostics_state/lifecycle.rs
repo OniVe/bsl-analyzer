@@ -1193,4 +1193,61 @@ mod tests {
             "and a rebuild goes where it points now, rather than where it pointed before",
         );
     }
+
+    /// `references`, `outline` and `symbol_info` address a root by the id a search hit carried, and
+    /// search keeps that id when the link declaring the root is retargeted. A resident rebuilt after
+    /// the move must therefore register the root under the id search serves — resolved to the NEW
+    /// target — rather than the id a fresh build would mint from the new target.
+    #[cfg(unix)]
+    #[test]
+    fn a_resident_rebuilt_after_a_retarget_answers_to_the_id_search_serves() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("ws");
+        let outside = tempfile::tempdir().unwrap();
+        for root in [workspace.join("cf"), outside.path().join("one"), outside.path().join("two")] {
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        }
+        let link = workspace.join("ext");
+        std::os::unix::fs::symlink(outside.path().join("one"), &link).unwrap();
+        std::fs::write(
+            workspace.join("bsl-analyzer.toml"),
+            "[source]\nroot = \"cf\"\nextensions = [{ name = \"live\", path = \"ext\" }]\n",
+        )
+        .unwrap();
+        let extension_id = |roots: &bsl_search::WorkspaceRoots| {
+            roots.ids().find(|id| !id.is_empty()).expect("the extension is registered").to_owned()
+        };
+
+        let project = crate::project::at(&workspace).unwrap();
+        let (served, _) = crate::project::workspace_roots(&project, &[]);
+        crate::project::record_served_roots(&served);
+        let kept = extension_id(&served);
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("two"), &link).unwrap();
+        let (fresh, _) = bsl_search::WorkspaceRoots::build(
+            &workspace,
+            &workspace.join("cf"),
+            std::slice::from_ref(&link),
+        );
+        assert_ne!(extension_id(&fresh), kept, "control: a fresh build mints the new target's id");
+
+        let built = DiagnosticsState::build_resident(&workspace, &[]).expect("builds");
+        let roots = built.resident.workspace_roots();
+        assert_eq!(
+            roots.ids().collect::<Vec<_>>(),
+            served.ids().collect::<Vec<_>>(),
+            "the resident registers the ids search serves",
+        );
+        assert!(roots.registration_is_current(&kept), "and they are current, not stale");
+        assert_eq!(
+            roots
+                .entries_with_canonical()
+                .find(|(id, ..)| *id == kept)
+                .map(|(_, _, canonical)| canonical.to_path_buf()),
+            Some(std::fs::canonicalize(outside.path().join("two")).unwrap()),
+            "resolved to the target the link leads to now",
+        );
+    }
 }

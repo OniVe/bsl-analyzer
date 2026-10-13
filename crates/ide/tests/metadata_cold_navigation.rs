@@ -57,7 +57,7 @@ fn setup_with_role_xml(fixture_text: &str, role_xml: &str) -> (Analysis, FileId,
     }
     db.set_file_source_root(ROLE_XML_FILE_ID, METADATA_SOURCE_ROOT);
     db.set_file_text(ROLE_XML_FILE_ID, role_xml);
-    db.set_all_config_paths(vec![(None, designer_fixture_path())]);
+    db.set_all_config_paths(vec![(None, designer_fixture_path())], None);
 
     let test_file = fixture
         .files
@@ -129,7 +129,7 @@ fn setup_with_role_substrate(fixture_text: &str) -> (Analysis, FileId, u32) {
 </Rights>"#,
     );
 
-    db.set_all_config_paths(vec![(None, root.clone())]);
+    db.set_all_config_paths(vec![(None, root.clone())], None);
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
@@ -228,7 +228,7 @@ fn setup_with_http_service_substrate(fixture_text: &str) -> (Analysis, FileId, u
         .map(|(id, _)| *id)
         .expect("cursor-bearing file not found");
 
-    db.set_all_config_paths(vec![(None, root.clone())]);
+    db.set_all_config_paths(vec![(None, root.clone())], None);
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
@@ -291,7 +291,7 @@ fn setup_with_web_service_substrate(fixture_text: &str) -> (Analysis, FileId, u3
         .map(|(id, _)| *id)
         .expect("cursor-bearing file not found");
 
-    db.set_all_config_paths(vec![(None, root.clone())]);
+    db.set_all_config_paths(vec![(None, root.clone())], None);
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
@@ -358,7 +358,7 @@ fn setup_with_integration_service_substrate(fixture_text: &str) -> (Analysis, Fi
         .map(|(id, _)| *id)
         .expect("cursor-bearing file not found");
 
-    db.set_all_config_paths(vec![(None, root.clone())]);
+    db.set_all_config_paths(vec![(None, root.clone())], None);
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
@@ -415,7 +415,7 @@ fn setup_with_scheduled_job_xml(
     }
     db.set_file_source_root(SCHEDULED_JOB_XML_FILE_ID, METADATA_SOURCE_ROOT);
     db.set_file_text(SCHEDULED_JOB_XML_FILE_ID, scheduled_job_xml);
-    db.set_all_config_paths(vec![(None, root.clone())]);
+    db.set_all_config_paths(vec![(None, root.clone())], None);
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {

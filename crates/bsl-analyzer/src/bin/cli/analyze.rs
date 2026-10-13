@@ -453,9 +453,13 @@ fn analyze_salsa(
     };
     // Deliberately not gated on `--quiet`: this explains why the findings that
     // follow are wrong, and suppressing it leaves the run looking merely broken.
-    for notice in [project.standalone_extension_notice(), project.standalone_external_notice()]
-        .into_iter()
-        .flatten()
+    for notice in [
+        project.standalone_extension_notice(),
+        project.standalone_external_notice(),
+        project.legacy_extension_scope_warning(),
+    ]
+    .into_iter()
+    .flatten()
     {
         eprintln!("warning: {notice}");
     }

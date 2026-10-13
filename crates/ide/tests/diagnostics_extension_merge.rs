@@ -64,10 +64,10 @@ fn setup_with(base: &str, ext: &str) -> Fixture {
     std::mem::forget(temp);
 
     let mut db = RootDatabaseImpl::new();
-    db.set_all_config_paths(vec![
-        (None, main_root.clone()),
-        (Some("X".to_string()), ext_root.clone()),
-    ]);
+    db.set_all_config_paths(
+        vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
 
     let main_file = FileId(0);
     let ext_file = FileId(1);
@@ -332,11 +332,14 @@ fn setup_adopted() -> AdoptedFixture {
     write_common_module(&ext_y_root, "ЧужойМодульИгрек", "05", ADOPTED_CALLER);
 
     let mut db = RootDatabaseImpl::new();
-    db.set_all_config_paths(vec![
-        (None, main_root.clone()),
-        (Some("X".to_string()), ext_x_root.clone()),
-        (Some("Y".to_string()), ext_y_root.clone()),
-    ]);
+    db.set_all_config_paths(
+        vec![
+            (None, main_root.clone()),
+            (Some("X".to_string()), ext_x_root.clone()),
+            (Some("Y".to_string()), ext_y_root.clone()),
+        ],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
 
     // The extension's adopted body is inserted BEFORE the base body — the
     // adversarial order for a last-write-wins name index.
@@ -447,10 +450,10 @@ fn setup_with_rel_paths(base_rel: &str, ext_rel: &str) -> Fixture {
     std::mem::forget(temp);
 
     let mut db = RootDatabaseImpl::new();
-    db.set_all_config_paths(vec![
-        (None, main_root.clone()),
-        (Some("X".to_string()), ext_root.clone()),
-    ]);
+    db.set_all_config_paths(
+        vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
 
     let main_file = FileId(0);
     let ext_file = FileId(1);

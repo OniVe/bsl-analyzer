@@ -165,7 +165,7 @@ fn build(fixture_text: &str, cursor_file: &str, config_path: &Path) -> (Analysis
         db.set_file_source_root(*file_id, SourceRootId(0));
         db.set_file_text(*file_id, &file.content);
     }
-    db.set_all_config_paths(vec![(None, config_path.to_path_buf())]);
+    db.set_all_config_paths(vec![(None, config_path.to_path_buf())], None);
     let file_id = fixture
         .files
         .iter()

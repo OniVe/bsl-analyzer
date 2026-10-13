@@ -1018,20 +1018,11 @@ pub fn handle_completion(
     let text = doc.text();
     let line_index = doc.line_index();
 
-    let line_num = position.line as usize;
-    let lines: Vec<&str> = text.lines().collect();
-    if line_num < lines.len() {
-        let line_text = lines[line_num];
-        tracing::debug!(
-            "Line {} content (first 100 chars): {:?}",
-            line_num,
-            &line_text.chars().take(100).collect::<String>()
-        );
-        tracing::debug!(
-            "Position.character={} (UTF-16 code units from line start)",
-            position.character
-        );
-    }
+    tracing::debug!(
+        line = position.line,
+        character = position.character,
+        "completion request position"
+    );
 
     let offset =
         match crate::lsp::offset_with_encoding(line_index, text, position, ctx.position_encoding) {
@@ -1626,6 +1617,93 @@ impl Drop for WorkDoneProgressGuard<'_> {
     }
 }
 
+#[cfg(test)]
+struct WorkspaceDiagnosticChunkGate {
+    token: lsp_types::ProgressToken,
+    after_files: usize,
+    entered: crossbeam_channel::Sender<(usize, usize)>,
+    release: crossbeam_channel::Receiver<()>,
+}
+
+#[cfg(test)]
+static WORKSPACE_DIAGNOSTIC_CHUNK_GATE: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::sync::Arc<WorkspaceDiagnosticChunkGate>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct WorkspaceDiagnosticChunkGateGuard {
+    gate: std::sync::Arc<WorkspaceDiagnosticChunkGate>,
+    release: crossbeam_channel::Sender<()>,
+}
+
+#[cfg(test)]
+impl WorkspaceDiagnosticChunkGateGuard {
+    pub(crate) fn release(&self) {
+        let _ = self.release.send(());
+    }
+
+    pub(crate) fn release_sender(&self) -> crossbeam_channel::Sender<()> {
+        self.release.clone()
+    }
+}
+
+#[cfg(test)]
+impl Drop for WorkspaceDiagnosticChunkGateGuard {
+    fn drop(&mut self) {
+        self.release();
+        let slot = WORKSPACE_DIAGNOSTIC_CHUNK_GATE.get_or_init(|| std::sync::Mutex::new(None));
+        let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.as_ref().is_some_and(|gate| std::sync::Arc::ptr_eq(gate, &self.gate)) {
+            slot.take();
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn g1_arm_workspace_diagnostic_chunk_gate(
+    token: lsp_types::ProgressToken,
+    after_files: usize,
+) -> (WorkspaceDiagnosticChunkGateGuard, crossbeam_channel::Receiver<(usize, usize)>) {
+    let (entered, entered_rx) = crossbeam_channel::bounded(1);
+    let (release, release_rx) = crossbeam_channel::bounded(1);
+    let gate = std::sync::Arc::new(WorkspaceDiagnosticChunkGate {
+        token,
+        after_files,
+        entered,
+        release: release_rx,
+    });
+    let slot = WORKSPACE_DIAGNOSTIC_CHUNK_GATE.get_or_init(|| std::sync::Mutex::new(None));
+    let previous = slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .replace(std::sync::Arc::clone(&gate));
+    assert!(previous.is_none(), "only one workspace-diagnostic gate may be armed");
+    (WorkspaceDiagnosticChunkGateGuard { gate, release }, entered_rx)
+}
+
+#[cfg(test)]
+fn g1_wait_at_workspace_diagnostic_chunk(
+    token: &lsp_types::ProgressToken,
+    done: usize,
+    emitted_items: usize,
+) {
+    let gate = WORKSPACE_DIAGNOSTIC_CHUNK_GATE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|gate| gate.token == *token && gate.after_files == done)
+        .cloned();
+    // A test that already gave up must not turn into a panic here: this runs with the
+    // database attached, so panic_watch would stamp it and flip the verdict of every
+    // propagated-cancellation test running alongside.
+    if let Some(gate) = gate {
+        if gate.entered.send((done, emitted_items)).is_ok() {
+            let _ = gate.release.recv_timeout(std::time::Duration::from_secs(60));
+        }
+    }
+}
+
 /// Pull-model whole-workspace diagnostics (`workspace/diagnostic`).
 ///
 /// Reports diagnostics for every in-scope BSL file in one sweep. Scope comes from
@@ -1743,6 +1821,8 @@ pub fn handle_workspace_diagnostic(
             })
             .collect();
         done += chunk.len();
+        #[cfg(test)]
+        let emitted_items = chunk_items.len();
 
         if let Some(token) = &partial_token {
             ctx.send_progress(token, serde_json::json!({ "items": chunk_items }));
@@ -1760,6 +1840,10 @@ pub fn handle_workspace_diagnostic(
                 }))
                 .unwrap_or_default(),
             );
+        }
+        #[cfg(test)]
+        if let Some(token) = &partial_token {
+            g1_wait_at_workspace_diagnostic_chunk(token, done, emitted_items);
         }
     }
 
@@ -3095,7 +3179,11 @@ mod tests {
             let task = task_receiver
                 .recv_timeout(remaining)
                 .expect("single-worker incoming request must complete");
-            if let Task::RequestResult { response } = task {
+            if let Task::LatencyRequestFinished {
+                outcome: crate::global_state::LatencyAttemptOutcome::Response(response),
+                ..
+            } = task
+            {
                 break response;
             }
         };
@@ -3961,7 +4049,7 @@ mod tests {
 
         {
             let db = state.analysis_host.raw_database_mut();
-            db.set_all_config_paths(vec![(None, tmp.path().to_path_buf())]);
+            db.set_all_config_paths(vec![(None, tmp.path().to_path_buf())], None);
             db.set_metadata_listing(
                 &tmp.path().to_string_lossy(),
                 ide_db::metadata::MetadataListingData {
@@ -4134,7 +4222,6 @@ mod tests {
     /// file rather than after a sleep.
     mod cancel_walk_tests {
         use super::*;
-        use crate::global_state::Task;
         use lsp_types::request::References;
         use std::time::Duration;
         use test_utils::walk_probe;
@@ -4167,8 +4254,11 @@ mod tests {
         /// and an open buffer stays resident in salsa instead of being re-read from a
         /// disk this stand does not have. No metadata is needed for every file to be
         /// entered.
-        fn stand(workers: Option<usize>) -> GlobalState {
-            let mut state = create_test_state();
+        fn stand(
+            workers: Option<usize>,
+        ) -> (GlobalState, crossbeam_channel::Receiver<lsp_server::Message>) {
+            let (sender, client_receiver) = crossbeam_channel::unbounded();
+            let mut state = GlobalState::new(sender);
             if let Some(workers) = workers {
                 state.task_pool = TaskPool::new_with_workers(workers);
             }
@@ -4189,7 +4279,7 @@ mod tests {
             // Registers the anchor the same way and folds every pending VFS change,
             // callers included, into salsa.
             open_source(&mut state, &anchor_uri(), ANCHOR_SOURCE);
-            state
+            (state, client_receiver)
         }
 
         fn references_request(id: i32) -> lsp_server::Request {
@@ -4223,20 +4313,25 @@ mod tests {
             .unwrap();
         }
 
-        fn response(state: &GlobalState, id: i32) -> lsp_server::Response {
+        fn response(
+            state: &mut GlobalState,
+            client_receiver: &crossbeam_channel::Receiver<lsp_server::Message>,
+            id: i32,
+        ) -> lsp_server::Response {
             let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            let task_receiver = state.task_pool.receiver.clone();
             loop {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                let task = state
-                    .task_pool
-                    .receiver
-                    .recv_timeout(remaining)
-                    .expect("the references request never answered");
-                if let Task::RequestResult { response } = task {
+                if let Ok(lsp_server::Message::Response(response)) = client_receiver.try_recv() {
                     if response.id == lsp_server::RequestId::from(id) {
                         return response;
                     }
                 }
+                let task = task_receiver
+                    .recv_timeout(remaining)
+                    .expect("the references request never answered");
+                crate::server::handle_task(state, task)
+                    .expect("production task handler must finish reference request");
             }
         }
 
@@ -4248,10 +4343,10 @@ mod tests {
             let _serialised = serialised();
             walk_probe::install();
             walk_probe::reset();
-            let mut state = stand(None);
+            let (mut state, client_receiver) = stand(None);
 
             dispatch_references(&mut state, 40);
-            let response = response(&state, 40);
+            let response = response(&mut state, &client_receiver, 40);
 
             assert!(response.error.is_none(), "{:?}", response.error);
             assert!(
@@ -4266,12 +4361,12 @@ mod tests {
             let _serialised = serialised();
             walk_probe::install();
             walk_probe::reset();
-            let mut state = stand(None);
+            let (mut state, client_receiver) = stand(None);
 
             dispatch_references(&mut state, 41);
             walk_probe::await_walk_start();
             cancel(&mut state, 41);
-            let response = response(&state, 41);
+            let response = response(&mut state, &client_receiver, 41);
 
             let err = response.error.expect("a cancelled walk must not answer with locations");
             assert_eq!(err.code, lsp_server::ErrorCode::RequestCanceled as i32, "{err:?}");
@@ -4290,14 +4385,14 @@ mod tests {
             let _serialised = serialised();
             walk_probe::install();
             walk_probe::reset();
-            let mut state = stand(Some(1));
+            let (mut state, client_receiver) = stand(Some(1));
 
             dispatch_references(&mut state, 42);
             walk_probe::await_walk_start();
             cancel(&mut state, 42);
             dispatch_references(&mut state, 43);
-            let first = response(&state, 42);
-            let second = response(&state, 43);
+            let first = response(&mut state, &client_receiver, 42);
+            let second = response(&mut state, &client_receiver, 43);
 
             assert_eq!(
                 first.error.map(|err| err.code),

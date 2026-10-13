@@ -68,6 +68,9 @@ impl GlobalState {
             Ok(project) => project,
             Err(e) => {
                 tracing::error!(error = %e, "invalid project; workspace root not set");
+                if self.project.is_none() {
+                    self.project_rejected = true;
+                }
                 return Err(e);
             }
         };
@@ -78,6 +81,7 @@ impl GlobalState {
         {
             self.show_warning_message(notice);
         }
+        let legacy_scope_warning = project.legacy_extension_scope_warning();
 
         self.supersede_call_hierarchy_index(base_db::SourceRootId(0));
 
@@ -111,6 +115,10 @@ impl GlobalState {
             if !self.vfs_done {
                 db.set_workspace_load_complete(false);
             }
+        }
+
+        if let Some(warning) = legacy_scope_warning {
+            self.show_warning_message(format!("bsl-analyzer: {warning}"));
         }
 
         self.update_diagnostics_config();
@@ -605,6 +613,29 @@ impl GlobalState {
 
         if removed.is_empty() {
             return false;
+        }
+
+        let open_documents_under_removed_paths: Vec<_> = self
+            .mem_docs
+            .uris()
+            .into_iter()
+            .filter(|uri| {
+                uri.to_file_path().ok().is_some_and(|path| {
+                    removed.iter().any(|dir| {
+                        let removed_path: &std::path::Path = dir.as_path().as_ref();
+                        path.starts_with(removed_path)
+                    })
+                })
+            })
+            .collect();
+        for uri in &open_documents_under_removed_paths {
+            self.mem_docs.invalidate_identity(uri);
+        }
+        if !open_documents_under_removed_paths.is_empty() {
+            tracing::debug!(
+                invalidated_open_documents = open_documents_under_removed_paths.len(),
+                "invalidated editor request origins under removed directory subtree"
+            );
         }
 
         let mut descendants: Vec<VfsPath> = Vec::new();
@@ -1192,7 +1223,7 @@ mod metadata_warmup_tests {
             extension_at(root, "src/cfe/Feature");
             std::fs::write(
                 root.join("bsl-analyzer.toml"),
-                "[source]\nroot = \"src/cf\"\nextensions = [\"src/cfe/Feature\"]\n",
+                "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"Feature\", path = \"src/cfe/Feature\", scope = \"InfoBase\" }]\n",
             )
             .unwrap();
         });
@@ -1207,7 +1238,7 @@ mod metadata_warmup_tests {
             extension_at(root, "Расширения/Feature");
             std::fs::write(
                 root.join("bsl-analyzer.toml"),
-                "[source]\nextensions = [\"Расширения/Feature\"]\n",
+                "[source]\nextensions = [{ name = \"Feature\", path = \"Расширения/Feature\", scope = \"InfoBase\" }]\n",
             )
             .unwrap();
         });
@@ -1283,7 +1314,7 @@ mod diagnostics_baseline_tests {
             format!(
                 r#"[source]
 root = "src/cf"
-extensions = [{{ name = "Ext", path = "src/cfe/Ext" }}, {{ name = "Dormant", path = "src/cfe/Dormant" }}]
+extensions = [{{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }}, {{ name = "Dormant", path = "src/cfe/Dormant", scope = "InfoBase" }}]
 [diagnostics.baseline]
 directory = "baselines"
 {include}

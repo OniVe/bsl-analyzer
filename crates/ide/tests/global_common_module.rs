@@ -51,7 +51,7 @@ fn build_db(caller_text: &str) -> RootDatabaseImpl {
         db.set_file_text(id, text);
     }
 
-    db.set_all_config_paths(vec![(None, designer_path())]);
+    db.set_all_config_paths(vec![(None, designer_path())], None);
     db
 }
 

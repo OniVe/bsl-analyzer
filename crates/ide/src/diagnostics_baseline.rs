@@ -53,13 +53,7 @@ pub struct DiagnosticsBaselineScope {
     pub extensions: Vec<DiagnosticsBaselineExtension>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DiagnosticsBaselineExtension {
-    pub name: String,
-    pub path: String,
-    pub depends_on: Vec<String>,
-}
+pub type DiagnosticsBaselineExtension = project_model::DiagnosticsBaselineProjectExtension;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -225,6 +219,8 @@ pub enum DiagnosticsBaselineError {
     UnsupportedSchema { found: u32, expected: u32 },
     #[error("diagnostics baseline scope does not match the current project")]
     ScopeMismatch,
+    #[error("diagnostics baseline has a contradictory legacy scope marker")]
+    InvalidLegacyScopeMarker,
     #[error("diagnostics baseline contains invalid relative path: {0}")]
     InvalidPath(String),
     #[error("diagnostics baseline fingerprint does not match its fields: {0}")]
@@ -277,6 +273,19 @@ pub fn scopes_match(left: &DiagnosticsBaselineScope, right: &DiagnosticsBaseline
     base(left) == base(right) && left.extensions == right.extensions
 }
 
+pub fn legacy_scope_markers_are_valid(scope: &DiagnosticsBaselineScope) -> bool {
+    let valid = |scope: Option<bsl_metadata::ExtensionScope>, marker: Option<bool>| {
+        marker != Some(false) && !(scope.is_some() && marker == Some(true))
+    };
+    scope.extensions.iter().all(|extension| {
+        valid(extension.scope, extension.legacy_scope)
+            && extension
+                .dependency_scopes
+                .iter()
+                .all(|dependency| valid(dependency.scope, dependency.legacy_scope))
+    })
+}
+
 fn validate_diagnostics_baseline(
     baseline: &DiagnosticsBaseline,
     expected_scope: &DiagnosticsBaselineScope,
@@ -286,6 +295,11 @@ fn validate_diagnostics_baseline(
             found: baseline.schema_version,
             expected: DIAGNOSTICS_BASELINE_SCHEMA_VERSION,
         });
+    }
+    if !legacy_scope_markers_are_valid(&baseline.scope)
+        || !legacy_scope_markers_are_valid(expected_scope)
+    {
+        return Err(DiagnosticsBaselineError::InvalidLegacyScopeMarker);
     }
     if !scopes_match(&baseline.scope, expected_scope) {
         return Err(DiagnosticsBaselineError::ScopeMismatch);
@@ -692,6 +706,72 @@ mod tests {
         let nested =
             DiagnosticsBaselineScope { source_root: Some("src/cf".to_owned()), extensions: vec![] };
         assert!(!scopes_match(&nested, &computed), "a nested base is a different scope");
+    }
+
+    #[test]
+    fn legacy_scope_markers_validate_fresh_v1_baselines_and_reject_old_or_contradictory_identity() {
+        for legacy_root in [true, false] {
+            let extension = DiagnosticsBaselineExtension {
+                name: "Ext".to_owned(),
+                path: "src/cfe/Ext".to_owned(),
+                scope: if legacy_root {
+                    None
+                } else {
+                    Some(bsl_metadata::ExtensionScope::InfoBase)
+                },
+                legacy_scope: legacy_root.then_some(true),
+                dependency_scopes: if legacy_root {
+                    vec![]
+                } else {
+                    vec![project_model::DiagnosticsBaselineDependencyScope {
+                        name: "Base".to_owned(),
+                        scope: None,
+                        legacy_scope: Some(true),
+                    }]
+                },
+                depends_on: vec![],
+            };
+            let expected =
+                DiagnosticsBaselineScope { source_root: None, extensions: vec![extension.clone()] };
+            let fresh = DiagnosticsBaseline {
+                schema_version: DIAGNOSTICS_BASELINE_SCHEMA_VERSION,
+                scope: expected.clone(),
+                diagnostics: vec![],
+            };
+            let bytes = diagnostics_baseline_json(&fresh).unwrap();
+            assert_eq!(parse_diagnostics_baseline(&bytes, &expected).unwrap(), fresh);
+
+            let mut markerless = fresh.clone();
+            if legacy_root {
+                markerless.scope.extensions[0].legacy_scope = None;
+            } else {
+                markerless.scope.extensions[0].dependency_scopes[0].legacy_scope = None;
+            }
+            let old_bytes = serde_json::to_vec(&markerless).unwrap();
+            assert!(matches!(
+                parse_diagnostics_baseline(&old_bytes, &expected),
+                Err(DiagnosticsBaselineError::ScopeMismatch)
+            ));
+
+            let mut contradictory = fresh;
+            if legacy_root {
+                contradictory.scope.extensions[0].scope =
+                    Some(bsl_metadata::ExtensionScope::InfoBase);
+            } else {
+                contradictory.scope.extensions[0].dependency_scopes[0].scope =
+                    Some(bsl_metadata::ExtensionScope::DataSeparation);
+                contradictory.scope.extensions[0].dependency_scopes[0].legacy_scope = Some(true);
+            }
+            let invalid_bytes = serde_json::to_vec(&contradictory).unwrap();
+            assert!(matches!(
+                parse_diagnostics_baseline(&invalid_bytes, &expected),
+                Err(DiagnosticsBaselineError::InvalidLegacyScopeMarker)
+            ));
+            assert!(matches!(
+                diagnostics_baseline_json(&contradictory),
+                Err(DiagnosticsBaselineError::InvalidLegacyScopeMarker)
+            ));
+        }
     }
 
     #[test]

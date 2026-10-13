@@ -152,7 +152,8 @@ bsl-analyzer
 
 ## Salsa и модель вычислений
 
-Проект построен вокруг инкрементальных вычислений на базе Salsa `0.26`.
+Проект построен вокруг инкрементальных вычислений на базе Salsa `0.28.2`
+(fork `itrous/salsa`, revision зафиксирована в `Cargo.lock`).
 
 Ключевая идея:
 
@@ -239,26 +240,42 @@ Markdown, не разбирая комментарии повторно.
   `documentSymbol`, `semanticTokens/full`, `codeAction`, `signatureHelp`)
   уходят сюда и не блокируют main loop.
 
-`on_latency` на main thread:
+До первой успешной загрузки latency-запросы получают `ContentModified`
+с причиной `workspace is still loading`. Live VFS update и повторный
+workspace batch не сбрасывают готовность проекта.
 
-1. Клонирует owned Salsa DB (snapshot) и берёт у него
-   `salsa::CancellationToken`.
-2. Регистрирует токен в `GlobalState.request_tokens` по `RequestId`;
-   при повторе id предыдущий токен отменяется.
-3. Замораживает `MemDocs` и пути VFS в `LatencyRequestContext` (см.
-   `crates/bsl-analyzer/src/frozen_context.rs`). Worker читает только
-   этот снимок и не видит последующих `didChange`.
+На main thread dispatcher создаёт logical request с поколением владельца
+и номером попытки. Он клонирует Salsa DB, регистрирует cancellation token
+вместе с владельцем и собирает полный `LatencyRequestContext`: Analysis,
+Project, конфигурацию, baseline, открытые buffers и пути VFS. Worker читает
+этот согласованный контекст, а следующая попытка получает новый целиком.
 
-На task-pool потоке worker обернут в два слоя защиты —
-`salsa::Cancelled::catch` конвертирует кооперативную отмену в
-`ErrorCode::RequestCanceled`, а внешний `std::panic::catch_unwind`
-логирует любой панический payload + backtrace и возвращает
-`ErrorCode::InternalError`. Инвариант: **на каждый dispatch ровно один
-`Task::RequestResult`**.
+Worker через `salsa::Cancelled::catch` отделяет отмену от обычного результата,
+а внешний `catch_unwind` превращает настоящий panic в `InternalError`.
+Перед `Task::LatencyRequestFinished` контекст полностью освобождается,
+чтобы Salsa writer мог завершить запись без ожидания повтора. Event loop
+проверяет поколение и номер попытки; старое completion не снимает текущий
+token и не отвечает клиенту.
 
-`$/cancelRequest` на main thread удаляет токен из `request_tokens` и
-вызывает `cancel()`. Worker унывает на следующей границе salsa-запроса
-— так же, как диагностика после `didChange`.
+`on_retryable_latency` разрешён для `hover`, `definition`, `typeDefinition`
+и `completion`: максимум две дополнительные попытки с исходными id и params.
+`PendingWrite` подтверждает запись; для `PropagatedPanic` дополнительно
+нужны отсутствие настоящего panic в `panic_watch` и более новая опубликованная
+ревизия. Повтор допустим только при сохранении исходного открытого документа
+и его принадлежности проекту. Изменение или закрытие/reopen документа,
+удаление пути и непригодные параметры запрещают replay старой позиции.
+Остальные latency handlers автоматически не повторяются: их безопасность
+для retained parameters, streaming или редактирующего результата не доказана.
+
+Повтор поступает через прежнюю task-pool admission; pending lifecycle
+учитывается при quiescence. Write cancellation без допустимого повтора или
+после третьей попытки даёт один `ContentModified`. Явная отмена клиента
+и `Local` дают `RequestCanceled`; настоящий panic не превращается в retry.
+
+`$/cancelRequest` отменяет token работающей попытки и сохраняет факт отмены
+в logical request. Для ожидающего повтора он сразу завершает request одним
+`RequestCanceled`. Поздняя отмена после ответа остаётся no-op. Shutdown и
+disconnect отменяют оставшиеся tokens и очищают lifecycle/очередь повторов.
 
 Cancellation-карты (`diagnostics_tokens`, `preload_tokens`,
 `preload_external_tokens`, `request_tokens`) живут на `GlobalState`;

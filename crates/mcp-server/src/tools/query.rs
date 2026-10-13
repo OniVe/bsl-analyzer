@@ -76,13 +76,29 @@ fn validate_parameters(
     }
 
     if let Some(root_id) = root_id {
-        let known = state
+        let roots = state
             .workspace_root()
             .and_then(|root| crate::project::at(root).ok())
-            .map(|project| crate::project::workspace_roots(&project, &[]).0)
-            .is_some_and(|roots| roots.contains_id(root_id));
-        if !known {
+            .map(|project| crate::project::workspace_roots(&project, &[]).0);
+        if !roots.as_ref().is_some_and(|roots| roots.contains_id(root_id)) {
             return Err(McpError::invalid_params(format!("Неизвестный root_id: {root_id}"), None));
+        }
+        // The id must also still be CURRENT in the table it is matched against. The table here is
+        // built at request time from the project on disk, so its canonical spellings were read just
+        // now and this cannot fire while the project is read fresh — it is stated because every
+        // path that takes a caller's `root_id` asks the same question of its own table, and the
+        // ones that hold a table built earlier (the diagnostics resident) CAN be stale
+        // (`WorkspaceRoots::registration_is_current`). An id survives a root's retarget, so an
+        // `unknown_root_id` refusal no longer covers that case by itself.
+        if roots.as_ref().is_some_and(|roots| !roots.registration_is_current(root_id)) {
+            return Err(McpError::invalid_params(
+                format!(
+                    "root_id '{root_id}' больше не разрешается в каталог, с которым он был \
+                     зарегистрирован; представление резидента может быть устаревшим — \
+                     перезагрузите workspace"
+                ),
+                None,
+            ));
         }
     }
 

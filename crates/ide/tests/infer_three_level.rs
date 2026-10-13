@@ -170,7 +170,7 @@ fn visible_config_outranks_a_manager_module_on_disk() {
     let (mut db, file_id) = setup(fixture);
     assert!(db.infer(file_id).var_types.contains_key("м"), "config-less baseline must promote");
 
-    db.set_all_config_paths(vec![(None, std::path::PathBuf::from("/does-not-exist"))]);
+    db.set_all_config_paths(vec![(None, std::path::PathBuf::from("/does-not-exist"))], None);
     let ty = db.infer(file_id).var_types.get("м").copied();
     let shape = ty.map(|ty| format!("{:?}", db.lookup_type(ty)));
     assert!(
@@ -372,14 +372,14 @@ fn three_level_invalidates_on_config_change() {
 
     assert!(unresolved_kinds(&db, file_id).is_empty(), "baseline must be clean");
 
-    db.set_all_config_paths(vec![(None, std::path::PathBuf::from("/does-not-exist"))]);
+    db.set_all_config_paths(vec![(None, std::path::PathBuf::from("/does-not-exist"))], None);
     assert_eq!(
         unresolved_fields(&db, file_id),
         vec!["ПКО".to_string()],
         "bogus config must hide the MDO, and the miss lands on the object segment"
     );
 
-    db.set_all_config_paths(vec![]);
+    db.set_all_config_paths(vec![], None);
     assert!(
         unresolved_kinds(&db, file_id).is_empty(),
         "clearing configs must restore the baseline — invalidation fires on input removal"

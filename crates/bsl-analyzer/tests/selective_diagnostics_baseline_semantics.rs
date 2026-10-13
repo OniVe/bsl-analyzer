@@ -79,7 +79,7 @@ fn selective_semantics_keeps_full_topology_for_unsuppressed_extensions() {
         temp.path().join("bsl-analyzer.toml"),
         r#"[source]
 root = "src/cf"
-extensions = [{ name = "Ext", path = "src/cfe/Ext" }]
+extensions = [{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }]
 
 [diagnostics.baseline]
 directory = "baselines"

@@ -1255,8 +1255,9 @@ mod tests {
         owners.wakes(move || {
             let _ = stop_tx.send(());
         });
+        let live = owners.enter();
         let owner = std::thread::spawn(move || {
-            let _live = owners.enter();
+            let _live = live;
             stop_rx.recv().unwrap();
             finish_rx.recv().unwrap();
         });

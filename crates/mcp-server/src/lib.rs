@@ -5625,6 +5625,81 @@ mod rescan_hatch_consultations {
         server.shutdown();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_object_returns_base_and_local_fields_for_a_partial_adopted_register() {
+        fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_tree(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../bsl-metadata/fixtures/extension_common_attributes");
+        let base = root.join("src/cf");
+        let extension = root.join("src/cfe/ext");
+        copy_tree(&fixture.join("base"), &base);
+        copy_tree(&fixture.join("extensions/explicit-use"), &extension);
+        std::fs::write(
+            root.join("bsl-analyzer.toml"),
+            "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"Ext\", path = \"src/cfe/ext\", scope = \"InfoBase\" }]\n",
+        )
+        .unwrap();
+
+        let overlay_register = extension.join("InformationRegisters/BaseRegister.xml");
+        let mut xml = std::fs::read_to_string(&overlay_register).unwrap();
+        assert!(xml.contains("0974fddb-727e-5ee2-bbb2-f9896e3c8862"));
+        xml = xml.replace(
+            "0974fddb-727e-5ee2-bbb2-f9896e3c8862",
+            "00000000-0000-0000-0000-000000000000",
+        );
+        let local_fields = "<Dimension uuid=\"f0000000-0000-0000-0000-000000000001\"><Properties><Name>LocalKey</Name><Type><v8:Type>xs:string</v8:Type><v8:StringQualifiers><v8:Length>20</v8:Length><v8:AllowedLength>Variable</v8:AllowedLength></v8:StringQualifiers></Type></Properties></Dimension><Resource uuid=\"f0000000-0000-0000-0000-000000000002\"><Properties><Name>LocalAmount</Name><Type><v8:Type>xs:decimal</v8:Type><v8:NumberQualifiers><v8:Digits>10</v8:Digits><v8:FractionDigits>0</v8:FractionDigits><v8:AllowedSign>Any</v8:AllowedSign></v8:NumberQualifiers></Type></Properties></Resource>";
+        assert!(xml.contains("<ChildObjects/>"));
+        xml =
+            xml.replace("<ChildObjects/>", &format!("<ChildObjects>{local_fields}</ChildObjects>"));
+        std::fs::write(&overlay_register, xml).unwrap();
+
+        let project = crate::project::at(root).expect("base and extension project resolves");
+        let cache = crate::cache::WorkspaceCacheLayout::for_project(
+            &project,
+            Some(&dir.path().join("cache")),
+            root,
+            None,
+        )
+        .unwrap();
+        let state = SharedState::workspace_with_cache(root.to_path_buf(), cache).unwrap();
+        state.diagnostics().ensure_loading();
+        crate::diagnostics_state::test_support::wait_ready(state.diagnostics());
+        let server = McpServer::new(McpProfile::Workspace, state.clone());
+        let response = server
+            .metadata(
+                metadata_params("РегистрСведений", "BaseRegister"),
+                token(),
+                tasks::TaskCapable(false),
+            )
+            .await
+            .expect("the metadata object consumer resolves the partial register");
+        let rmcp::model::CallToolResponse::Complete(result) = response else {
+            panic!("the metadata response is inline without task capability")
+        };
+        let body = serde_json::to_string(&result).unwrap();
+        for field in ["Key", "Amount", "LocalKey", "LocalAmount"] {
+            assert!(body.contains(field), "the tool preserves base and local fields: {body}");
+        }
+        for field_type in ["Строка(20)", "Число(10, 0)"] {
+            assert!(body.contains(field_type), "the tool returns resolved field types: {body}");
+        }
+        state.shutdown();
+    }
+
     /// An absent card for a request made BY NAME is a candidate; a name that resolved is
     /// not.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

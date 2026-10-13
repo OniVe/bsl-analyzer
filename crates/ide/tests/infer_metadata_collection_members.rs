@@ -26,7 +26,7 @@ fn setup(fixture_text: &str) -> (RootDatabaseImpl, FileId) {
         db.set_file_source_root(*file_id, SourceRootId(0));
         db.set_file_text(*file_id, &file.content);
     }
-    db.set_all_config_paths(vec![(None, designer_fixture_path())]);
+    db.set_all_config_paths(vec![(None, designer_fixture_path())], None);
 
     let test_file = fixture
         .files
@@ -118,7 +118,7 @@ fn unresolved_field_messages(code: &str, with_configuration: bool) -> Vec<String
     let fixture = format!("//- /test.bsl\n{code}");
     let (mut db, file_id) = setup(&fixture);
     if !with_configuration {
-        db.set_all_config_paths(Vec::new());
+        db.set_all_config_paths(Vec::new(), None);
     }
     Analysis::from_database(db)
         .diagnostics(file_id, &DiagnosticsConfig::all_enabled())

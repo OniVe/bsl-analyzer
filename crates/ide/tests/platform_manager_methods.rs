@@ -39,7 +39,7 @@ fn setup_with_unreadable(fixture_text: &str, unreadable: &[&str]) -> (RootDataba
     }
     assert_eq!(marked, unreadable.len(), "every named file must exist in the fixture");
 
-    db.set_all_config_paths(vec![(None, designer_fixture_path())]);
+    db.set_all_config_paths(vec![(None, designer_fixture_path())], None);
 
     let test_file = fixture
         .files
@@ -116,7 +116,7 @@ fn setup_with_target_path(
         db.set_file_source_root(*file_id, SourceRootId(0));
         db.set_file_text(*file_id, &file.content);
     }
-    db.set_all_config_paths(vec![(None, designer)]);
+    db.set_all_config_paths(vec![(None, designer)], None);
     let needle = target_path_suffix.replace('\\', "/");
     let target = mapped
         .iter()

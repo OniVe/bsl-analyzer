@@ -86,6 +86,9 @@ pub(crate) mod heap_estimate {
             + stdx::heap::vec_bytes::<std::path::PathBuf>(snapshot.canonical_paths.len())
             + snapshot.canonical_paths.iter().map(|p| p.capacity()).sum::<usize>()
             + stdx::heap::vec_bytes::<super::RootKind>(snapshot.kinds.len())
+            + stdx::heap::vec_bytes::<Option<bsl_metadata::ExtensionScope>>(
+                snapshot.extension_scopes.len(),
+            )
             + stdx::heap::vec_bytes::<Vec<usize>>(snapshot.closures.len())
             + snapshot
                 .closures
@@ -404,6 +407,8 @@ pub struct WorkspaceConfigsSnapshot {
     pub paths: Vec<(Option<String>, PathBuf)>,
     /// Per entry (same order as `paths`): what the root is.
     pub kinds: Vec<RootKind>,
+    /// Installation scope per root; base and external roots have no extension scope.
+    pub extension_scopes: Vec<Option<bsl_metadata::ExtensionScope>>,
     /// Canonicalized counterpart of `paths` (same order) — what per-file
     /// longest-prefix matching uses, so a symlinked workspace still matches.
     pub canonical_paths: Vec<PathBuf>,
@@ -440,9 +445,11 @@ impl WorkspaceConfigsSnapshot {
         let closures = vec![Vec::new(); paths.len()];
         let topological_order = (0..paths.len()).collect();
         let kinds = RootKind::from_labels(&paths);
+        let extension_scopes = vec![None; paths.len()];
         Self {
             paths,
             kinds,
+            extension_scopes,
             canonical_paths,
             closures,
             topological_order,
@@ -459,6 +466,7 @@ impl WorkspaceConfigsSnapshot {
         let topology = project.extension_topology();
         let mut paths: Vec<(Option<String>, PathBuf)> = Vec::new();
         let mut kinds: Vec<RootKind> = Vec::new();
+        let mut extension_scopes = Vec::new();
         let mut canonical_paths = Vec::new();
         let mut closures: Vec<Vec<usize>> = Vec::new();
         let base = project.semantic_base_path();
@@ -468,10 +476,12 @@ impl WorkspaceConfigsSnapshot {
             let canonical_base = std::fs::canonicalize(&base).unwrap_or_else(|_| base.clone());
             paths.push((None, base));
             kinds.push(RootKind::Base);
+            extension_scopes.push(None);
             canonical_paths.push(canonical_base);
             closures.push(Vec::new());
         }
         for node in topology.nodes() {
+            extension_scopes.push(node.scope());
             paths.push((Some(node.name().to_string()), node.path().to_path_buf()));
             canonical_paths.push(node.canonical_path().to_path_buf());
             kinds.push(match node.kind() {
@@ -488,6 +498,7 @@ impl WorkspaceConfigsSnapshot {
         Self {
             paths,
             kinds,
+            extension_scopes,
             canonical_paths,
             closures,
             topological_order,
@@ -668,6 +679,23 @@ fn source_exclusions_for<'db>(
         .unwrap_or_default()
 }
 
+/// Project the owner kind and scope so unrelated snapshot changes can be backdated.
+#[salsa::tracked]
+pub(crate) fn configuration_context(
+    db: &dyn salsa::Database,
+    path: ConfigurationPathInput<'_>,
+) -> Option<(RootKind, Option<bsl_metadata::ExtensionScope>)> {
+    let snapshot = WorkspaceConfigsInput::try_get(db)?.snapshot(db);
+    let requested = path.path(db);
+    snapshot.paths.iter().enumerate().find_map(|(idx, (_, configured))| {
+        let canonical = &snapshot.canonical_paths[idx];
+        [configured, canonical]
+            .into_iter()
+            .any(|p| canonicalize_configuration_path(&p.to_string_lossy()) == *requested)
+            .then(|| (snapshot.kinds[idx], snapshot.extension_scopes[idx]))
+    })
+}
+
 /// The base configuration merged with one extension's overlay, memoised per
 /// (base, extension) path pair. `Configuration::merged_with_extension` deep-clones the
 /// whole base configuration, so without this every metadata lookup of every extension
@@ -691,7 +719,12 @@ pub fn merged_configuration<'db>(
     // every batch re-run the whole-config XML load inside the worker pool.
     let main = db.load_configuration(main_input);
     let extension = db.load_configuration(extension_input);
-    Arc::new(main.merged_with_extension(&extension))
+    let scope =
+        configuration_context(db.as_dyn_database(), extension_input).and_then(|(_, scope)| scope);
+    let base_attributes = configuration_context(db.as_dyn_database(), main_input)
+        .filter(|(kind, _)| *kind == RootKind::Base)
+        .map(|_| main.common_attribute_set());
+    Arc::new(main.merged_with_extension(&extension, scope, base_attributes))
 }
 
 /// An ordered visibility chain of config roots: the base first, then the
@@ -724,12 +757,40 @@ pub fn chain_configuration<'db>(
     let inputs = chain.inputs(db.as_dyn_database());
     match inputs.split_last() {
         None => Arc::new(Configuration::new("Configuration")),
-        Some((only, [])) => db.load_configuration(*only),
+        Some((only, [])) => {
+            let config = db.load_configuration(*only);
+            match configuration_context(db.as_dyn_database(), *only) {
+                Some((RootKind::Extension, Some(scope))) => {
+                    let mut standalone = (*config).clone();
+                    standalone.apply_extension_common_attributes(*scope);
+                    Arc::new(standalone)
+                }
+                Some((RootKind::Extension, None)) => {
+                    let mut standalone = (*config).clone();
+                    standalone.apply_legacy_common_attributes();
+                    Arc::new(standalone)
+                }
+                _ => config,
+            }
+        }
         Some((last, prefix)) => {
             let prefix_chain = ConfigChainInput::new(db.as_dyn_database(), prefix.to_vec());
             let base = chain_configuration(db, prefix_chain);
             let overlay = db.load_configuration(*last);
-            Arc::new(base.merged_with_extension(&overlay))
+            let scope =
+                configuration_context(db.as_dyn_database(), *last).and_then(|(_, scope)| scope);
+            let main = inputs
+                .iter()
+                .find(|input| {
+                    configuration_context(db.as_dyn_database(), **input)
+                        .is_some_and(|(kind, _)| kind == RootKind::Base)
+                })
+                .map(|input| db.load_configuration(*input));
+            Arc::new(base.merged_with_extension(
+                &overlay,
+                scope,
+                main.as_ref().map(|main| main.common_attribute_set()),
+            ))
         }
     }
 }
@@ -2443,7 +2504,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             dir.path().join("bsl-analyzer.toml"),
-            "[source]\nextensions = [\"Расширения/Feature\"]\n",
+            "[source]\nextensions = [{ name = \"Feature\", path = \"Расширения/Feature\", scope = \"InfoBase\" }]\n",
         )
         .unwrap();
 
@@ -2457,6 +2518,7 @@ mod tests {
         assert_eq!(snapshot.topological_order, vec![0]);
         assert_eq!(snapshot.closures, vec![Vec::<usize>::new()]);
         assert_eq!(snapshot.kinds, vec![super::RootKind::Extension]);
+        assert_eq!(snapshot.extension_scopes, vec![Some(bsl_metadata::ExtensionScope::InfoBase)]);
     }
 
     /// An external object declared first still lands after every extension, sees
@@ -2487,8 +2549,8 @@ mod tests {
             "[source]\nroot = \"src/cf\"\n\
              externals = [{ name = \"EPF\", path = \"src/epf/Обработка\" }]\n\
              extensions = [\n\
-               { name = \"A\", path = \"src/cfe/A\", dependsOn = [\"B\"] },\n\
-               { name = \"B\", path = \"src/cfe/B\" },\n\
+               { name = \"A\", path = \"src/cfe/A\", scope = \"DataSeparation\", dependsOn = [\"B\"] },\n\
+               { name = \"B\", path = \"src/cfe/B\", scope = \"InfoBase\" },\n\
              ]\n",
         )
         .unwrap();
@@ -2499,6 +2561,15 @@ mod tests {
         let labels: Vec<Option<&str>> =
             snapshot.paths.iter().map(|(label, _)| label.as_deref()).collect();
         assert_eq!(labels, vec![None, Some("A"), Some("B"), Some("EPF")]);
+        assert_eq!(
+            snapshot.extension_scopes,
+            vec![
+                None,
+                Some(bsl_metadata::ExtensionScope::DataSeparation),
+                Some(bsl_metadata::ExtensionScope::InfoBase),
+                None
+            ]
+        );
         assert_eq!(
             snapshot.kinds,
             vec![

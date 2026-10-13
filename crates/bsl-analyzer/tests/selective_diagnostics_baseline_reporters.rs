@@ -20,7 +20,7 @@ fn setup() -> tempfile::TempDir {
         temp.path().join("bsl-analyzer.toml"),
         r#"[source]
 root = "src/cf"
-extensions = [{ name = "Ext", path = "src/cfe/Ext" }]
+extensions = [{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }]
 [diagnostics.baseline]
 directory = "baselines"
 include = ["main"]
@@ -124,7 +124,7 @@ fn selective_baseline_codequality_and_sarif_preserve_fingerprint_semantics() {
         temp.path().join("bsl-analyzer.toml"),
         r#"[source]
 root = "src/cf"
-extensions = [{ name = "Ext", path = "src/cfe/Ext" }]
+extensions = [{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }]
 "#,
     )
     .unwrap();
