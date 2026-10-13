@@ -1690,9 +1690,8 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../bsl-metadata/fixtures/designer"
         ));
-        for name in ["Configuration.xml", "ConfigDumpInfo.xml"] {
-            std::fs::copy(fixture.join(name), dir.path().join(name)).expect("copy");
-        }
+        std::fs::copy(fixture.join("Configuration.xml"), dir.path().join("Configuration.xml"))
+            .expect("copy");
         copy_tree(&fixture.join("Catalogs"), &dir.path().join("Catalogs"));
         let config = bsl_metadata::load_from_directory(dir.path()).expect("load");
         assert!(

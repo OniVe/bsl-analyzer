@@ -1,23 +1,21 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" version="2.20">
-	<IntegrationService uuid="c512a1cd-1240-4e46-8bad-8b7b27c5c25a">
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="2.20">
+	<IntegrationService uuid="7e1c005c-3a5b-4c6d-8e7f-5a000000005c">
 		<Properties>
 			<Name>ОбменСообщениями</Name>
-			<Comment/>
 		</Properties>
 		<ChildObjects>
-			<IntegrationServiceChannel uuid="1ef0581c-b1d8-4115-87f1-7856f6c06bb6">
+			<IntegrationServiceChannel uuid="7e1c005a-3a5b-4c6d-8e7f-5a000000005a">
 				<Properties>
-					<Name>input_from_SM_normal_priority</Name>
+					<Name>Входящий</Name>
 					<MessageDirection>Receive</MessageDirection>
 					<ReceiveMessageProcessing>ОбработатьСообщениеОбычныйПриоритет</ReceiveMessageProcessing>
 				</Properties>
 			</IntegrationServiceChannel>
-			<IntegrationServiceChannel uuid="b017ac62-a4a2-47bd-b963-50e0764a7d4e">
+			<IntegrationServiceChannel uuid="7e1c005b-3a5b-4c6d-8e7f-5a000000005b">
 				<Properties>
-					<Name>output_to_SM_high_priority</Name>
+					<Name>Исходящий</Name>
 					<MessageDirection>Send</MessageDirection>
-					<ReceiveMessageProcessing/>
 				</Properties>
 			</IntegrationServiceChannel>
 		</ChildObjects>
