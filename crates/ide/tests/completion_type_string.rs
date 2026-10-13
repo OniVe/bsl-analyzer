@@ -218,3 +218,45 @@ fn primitive_types_are_not_offered_after_ref_prefix() {
         );
     }
 }
+
+#[test]
+fn string_argument_of_method_on_variable_named_type_gets_no_type_names() {
+    let items = complete(
+        r#"//- /test.bsl
+Процедура ОбработатьЗначение(Значение)
+    Тип = Новый Соответствие;
+    Тип.Вставить("СправочникСсылка.$0", 1);
+КонецПроцедуры
+"#,
+    );
+
+    assert!(!has_label(&items, "Справочник1"), "got {:?}", labels(&items));
+}
+
+#[test]
+fn string_argument_of_method_on_type_call_result_gets_no_type_names() {
+    let items = complete(
+        r#"//- /test.bsl
+Процедура ОбработатьЗначение(Значение)
+    Тип("Строка").Метод("ДокументСсылка.$0");
+КонецПроцедуры
+"#,
+    );
+
+    assert!(!has_label(&items, "Документ1"), "got {:?}", labels(&items));
+}
+
+#[test]
+fn english_type_call_offers_type_names() {
+    let items = complete(
+        r#"//- /test.bsl
+Procedure Check(Value)
+    If TypeOf(Value) = Type("ДокументСсылка.$0") Then
+        Return;
+    EndIf;
+EndProcedure
+"#,
+    );
+
+    assert!(has_label(&items, "Документ1"), "got {:?}", labels(&items));
+}

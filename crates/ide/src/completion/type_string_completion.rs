@@ -133,11 +133,17 @@ fn consider(
     });
 }
 
-/// `Тип` is a bare global function, so the first identifier inside the call is
-/// its name; matched case-insensitively in both languages.
+/// `Тип` is a bare global function: the callee — the first child of the call —
+/// must be a lone `IDENT` node, not a `FIELD_EXPR` such as `Тип.Вставить` on a
+/// variable that happens to be named `Тип`. Matched case-insensitively in both
+/// languages.
 fn callee_is_type(call: &SyntaxNode) -> bool {
-    call.descendants_with_tokens()
-        .filter_map(|e| e.into_token())
-        .find(|t| t.kind() == SyntaxKind::IDENT)
-        .is_some_and(|t| matches!(t.text().fold_lower().as_str(), "тип" | "type"))
+    call.children()
+        .next()
+        .filter(|callee| callee.kind() == SyntaxKind::IDENT)
+        .and_then(|callee| callee.first_token())
+        .is_some_and(|t| {
+            t.kind() == SyntaxKind::IDENT
+                && matches!(t.text().fold_lower().as_str(), "тип" | "type")
+        })
 }
