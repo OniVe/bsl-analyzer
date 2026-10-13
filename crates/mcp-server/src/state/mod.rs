@@ -614,11 +614,22 @@ impl SharedState {
         self.workspace_lease.ownership_was_checked()
     }
 
-    /// Whether the boot's workspace-search initialization is still running. A test that needs
-    /// the graph to stay unbuilt has to know when the thread that would claim it has gone.
-    #[cfg(test)]
-    pub(crate) fn search_init_running(&self) -> bool {
+    /// Whether the boot's workspace-search initialization is still running — the window in
+    /// which an empty engine slot means "a build is coming" and not "the build gave up".
+    /// `search status` reads it so a terminal failure is never worded as "building"; a test
+    /// that needs the graph to stay unbuilt reads it to know when the claiming thread has gone.
+    pub(crate) fn search_initializing(&self) -> bool {
         self.workspace_search_initializing.load(Ordering::Relaxed)
+    }
+
+    /// Hold the boot's initialization flag up, for a test that must stand in the window between
+    /// "the engine slot is empty" and "the boot's thread has gone". That window is real but not
+    /// constructible: the thread lowers the flag as it leaves, so a test that built a state and
+    /// read the flag would be racing whatever the init did in the meantime. Nothing in production
+    /// calls this — the flag is the init thread's own.
+    #[cfg(test)]
+    pub(crate) fn hold_search_initialization_for_test(&self) {
+        self.workspace_search_initializing.store(true, Ordering::Relaxed);
     }
 
     /// Observe qualified indexing evidence without waiting or starting work.

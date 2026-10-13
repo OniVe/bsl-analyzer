@@ -1143,11 +1143,12 @@ impl SharedState {
                 "topology changed; re-rendering every document's graph context"
             );
         }
-        if stats.paths_cleared > 0 {
+        if stats.paths_cleared > 0 || stats.paths_transferred > 0 {
             tracing::info!(
                 paths = stats.paths_cleared,
                 chunks = stats.chunks_updated,
                 cleared_embeddings = stats.cleared_embeddings,
+                transferred = stats.paths_transferred,
                 "search graph context refreshed after graph publish"
             );
         }
@@ -3232,6 +3233,250 @@ mod tests {
             refreshed,
             "the xml drift re-rendered the module's graph context and re-embedded it into the live index",
         );
+    }
+
+    /// github#234, end to end through the PRODUCTION wiring (real graph, real store, the real
+    /// publish hook built by `build_publish_hook`). A CommonModule that exists on disk but in no
+    /// store row lives in the overlay alone: its `.bsl` chunks are its overlay RECORD, published
+    /// by the point path. Its `.xml` descriptor is then edited — which flips the module's
+    /// dispatch, so the next graph renders a different context for the same method — and the
+    /// graph's own publish fires the context refresh. That refresh has no store chunks to
+    /// re-render, so the obligation must move to the record's dirty mark, and the point path
+    /// must rebuild the record from the freshly published graph. Clearing the mark against the
+    /// store instead leaves the record on the pre-edit context for good, which is what this test
+    /// fails on.
+    #[test]
+    fn an_xml_descriptor_edit_rerenders_the_context_of_an_overlay_only_record() {
+        use crate::change_hub::{ChangeEntry, ChangeKind};
+        use bsl_search::{PointPublish, SearchEngine, Store};
+        use std::time::{Duration, Instant};
+
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        // Server-only as declared: the graph renders "Dispatch: server | сервер" for its method.
+        write_common_module(&workspace, "Сервер", "Функция Считать() Экспорт КонецФункции");
+        let module_rel = "CommonModules/Сервер/Ext/Module.bsl";
+        let xml = workspace.join("CommonModules/Сервер.xml");
+
+        let db_path = workspace.join("search.db");
+        let mut engine = SearchEngine::fts_only(&db_path).unwrap();
+        engine.set_workspace_root(&workspace);
+        engine.enable_workspace_watcher_mode();
+        engine.initialize_workspace_overlay_clean().unwrap();
+        let engine_arc: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
+
+        // The SAME publish hook the daemon builds, so the graph's real publish — not a hand-call
+        // — drives the context refresh and installs the provider the record is rebuilt from.
+        let semantic_runtime = Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Ready));
+        let index_progress = bsl_search::IndexProgress::new();
+        let embed_flight = super::EmbedFlight::new();
+        let graph = crate::graph::GraphState::for_workspace(workspace.clone());
+        let inner = SharedState::build_publish_hook(
+            Arc::clone(&engine_arc),
+            crate::state::OwnerStop::default(),
+            graph.store().clone(),
+            graph.owed_context_marks(),
+            Arc::clone(&semantic_runtime),
+            Arc::clone(&index_progress),
+            Arc::clone(&embed_flight),
+            None,
+            Arc::new(AtomicU64::new(0)),
+            super::super::types::EmbeddingPrefixes::default(),
+            crate::workspace_lease::WorkspaceLease::unmanaged(),
+            DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
+        );
+        // What the test waits on, and every signal it uses is the FACT of the hook having run:
+        // a fire counted here has already installed its generation's provider and rendered the
+        // marks it could answer. The graph token on disk is observable BEFORE the hook runs, so
+        // waiting on it would let the assertion below race the publication it is about.
+        let revision_before = Arc::new(AtomicU64::new(0));
+        let new_generation_publications = Arc::new(AtomicUsize::new(0));
+        let hook = {
+            let inner = Arc::clone(&inner);
+            let revision_before = Arc::clone(&revision_before);
+            let new_generation_publications = Arc::clone(&new_generation_publications);
+            Arc::new(move |signal: crate::graph::GraphPublishSignal| {
+                let publishes_a_new_generation = signal.roots_refresh_requested
+                    && signal.revision > revision_before.load(Ordering::SeqCst);
+                let outcome = inner(signal);
+                // Counted AFTER the inner hook: installing the provider and consuming the marks
+                // both happen inside it, so a counted fire is one the test may already rely on.
+                if publishes_a_new_generation {
+                    new_generation_publications.fetch_add(1, Ordering::SeqCst);
+                }
+                outcome
+            })
+        };
+        let graph = graph.with_publish_hook(hook);
+
+        // The point path is the executor of a record's dirty mark; the test drives it the way the
+        // production owners do (capture under the engine lock, prepare off it, publish) and treats
+        // its documented transient outcomes the same way they do — by repeating the batch.
+        let run_point_refresh = |engine: &super::SharedSearchEngine| {
+            let capture = engine
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .capture_point_refresh(bsl_search::POINT_BATCH_KEYS)
+                .unwrap();
+            let Some(capture) = capture else { return false };
+            let reader = Store::open_reader(capture.db_path()).unwrap();
+            let mut batch = capture.prepare(&reader, &|| false).unwrap();
+            let published =
+                engine.lock().unwrap().as_ref().unwrap().publish_point_refresh(&mut batch).unwrap();
+            // `Discarded`/`Busy` are documented: the state the batch was prepared against moved,
+            // or the store was writing. Production keeps the mark and repeats; so does this loop.
+            matches!(published, PointPublish::Applied { .. })
+        };
+        let record_context = |engine: &super::SharedSearchEngine| {
+            engine
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .workspace_overlay_snapshot()
+                .unwrap()
+                .lexical_documents
+                .into_iter()
+                .find(|document| document.symbol_name == "Считать")
+                .and_then(|document| document.graph_context)
+        };
+        // Every wait in this test is on a condition the test itself can re-read, with a deadline
+        // instead of a sleep: the graph builds, and its hook runs, on its own thread.
+        let wait_for = |ready: &dyn Fn() -> bool, seconds: u64, what: &str| {
+            let deadline = Instant::now() + Duration::from_secs(seconds);
+            while Instant::now() < deadline {
+                if ready() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(ready(), "{what} (graph: {:?})", graph.status());
+        };
+        // The production owners repeat a point batch whose outcome was transient; so does this.
+        let drive_point_refresh =
+            |engine: &super::SharedSearchEngine, ready: &dyn Fn() -> bool, what: &str| {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while Instant::now() < deadline {
+                    if ready() {
+                        return;
+                    }
+                    run_point_refresh(engine);
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                assert!(ready(), "{what} (graph: {:?})", graph.status());
+            };
+
+        // Build and publish the graph once. The provider the record is rendered with is installed
+        // by the publication's HOOK, not by the build's status — which is observable before the
+        // hook runs — so the test waits for a counted fire, not for `Ready`.
+        graph.ensure_loading();
+        wait_for(
+            &|| new_generation_publications.load(Ordering::SeqCst) >= 1,
+            60,
+            "the first graph publication never ran its hook",
+        );
+
+        // A file created after boot: the point path builds its record, and no store row is
+        // written for it — the premise of the whole case.
+        let key = {
+            let guard = engine_arc.lock().unwrap();
+            let engine = guard.as_ref().unwrap();
+            bsl_search::workspace_file_key_in(
+                engine.workspace_roots().expect("the engine serves a root table"),
+                &workspace.join(module_rel),
+            )
+            .expect("the module attributes to the configuration root")
+        };
+        engine_arc.lock().unwrap().as_ref().unwrap().mark_workspace_key_dirty(key.clone()).unwrap();
+        drive_point_refresh(
+            &engine_arc,
+            &|| record_context(&engine_arc).is_some(),
+            "the point path never built the record",
+        );
+        {
+            let guard = engine_arc.lock().unwrap();
+            let engine = guard.as_ref().unwrap();
+            assert!(
+                engine
+                    .store()
+                    .chunks_with_context_for_file("code", &key.root_id, &key.path)
+                    .unwrap()
+                    .is_empty(),
+                "the store must hold no chunks for this key for the case to mean anything",
+            );
+        }
+        // Positive control: the record carries the pre-edit graph's context, so the assertions
+        // below cannot pass on a context that was never rendered.
+        let before = record_context(&engine_arc).expect("the record carries a rendered context");
+        assert!(before.contains("Dispatch: server | сервер"), "{before}");
+
+        // The descriptor edit: client-only now, so the same method renders another dispatch. The
+        // `.bsl` itself is untouched.
+        let declared = fs::read_to_string(&xml).unwrap();
+        fs::write(
+            &xml,
+            declared.replace("<Server>true</Server>", "<Server>false</Server>").replace(
+                "<ClientManagedApplication>false</ClientManagedApplication>",
+                "<ClientManagedApplication>true</ClientManagedApplication>",
+            ),
+        )
+        .unwrap();
+        let entry = ChangeEntry {
+            canonical: xml.clone(),
+            raw: xml.clone(),
+            kind: ChangeKind::MaybeChanged,
+            seq: 1,
+        };
+        // The generation the provider is installed for is the one the test stamps here; every fire
+        // that serves a NEWER one is counted by the hook above.
+        revision_before.store(built_graph_token(&workspace).0, Ordering::SeqCst);
+        let publications_before = new_generation_publications.load(Ordering::SeqCst);
+        // The drift marks the owned module context-dirty and nudges the graph; the nudged build
+        // publishes and fires the hook — which consumes the mark — on its own thread.
+        SharedState::apply_search_drift(
+            &engine_arc,
+            &crate::state::OwnerStop::default(),
+            &[entry],
+            false,
+            &graph,
+        );
+
+        // Wait for the PUBLICATION, not for the graph token: the token on disk is observable
+        // before the hook runs, and the point refresh below must answer the obligation against the
+        // provider that hook installed. A counted fire has already installed it and consumed the
+        // marks it could answer, so both facts below hold by then — in either order the graph
+        // chooses (a marks-only fire against the old generation first, or the rebuild's own fire).
+        wait_for(
+            &|| new_generation_publications.load(Ordering::SeqCst) > publications_before,
+            60,
+            "no publication served the edited descriptor",
+        );
+        {
+            let guard = engine_arc.lock().unwrap();
+            assert!(
+                guard.as_ref().unwrap().workspace_overlay_dirty_paths().unwrap().contains(&key),
+                "the record must own the obligation the context mark dropped",
+            );
+        }
+        // Positive control: nothing rebuilt the record yet, so it still serves the pre-edit
+        // context — the state the defect would have left it in for good.
+        let stale = record_context(&engine_arc).expect("the record carries a rendered context");
+        assert!(stale.contains("Dispatch: server | сервер"), "{stale}");
+
+        // The executor answers it, against the provider the publication installed. Its documented
+        // transient outcomes are repeated, not asserted away.
+        drive_point_refresh(
+            &engine_arc,
+            &|| {
+                record_context(&engine_arc)
+                    .is_some_and(|context| context.contains("Dispatch: client | клиент"))
+            },
+            "the record never took the new graph's context",
+        );
+        let after = record_context(&engine_arc).unwrap_or_default();
+        assert!(!after.contains("Dispatch: server"), "{after}");
     }
 
     /// While a graph drift is still being caught up (a follow-up reload is pending), the context

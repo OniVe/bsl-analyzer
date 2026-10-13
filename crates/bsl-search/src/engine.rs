@@ -533,6 +533,13 @@ pub struct ContextRefreshStats {
     /// `chunks_updated` today (every re-render clears the embedding), tracked separately
     /// so the "kick the embed pass" decision reads an explicit signal, not a coincidence.
     pub cleared_embeddings: usize,
+    /// Keys whose context obligation was HANDED to their overlay record instead of being
+    /// satisfied here: the record is the surface that serves those keys' chunks (a locally edited
+    /// file, or a file the store has not stored at all), and only the point path rebuilds it —
+    /// from the provider the cache holds now. Each one had its record marked dirty in this pass;
+    /// the context mark is cleared in the same pass, so the obligation is never unowned between
+    /// the two.
+    pub paths_transferred: usize,
 }
 
 impl SearchEngine {
@@ -3638,6 +3645,28 @@ impl SearchEngine {
         Ok(())
     }
 
+    /// Hand a key's context obligation to its overlay record, when the overlay holds one — the ONE
+    /// place either render branch asks who else carries a key, so neither can disagree about who
+    /// owns the work. Called ONCE per key, before the pass chooses what to do with the store's own
+    /// copy, and its answer decides that choice: `true` means a record serves this key and was
+    /// marked dirty here (whose executor is the point refresh, rendering from the provider the
+    /// cache holds now), `false` means the store's copy is the only carrier and the caller clears
+    /// the context mark exactly as it always has.
+    ///
+    /// The cache is locked directly, not through a `mark_*` engine method: the context refresh
+    /// already runs under the engine lock, and re-entering it here would deadlock.
+    fn hand_context_obligation_to_overlay(&self, key: &FileKey) -> Result<bool, SearchError> {
+        let mut cache = self
+            .workspace_overlay_cache
+            .lock()
+            .map_err(|e| SearchError::Index(format!("workspace overlay cache lock error: {e}")))?;
+        if !cache.holds_entry(key) {
+            return Ok(false);
+        }
+        cache.mark_dirty_path(key.clone());
+        Ok(true)
+    }
+
     /// Apply one already-materialized drift slice. The host advances its cursors only after this
     /// returns `Continue(Ok(_))`; cancellation rolls back every Store mutation in the slice.
     ///
@@ -4521,6 +4550,7 @@ impl SearchEngine {
                 .and_then(Embedder::token_policy);
             let mut token_replacements = Vec::new();
             let mut retained_context = false;
+            let mut transferred = 0usize;
             if topology_changed {
                 mutations.extend(
                     keys.iter()
@@ -4529,6 +4559,17 @@ impl SearchEngine {
                 );
             }
             for key in keys {
+                // The ONE place a key's OTHER carrier is decided — whatever this pass does with
+                // the store's own copy of it. A key an overlay record serves (it hides the store's
+                // rows, or is what the store cannot serve at all) is handed that record's dirty
+                // mark here, before the context mark is consumed below, so the key is never left
+                // with neither carrier. The point path is that mark's executor: it rebuilds the
+                // record from the provider the cache holds now. Every outcome below uses this one
+                // verdict, so no branch can quietly leave a served record on the old context.
+                let handed = self.hand_context_obligation_to_overlay(&key)?;
+                if handed {
+                    transferred += 1;
+                }
                 if token_claim.is_some() {
                     let (Some(embedder), Some(policy), Some(roots)) = (
                         self.embedder.as_ref(),
@@ -4554,6 +4595,19 @@ impl SearchEngine {
                     if self.store.file_hash(&key.root_id, &key.path)?.as_deref()
                         != Some(content_hash.as_slice())
                     {
+                        // The disk is not the version the store holds, so the token replacement
+                        // below — fenced to a byte-identical store version — cannot answer this
+                        // key. The record that serves it was handed the obligation above; the
+                        // store's own mark is cleared here, since nothing in this pass can answer
+                        // it. A key with NO record keeps its mark: a store-side pass that puts
+                        // this content into the store is what has to answer it.
+                        if handed {
+                            mutations.push(ContextRefreshMutation::Clear {
+                                key: key.clone(),
+                                seq_bound,
+                            });
+                            continue;
+                        }
                         retained_context = true;
                         continue;
                     }
@@ -4583,6 +4637,10 @@ impl SearchEngine {
                     };
                     let (chunks, contexts, spans) =
                         crate::document::chunks_contexts_and_spans(&documents);
+                    // The store's copy IS the disk's here, so the token replacement above answers
+                    // the store's mark — but a record that serves this key was handed its own
+                    // obligation at the top of this turn, and its rebuild is a separate one: what
+                    // the store reindexes is the copy the record hides.
                     token_replacements.push((key.clone(), content_hash, chunks, contexts, spans));
                     lifecycle::decision(
                         self.store.db_path(),
@@ -4598,11 +4656,14 @@ impl SearchEngine {
                 // the whole path rather than clearing it against a half-failed render. A
                 // legitimate `Ok(None)` (a method with no graph presence, or a file entirely
                 // gone from the graph) is not an error and clears normally.
+                let rows = self.store.chunks_with_context_for_file(
+                    "code",
+                    &key.root_id,
+                    &key.path,
+                )?;
                 let mut render_failed = false;
                 let mut updates = Vec::new();
-                for (id, symbol_name, kind, stored) in
-                    self.store.chunks_with_context_for_file("code", &key.root_id, &key.path)?
-                {
+                for (id, symbol_name, kind, stored) in rows {
                     match provider.try_graph_context(&key.path, &symbol_name, &kind) {
                         Ok(rendered) => {
                             if rendered.as_deref() != stored.as_deref() {
@@ -4640,11 +4701,16 @@ impl SearchEngine {
                     retained_context = true;
                     continue;
                 }
+                // The store rows above are re-rendered whatever else carries the key. A RECORD that
+                // hides them was handed its own obligation at the top of this key's turn, so the
+                // clear below leaves the key with the record as its carrier; a key with no record
+                // has nothing else to rebuild and clears as it always has.
                 mutations.extend(updates);
                 mutations.push(ContextRefreshMutation::Clear { key, seq_bound });
             }
 
-            let mut stats = ContextRefreshStats::default();
+            let mut stats =
+                ContextRefreshStats { paths_transferred: transferred, ..ContextRefreshStats::default() };
             for batch in mutations.chunks(WORKSPACE_APPLY_BATCH_ROWS) {
                 let outcome = Self::fenced_checkpointed_value(apply, |checkpoint| {
                     lifecycle::with_reason(Reason::ContextChanged, || {
@@ -8621,6 +8687,548 @@ mod tests {
         let pending = engine.store().load_pending_embedding_documents("code").unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].1.symbol_name, "Изменённая");
+    }
+
+    /// github#234: a file the STORE holds no chunks for carries its graph context in its overlay
+    /// record alone — created after boot, published by the point path, never committed to
+    /// `files`/`chunks`. Re-rendering "the file's chunks" therefore finds nothing to rewrite, and
+    /// clearing the context mark there would leave the record serving the previous graph's
+    /// context with nothing left to rebuild it: the mark would be consumed by the one carrier
+    /// that cannot answer it. The obligation moves to the record's OWN dirty mark, whose
+    /// executor — the point refresh — rebuilds the record from the provider the cache now holds.
+    #[test]
+    fn a_context_mark_the_store_cannot_serve_moves_to_the_overlay_record() {
+        struct OldGraph;
+        impl crate::ports::GraphContextProvider for OldGraph {
+            fn graph_context(&self, _rel: &str, symbol_name: &str, _kind: &str) -> Option<String> {
+                Some(format!("Dispatch: server | сервер\nSignature: {symbol_name}\n"))
+            }
+        }
+        struct NewGraph;
+        impl crate::ports::GraphContextProvider for NewGraph {
+            fn graph_context(&self, _rel: &str, symbol_name: &str, _kind: &str) -> Option<String> {
+                Some(format!("Dispatch: client | клиент\nSignature: {symbol_name}\n"))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        let file = workspace.join("CommonModule.bsl");
+        fs::write(&file, "Процедура Локальная()\nКонецПроцедуры").unwrap();
+
+        let db_path = workspace.join("bsl-search.db");
+        let mut engine = SearchEngine::fts_only(&db_path).unwrap();
+        engine.set_workspace_root(workspace);
+        engine.enable_workspace_watcher_mode();
+        engine.initialize_workspace_overlay_clean().unwrap();
+        engine.set_graph_context_provider(std::sync::Arc::new(OldGraph));
+        // After the provider: installing one reopens the overlay (its entries must rebuild
+        // against the new source), while the cold-init entry point is what marks it primed.
+        engine.initialize_workspace_overlay_clean().unwrap();
+
+        let key = FileKey::configuration("CommonModule.bsl");
+        engine.mark_workspace_key_dirty(key.clone()).unwrap();
+        crate::point_refresh::point_refresh_for_test(&engine).unwrap();
+
+        // The premise of the whole case: the file's chunks live in the record, not in the store,
+        // so nothing in the store-side render below can re-render them.
+        assert!(
+            engine
+                .store()
+                .chunks_with_context_for_file("code", &key.root_id, &key.path)
+                .unwrap()
+                .is_empty(),
+            "the store must hold no chunks for this key for the case to mean anything",
+        );
+        let record_context = |engine: &SearchEngine| {
+            engine
+                .workspace_overlay_snapshot()
+                .unwrap()
+                .lexical_documents
+                .iter()
+                .find(|document| document.symbol_name == "Локальная")
+                .and_then(|document| document.graph_context.clone())
+        };
+        let old = "Dispatch: server | сервер\nSignature: Локальная\n";
+        let new = "Dispatch: client | клиент\nSignature: Локальная\n";
+        // Positive control: the record carries the context of the graph it was built from.
+        assert_eq!(record_context(&engine).as_deref(), Some(old));
+
+        // A publication swaps the provider — exactly what `replace_published_graph_context_provider`
+        // does — and the key is context-dirty, as a topology change or an `.xml` drift leaves it.
+        engine.replace_published_graph_context_provider(std::sync::Arc::new(NewGraph)).unwrap();
+        engine.store().mark_context_dirty("code", &key.root_id, &key.path).unwrap();
+
+        let stats = engine.refresh_dirty_contexts(&NewGraph, i64::MAX).unwrap();
+        assert_eq!(stats.paths_transferred, 1, "the key's obligation moved to its record");
+        assert_eq!(stats.paths_cleared, 1, "and the context mark is consumed in the same pass");
+        assert_eq!(stats.chunks_updated, 0, "the store had nothing to rewrite");
+        assert!(engine.context_dirty_paths("code").unwrap().is_empty());
+        assert!(
+            engine.workspace_overlay_dirty_paths().unwrap().contains(&key),
+            "the record owns the obligation now, so the point path will answer it",
+        );
+        // Nothing rebuilt the record in this pass: it still serves the previous graph's context,
+        // which is precisely why the obligation had to survive.
+        assert_eq!(record_context(&engine).as_deref(), Some(old));
+
+        // The executor the mark was left for: a point refresh rebuilds the record from the
+        // provider the cache holds now.
+        crate::point_refresh::point_refresh_for_test(&engine).unwrap();
+        assert_eq!(record_context(&engine).as_deref(), Some(new));
+        assert!(
+            engine.workspace_overlay_dirty_paths().unwrap().is_empty(),
+            "the rebuilt record settles its mark",
+        );
+    }
+
+    /// The ORDER the obligation moves in: the record's dirty mark is placed while the context mark
+    /// is still standing, and only then is the context mark cleared — in the same pass, but by a
+    /// later statement. A fence that REFUSES the write therefore leaves the key owned by BOTH
+    /// carriers; the reverse order, which this test forbids, would leave it owned by neither: the
+    /// mark cleared and the record with no obligation to rebuild it.
+    #[test]
+    #[allow(clippy::type_complexity, reason = "the fence adapter's type is the host's own")]
+    fn a_refused_context_refresh_hands_the_store_less_key_over_before_it_clears_the_mark() {
+        struct Graph;
+        impl crate::ports::GraphContextProvider for Graph {
+            fn graph_context(&self, _rel: &str, symbol_name: &str, _kind: &str) -> Option<String> {
+                Some(format!("Signature: {symbol_name}\n"))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        fs::write(workspace.join("CommonModule.bsl"), "Процедура Локальная()\nКонецПроцедуры")
+            .unwrap();
+        let db_path = workspace.join("bsl-search.db");
+        let mut engine = SearchEngine::fts_only(&db_path).unwrap();
+        engine.set_workspace_root(workspace);
+        engine.enable_workspace_watcher_mode();
+        engine.set_graph_context_provider(std::sync::Arc::new(Graph));
+        engine.initialize_workspace_overlay_clean().unwrap();
+
+        let key = FileKey::configuration("CommonModule.bsl");
+        engine.mark_workspace_key_dirty(key.clone()).unwrap();
+        crate::point_refresh::point_refresh_for_test(&engine).unwrap();
+        assert!(
+            engine
+                .store()
+                .chunks_with_context_for_file("code", &key.root_id, &key.path)
+                .unwrap()
+                .is_empty(),
+            "the store must hold no chunks for this key for the case to mean anything",
+        );
+        engine.store().mark_context_dirty("code", &key.root_id, &key.path).unwrap();
+
+        let mut refuse = |_operation: &mut dyn FnMut(
+            &mut dyn FnMut() -> ControlFlow<()>,
+        ) -> ControlFlow<
+            (),
+            Result<(), SearchError>,
+        >| FenceOutcome::TransientRefusal;
+        let (stats, outcome) =
+            engine.refresh_dirty_contexts_fenced(&Graph, i64::MAX, false, &mut refuse).unwrap();
+        assert!(matches!(outcome, FenceOutcome::TransientRefusal));
+        assert_eq!(stats.paths_transferred, 1, "the obligation was handed over");
+        assert_eq!(stats.paths_cleared, 0, "and the refused write cleared no mark");
+        assert!(
+            engine.context_dirty_paths("code").unwrap().contains(&key),
+            "the refused clear leaves the context mark standing",
+        );
+        assert!(
+            engine.workspace_overlay_dirty_paths().unwrap().contains(&key),
+            "so the record owes the rebuild as well — the key is never left unowned",
+        );
+    }
+
+    /// github#234, the GENERAL case: a file the store holds as its BASE version, locally edited —
+    /// so the overlay record hides those store rows and serves the key. Re-rendering only the
+    /// store rows left the record on the previous graph's context with no obligation left to
+    /// rebuild it. One refresh must answer BOTH carriers, while a key with neither rows nor a
+    /// record clears exactly as before.
+    #[test]
+    fn a_context_mark_on_a_key_both_carriers_hold_reaches_the_record_too() {
+        struct OldGraph;
+        impl crate::ports::GraphContextProvider for OldGraph {
+            fn graph_context(&self, _rel: &str, symbol_name: &str, _kind: &str) -> Option<String> {
+                Some(format!("Dispatch: server | сервер\nSignature: {symbol_name}\n"))
+            }
+        }
+        struct NewGraph;
+        impl crate::ports::GraphContextProvider for NewGraph {
+            fn graph_context(&self, _rel: &str, symbol_name: &str, _kind: &str) -> Option<String> {
+                Some(format!("Dispatch: client | клиент\nSignature: {symbol_name}\n"))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        let base = "Процедура Локальная()\nКонецПроцедуры";
+        let edited = "Процедура Локальная()\n    Возврат;\nКонецПроцедуры";
+        fs::write(workspace.join("Edited.bsl"), base).unwrap();
+
+        let db_path = workspace.join("bsl-search.db");
+        let mut engine = SearchEngine::fts_only(&db_path).unwrap();
+        engine.set_workspace_root(workspace);
+        // The store carries the BASE version of the file the record will hide. Indexed BEFORE the
+        // other file exists, so the second key stays one the store has never held.
+        engine.index_directory_fts(workspace).unwrap();
+        engine.enable_workspace_watcher_mode();
+        engine.set_graph_context_provider(std::sync::Arc::new(OldGraph));
+        engine.initialize_workspace_overlay_clean().unwrap();
+
+        // The local edit, and a file the store never saw: the record is what serves the first.
+        fs::write(workspace.join("Edited.bsl"), edited).unwrap();
+        fs::write(workspace.join("Loose.bsl"), "Процедура Никому()\nКонецПроцедуры").unwrap();
+        let edited_key = FileKey::configuration("Edited.bsl");
+        let loose_key = FileKey::configuration("Loose.bsl");
+        engine.mark_workspace_key_dirty(edited_key.clone()).unwrap();
+        crate::point_refresh::point_refresh_for_test(&engine).unwrap();
+
+        assert!(
+            !engine
+                .store()
+                .chunks_with_context_for_file("code", &edited_key.root_id, &edited_key.path)
+                .unwrap()
+                .is_empty(),
+            "the store still carries its base version of the edited file",
+        );
+        let record_context = |engine: &SearchEngine| {
+            engine
+                .workspace_overlay_snapshot()
+                .unwrap()
+                .lexical_documents
+                .into_iter()
+                .find(|document| document.symbol_name == "Локальная")
+                .and_then(|document| document.graph_context)
+        };
+        let old = "Dispatch: server | сервер\nSignature: Локальная\n";
+        let new = "Dispatch: client | клиент\nSignature: Локальная\n";
+        // Positive control: the record — not the store — is what serves this key, on the old graph.
+        assert_eq!(record_context(&engine).as_deref(), Some(old));
+
+        // A publication swaps the provider; the graph change marks both the edited key and a key
+        // with neither store rows nor a record.
+        engine.replace_published_graph_context_provider(std::sync::Arc::new(NewGraph)).unwrap();
+        engine.store().mark_context_dirty("code", &edited_key.root_id, &edited_key.path).unwrap();
+        engine.store().mark_context_dirty("code", &loose_key.root_id, &loose_key.path).unwrap();
+
+        let stats = engine.refresh_dirty_contexts(&NewGraph, i64::MAX).unwrap();
+        assert_eq!(
+            stats.paths_transferred, 1,
+            "the record that hides the rows owes its own rebuild"
+        );
+        assert!(stats.chunks_updated > 0, "and the hidden store rows are re-rendered as before");
+        assert_eq!(stats.paths_cleared, 2, "both context marks are consumed");
+        assert!(engine.context_dirty_paths("code").unwrap().is_empty());
+        // The store rows now carry the new graph's context …
+        let stored: Vec<_> = engine
+            .store()
+            .chunks_with_context_for_file("code", &edited_key.root_id, &edited_key.path)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.3)
+            .collect();
+        assert!(
+            stored.iter().any(|context| context.as_deref() == Some(new)),
+            "the store-side render still happens: {stored:?}",
+        );
+        // … while the record waits for its executor, still on the old context.
+        assert_eq!(record_context(&engine).as_deref(), Some(old));
+        let dirty = engine.workspace_overlay_dirty_paths().unwrap();
+        assert!(dirty.contains(&edited_key), "the record owns the rebuild");
+        assert!(
+            !dirty.contains(&loose_key),
+            "a key with neither rows nor a record has nothing to rebuild: it clears as before",
+        );
+
+        crate::point_refresh::point_refresh_for_test(&engine).unwrap();
+        assert_eq!(record_context(&engine).as_deref(), Some(new));
+        assert!(engine.workspace_overlay_dirty_paths().unwrap().is_empty());
+    }
+
+    /// A token-claim profile routes EVERY key through its token branch, where a key whose disk
+    /// version is not the store's is refused a store reindex. That refusal used to keep the context
+    /// mark for good on a key served by its overlay record — neither cleared nor answered. The
+    /// obligation now moves to the record; a key with no record keeps the mark exactly as before,
+    /// because a store-side pass is what has to answer it.
+    ///
+    /// The policy is built in-test (the same shape the boot builds), so nothing here is gated on
+    /// an environment-provided tokenizer.
+    #[test]
+    fn a_token_claim_hands_overlay_served_keys_to_their_records() {
+        struct OldGraph;
+        impl crate::ports::GraphContextProvider for OldGraph {
+            fn graph_context(&self, _rel: &str, symbol_name: &str, _kind: &str) -> Option<String> {
+                Some(format!("Dispatch: server | сервер\nSignature: {symbol_name}\n"))
+            }
+        }
+        struct NewGraph;
+        impl crate::ports::GraphContextProvider for NewGraph {
+            fn graph_context(&self, _rel: &str, symbol_name: &str, _kind: &str) -> Option<String> {
+                Some(format!("Dispatch: client | клиент\nSignature: {symbol_name}\n"))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        let tokenizer = br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"[UNK]":0},"unk_token":"[UNK]"}}"#;
+        let tokenizer_path = workspace.join("tokenizer.json");
+        fs::write(&tokenizer_path, tokenizer).unwrap();
+        let tokenizer_hash = {
+            use sha2::Digest;
+            sha2::Sha256::digest(tokenizer)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let token_policy = crate::TokenPolicy::load(&tokenizer_path, &tokenizer_hash, 32).unwrap();
+
+        let base = "Процедура Считанная()\nКонецПроцедуры";
+        let edited = "Процедура Считанная()\n    Возврат;\nКонецПроцедуры";
+        fs::write(workspace.join("Base.bsl"), base).unwrap();
+        fs::write(workspace.join("Stable.bsl"), "Процедура Стабильная()\nКонецПроцедуры").unwrap();
+
+        let db_path = workspace.join("bsl-search.db");
+        let config = crate::SearchConfig {
+            embedder: crate::EmbedderConfig {
+                dim: Some(3),
+                base_url: "http://127.0.0.1:0".into(),
+                token_policy: Some(token_policy),
+                ..crate::EmbedderConfig::default()
+            },
+            ..crate::SearchConfig::default()
+        };
+        let mut engine = SearchEngine::new(&db_path, config).unwrap();
+        engine.set_workspace_root(workspace);
+        // The store holds Base.bsl's BASE version and Stable.bsl exactly as it is on disk.
+        engine.index_directory_fts(workspace).unwrap();
+        engine.enable_workspace_watcher_mode();
+        engine.set_graph_context_provider(std::sync::Arc::new(OldGraph));
+        engine.initialize_workspace_overlay_clean().unwrap();
+
+        // Two overlay-served keys (one the store never held, one it holds as its base version), a
+        // store-side key whose disk version still matches, and a key with no record at all.
+        fs::write(workspace.join("New.bsl"), "Процедура Новая()\nКонецПроцедуры").unwrap();
+        fs::write(workspace.join("Base.bsl"), edited).unwrap();
+        fs::write(workspace.join("Loose.bsl"), "Процедура Никому()\nКонецПроцедуры").unwrap();
+        let new_key = FileKey::configuration("New.bsl");
+        let base_key = FileKey::configuration("Base.bsl");
+        let stable_key = FileKey::configuration("Stable.bsl");
+        let loose_key = FileKey::configuration("Loose.bsl");
+        for key in [new_key.clone(), base_key.clone()] {
+            engine.mark_workspace_key_dirty(key).unwrap();
+        }
+        crate::point_refresh::point_refresh_for_test(&engine).unwrap();
+
+        let record_context = |engine: &SearchEngine, symbol: &str| {
+            engine
+                .workspace_overlay_snapshot()
+                .unwrap()
+                .lexical_documents
+                .into_iter()
+                .find(|document| document.symbol_name == symbol)
+                .and_then(|document| document.graph_context)
+        };
+        let old = "Dispatch: server | сервер\n";
+        let new = "Dispatch: client | клиент\n";
+        let old_of = |context: Option<String>| context.expect("a rendered context");
+        assert!(old_of(record_context(&engine, "Новая")).contains(old));
+        assert!(old_of(record_context(&engine, "Считанная")).contains(old));
+        // The premise for the store-visible key: its record hides a base version on disk.
+        assert!(
+            !engine
+                .store()
+                .chunks_with_context_for_file("code", &base_key.root_id, &base_key.path)
+                .unwrap()
+                .is_empty(),
+            "the store carries the base version of the edited file",
+        );
+
+        engine.replace_published_graph_context_provider(std::sync::Arc::new(NewGraph)).unwrap();
+        for key in [&new_key, &base_key, &stable_key, &loose_key] {
+            engine.store().mark_context_dirty("code", &key.root_id, &key.path).unwrap();
+        }
+        let stats = engine.refresh_dirty_contexts(&NewGraph, i64::MAX).unwrap();
+        assert_eq!(
+            stats.paths_transferred, 2,
+            "both records took the obligation the token fence cannot answer",
+        );
+        assert_eq!(
+            stats.paths_cleared, 3,
+            "the two transferred keys and the store-side one are cleared",
+        );
+        assert_eq!(
+            engine.context_dirty_paths("code").unwrap(),
+            std::collections::HashSet::from([loose_key.clone()]),
+            "the key with no record keeps its mark, exactly as before",
+        );
+
+        // The store-side key was reindexed in place, with the new context.
+        let stable: Vec<_> = engine
+            .store()
+            .chunks_with_context_for_file("code", &stable_key.root_id, &stable_key.path)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.3)
+            .collect();
+        assert!(
+            stable.iter().any(|context| context.as_deref().is_some_and(|c| c.contains(new))),
+            "the token replacement still renders the store's own copy: {stable:?}",
+        );
+
+        // The records wait for their executor, then serve the new graph's context.
+        let dirty = engine.workspace_overlay_dirty_paths().unwrap();
+        assert!(dirty.contains(&new_key) && dirty.contains(&base_key), "{dirty:?}");
+        assert!(!dirty.contains(&loose_key), "the kept mark is not a record obligation");
+        assert!(old_of(record_context(&engine, "Новая")).contains(old));
+        assert!(old_of(record_context(&engine, "Считанная")).contains(old));
+
+        crate::point_refresh::point_refresh_for_test(&engine).unwrap();
+        assert!(old_of(record_context(&engine, "Новая")).contains(new));
+        assert!(old_of(record_context(&engine, "Считанная")).contains(new));
+        assert!(engine.workspace_overlay_dirty_paths().unwrap().is_empty());
+    }
+
+    /// github#234 + K1: the token branch's SUCCESS path. The store's copy already matches the disk
+    /// (a fused ingest caught up with the edit), so nothing is refused — the pass reindexes the
+    /// store's copy and clears the store's mark. The record that serves that key is a SEPARATE
+    /// carrier and must still be handed its own obligation, or it keeps serving the previous
+    /// graph's context with nothing left to rebuild it. This is the case the mismatch branch never
+    /// sees, and the reason the carrier decision is taken once, before either outcome.
+    #[test]
+    fn a_token_claim_hands_a_synchronized_key_to_its_record_too() {
+        struct OldGraph;
+        impl crate::ports::GraphContextProvider for OldGraph {
+            fn graph_context(&self, _rel: &str, symbol_name: &str, _kind: &str) -> Option<String> {
+                Some(format!("Dispatch: server | сервер\nSignature: {symbol_name}\n"))
+            }
+        }
+        struct NewGraph;
+        impl crate::ports::GraphContextProvider for NewGraph {
+            fn graph_context(&self, _rel: &str, symbol_name: &str, _kind: &str) -> Option<String> {
+                Some(format!("Dispatch: client | клиент\nSignature: {symbol_name}\n"))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        let tokenizer = br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"[UNK]":0},"unk_token":"[UNK]"}}"#;
+        let tokenizer_path = workspace.join("tokenizer.json");
+        fs::write(&tokenizer_path, tokenizer).unwrap();
+        let tokenizer_hash = {
+            use sha2::Digest;
+            sha2::Sha256::digest(tokenizer)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let token_policy = crate::TokenPolicy::load(&tokenizer_path, &tokenizer_hash, 32).unwrap();
+
+        let base = "Процедура Считанная()\nКонецПроцедуры";
+        let edited = "Процедура Считанная()\n    Возврат;\nКонецПроцедуры";
+        let file = workspace.join("Base.bsl");
+        fs::write(&file, base).unwrap();
+
+        let db_path = workspace.join("bsl-search.db");
+        let config = crate::SearchConfig {
+            embedder: crate::EmbedderConfig {
+                dim: Some(3),
+                base_url: "http://127.0.0.1:0".into(),
+                token_policy: Some(token_policy),
+                ..crate::EmbedderConfig::default()
+            },
+            ..crate::SearchConfig::default()
+        };
+        let mut engine = SearchEngine::new(&db_path, config).unwrap();
+        engine.set_workspace_root(workspace);
+        engine.index_directory_fts(workspace).unwrap();
+        engine.enable_workspace_watcher_mode();
+        engine.set_graph_context_provider(std::sync::Arc::new(OldGraph));
+        engine.initialize_workspace_overlay_clean().unwrap();
+
+        // A local edit the store does not know yet, so the point path builds the record that
+        // serves the key from here on.
+        fs::write(&file, edited).unwrap();
+        let key = FileKey::configuration("Base.bsl");
+        engine.mark_workspace_key_dirty(key.clone()).unwrap();
+        crate::point_refresh::point_refresh_for_test(&engine).unwrap();
+
+        let record_context = |engine: &SearchEngine| {
+            engine
+                .workspace_overlay_snapshot()
+                .unwrap()
+                .lexical_documents
+                .into_iter()
+                .find(|document| document.symbol_name == "Считанная")
+                .and_then(|document| document.graph_context)
+        };
+        let old = "Dispatch: server | сервер\n";
+        let new = "Dispatch: client | клиент\n";
+        let old_context = record_context(&engine).expect("the point path built the record");
+        assert!(old_context.contains(old), "{old_context}");
+
+        // The fused ingest catches up with the edit: the store's copy IS the disk's now, and the
+        // record — which hides that copy — is still the one that serves the key.
+        engine.index_directory_fts(workspace).unwrap();
+        let disk_hash = blake3::hash(edited.as_bytes()).as_bytes().to_vec();
+        assert_eq!(
+            engine.store().file_hash(&key.root_id, &key.path).unwrap().as_deref(),
+            Some(disk_hash.as_slice()),
+            "the premise: the store's copy and the disk agree, so the token branch will SUCCEED",
+        );
+        let hidden = record_context(&engine).expect("the record survives the ingest");
+        assert!(hidden.contains(old), "{hidden}");
+
+        // A publication swaps the provider; the graph change marks the key.
+        engine.replace_published_graph_context_provider(std::sync::Arc::new(NewGraph)).unwrap();
+        engine.store().mark_context_dirty("code", &key.root_id, &key.path).unwrap();
+
+        let stats = engine.refresh_dirty_contexts(&NewGraph, i64::MAX).unwrap();
+        assert_eq!(stats.paths_transferred, 1, "the record took its own obligation");
+        assert_eq!(stats.paths_cleared, 1, "and the store's mark is consumed as before");
+        assert!(engine.context_dirty_paths("code").unwrap().is_empty());
+        // The store's copy was reindexed in place, with the new graph's context…
+        let stored: Vec<_> = engine
+            .store()
+            .chunks_with_context_for_file("code", &key.root_id, &key.path)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.3)
+            .collect();
+        assert!(
+            stored.iter().any(|context| context.as_deref().is_some_and(|c| c.contains(new))),
+            "the token replacement rendered the store's copy: {stored:?}",
+        );
+        // …and the record, which this pass could not re-render, waits for its executor on the old
+        // context — the obligation the pre-fix code left with nobody.
+        let stale = record_context(&engine).expect("the record is still the carrier here");
+        assert!(stale.contains(old), "{stale}");
+        assert!(engine.workspace_overlay_dirty_paths().unwrap().contains(&key));
+
+        // The executor settles it. The store's copy has caught up with the disk, so the point path
+        // finds nothing left for the record to hide and lifts it (its own `BaselineEqual`): the key
+        // is served by the repaired store copy from here on, and NO carrier is left on the old
+        // graph. (Had the store still held the base version, the same mark would rebuild the record
+        // instead — the case `a_token_claim_hands_overlay_served_keys_to_their_records` asserts.)
+        crate::point_refresh::point_refresh_for_test(&engine).unwrap();
+        assert!(engine.workspace_overlay_dirty_paths().unwrap().is_empty());
+        assert!(
+            record_context(&engine).is_none(),
+            "a record with nothing left to hide is lifted, not left on the old context",
+        );
+        let served: Vec<_> = engine
+            .store()
+            .chunks_with_context_for_file("code", &key.root_id, &key.path)
+            .unwrap()
+            .into_iter()
+            .filter_map(|row| row.3)
+            .collect();
+        assert!(
+            served.iter().any(|context| context.contains(new)),
+            "the context the key is served with is the new graph's: {served:?}",
+        );
     }
 
     #[test]

@@ -654,6 +654,14 @@ impl WorkspaceOverlayCache {
         self.dirty_paths.insert(key, self.dirty_seq);
     }
 
+    /// Whether this key carries a live overlay RECORD — the entry a point refresh rebuilds.
+    /// The context refresh asks this before it clears a key's context mark: a key the store
+    /// holds no chunks for is carried by its record alone, and only the point path can rebuild
+    /// that record from the graph now current.
+    pub(crate) fn holds_entry(&self, key: &FileKey) -> bool {
+        self.entries.contains_key(key)
+    }
+
     /// Re-mark a path whose refresh failed (stat/read error), carrying its consecutive-failure
     /// count. Past [`MAX_DIRTY_REFRESH_FAILURES`] the path is dropped from the dirty set with a
     /// warning instead of retried forever; a later [`Self::mark_dirty_path`] resets it.

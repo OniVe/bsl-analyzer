@@ -290,7 +290,7 @@ fn wait_for_search_initialization(state: &crate::state::SharedState) {
     loop {
         let engine_ready =
             state.search_engine().lock().map(|engine| engine.is_some()).unwrap_or(false);
-        if !state.search_init_running() && engine_ready {
+        if !state.search_initializing() && engine_ready {
             return;
         }
         assert!(

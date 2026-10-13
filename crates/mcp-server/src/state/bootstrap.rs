@@ -3165,6 +3165,9 @@ mod tests {
             None,
             None,
             false,
+            // The engine is published, so the slot's verdict cannot change this read; the boot's
+            // init is not running in a unit test either.
+            crate::tools::search::EmptyIndex::Idle,
         )
         .unwrap();
         let body = status.structured_content.unwrap();
@@ -3279,6 +3282,8 @@ mod tests {
             None,
             None,
             false,
+            // As above: a published engine makes the slot's verdict unobservable here.
+            crate::tools::search::EmptyIndex::Idle,
         )
         .unwrap();
         assert_eq!(

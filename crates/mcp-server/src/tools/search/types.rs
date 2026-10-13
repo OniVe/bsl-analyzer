@@ -500,6 +500,14 @@ mod tests {
                 let runtime = known_failure
                     .map(SemanticRuntimeStatus::EmbeddingFailed)
                     .unwrap_or(SemanticRuntimeStatus::Ready);
+                // The slot's verdict follows the runtime the profile owns: a failed runtime with
+                // nothing left to publish is terminal, a healthy one leaves the slot idle. Both
+                // wordings go through the schema validator this test is about.
+                let initialization = if known_failure.is_some() {
+                    super::super::status::EmptyIndex::Failed
+                } else {
+                    super::super::status::EmptyIndex::Idle
+                };
                 let result = super::super::status::search_status_with_cap(
                     profile,
                     &crate::state::shared_engine(None),
@@ -510,6 +518,7 @@ mod tests {
                     None,
                     None,
                     false,
+                    initialization,
                     std::time::Duration::ZERO,
                 )
                 .unwrap();
