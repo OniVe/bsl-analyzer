@@ -179,10 +179,17 @@ Salsa сам проверяет отмену на входе в каждый з�
   `textDocument/references` (свип по source root) — он уже соблюдает правило,
   вызывая `unwind_if_revision_cancelled()` в `crates/ide/src/references.rs` и
   `crates/hir-def/src/name_usage_index.rs`.
-- Отмена размывается в `-32800` (`RequestCanceled`) через
-  `salsa::Cancelled::catch` в `run_latency_handler`; паника (не отмена) остаётся
-  `InternalError`. Тип отмены (`local` vs `pending-write`) и elapsed логируются
-  там же.
+- `run_latency_attempt` передаёт тип отмены в event loop отдельно от Response
+  и освобождает полный контекст до завершения task. Явный cancel и `Local`
+  дают `RequestCanceled`; подтверждённая write cancellation допускает максимум
+  два повтора для `hover`, `definition`, `typeDefinition`, `completion` через
+  `on_retryable_latency`. Каждая попытка проверяет исходный документ и получает
+  свежий контекст через прежнюю admission. Остальные handlers сохраняют
+  `on_latency` без retry; write cancellation для них даёт `ContentModified`.
+- `PropagatedPanic` допускает повтор только без настоящего panic по
+  `panic_watch` и при более новой опубликованной ревизии. Настоящий panic
+  остаётся `InternalError`. Не выводите исходный текст в tracing: для диагностики
+  lifecycle достаточно method/id/attempt/reason и перехода ревизии.
 
 ---
 

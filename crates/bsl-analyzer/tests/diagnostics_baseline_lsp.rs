@@ -137,8 +137,10 @@ fn legacy_extension_scope_warning_uses_lsp_channel_and_tracks_config_reload() {
         "jsonrpc": "2.0", "method": "textDocument/didSave",
         "params": {"textDocument": {"uri": lsp_types::Url::from_file_path(&config).unwrap()}}
     }));
-    // The save can cancel requests already running against the old snapshot. Retry
-    // only that defined JSON-RPC cancellation; any other error remains a test failure.
+    // The save can cancel requests already running against the old snapshot: a write
+    // cancellation the server could not replay internally reaches the client as
+    // ContentModified, an explicit cancellation as RequestCanceled. Retry only those;
+    // any other error remains a test failure.
     let mut response = Value::Null;
     for id in 4..=8 {
         lsp.send(json!({
@@ -149,8 +151,8 @@ fn legacy_extension_scope_warning_uses_lsp_channel_and_tracks_config_reload() {
         if response.get("result").is_some() {
             break;
         }
-        assert_eq!(
-            response["error"]["code"], -32800,
+        assert!(
+            matches!(response["error"]["code"].as_i64(), Some(-32800 | -32801)),
             "only a reload cancellation may be retried: {response}"
         );
     }

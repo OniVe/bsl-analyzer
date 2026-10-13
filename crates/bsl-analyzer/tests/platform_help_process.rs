@@ -219,9 +219,11 @@ fn lsp_serves_the_configured_corpus_until_restart() {
         "first request answers from the configured corpus: {first}"
     );
 
-    std::fs::write(dir.path().join("bsl-analyzer.toml"), external("b.json")).unwrap();
     let warning = common::Provocation::start(|| {
-        std::fs::write(dir.path().join("bsl-analyzer.toml"), external("b.json")).unwrap();
+        // An in-place write can expose an empty config and emit an unrelated restart warning.
+        let temporary_config = dir.path().join("bsl-analyzer.toml.next");
+        std::fs::write(&temporary_config, external("b.json")).unwrap();
+        std::fs::rename(temporary_config, dir.path().join("bsl-analyzer.toml")).unwrap();
     });
     let shown = loop {
         match lsp.wait_for_within(std::time::Duration::from_secs(2), |message| {

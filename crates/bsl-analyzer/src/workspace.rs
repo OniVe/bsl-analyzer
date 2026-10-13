@@ -68,6 +68,9 @@ impl GlobalState {
             Ok(project) => project,
             Err(e) => {
                 tracing::error!(error = %e, "invalid project; workspace root not set");
+                if self.project.is_none() {
+                    self.project_rejected = true;
+                }
                 return Err(e);
             }
         };
@@ -610,6 +613,29 @@ impl GlobalState {
 
         if removed.is_empty() {
             return false;
+        }
+
+        let open_documents_under_removed_paths: Vec<_> = self
+            .mem_docs
+            .uris()
+            .into_iter()
+            .filter(|uri| {
+                uri.to_file_path().ok().is_some_and(|path| {
+                    removed.iter().any(|dir| {
+                        let removed_path: &std::path::Path = dir.as_path().as_ref();
+                        path.starts_with(removed_path)
+                    })
+                })
+            })
+            .collect();
+        for uri in &open_documents_under_removed_paths {
+            self.mem_docs.invalidate_identity(uri);
+        }
+        if !open_documents_under_removed_paths.is_empty() {
+            tracing::debug!(
+                invalidated_open_documents = open_documents_under_removed_paths.len(),
+                "invalidated editor request origins under removed directory subtree"
+            );
         }
 
         let mut descendants: Vec<VfsPath> = Vec::new();

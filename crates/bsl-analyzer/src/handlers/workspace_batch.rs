@@ -31,9 +31,74 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
 use base_db::DiagnosticsConfigInput;
 use line_index::LineIndex;
 use salsa::Database as _;
+
+#[cfg(test)]
+static G1_BATCH_PAUSE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static G1_BATCH_ENTERED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static G1_BATCH_CANCEL_OBSERVED: AtomicU64 = AtomicU64::new(0);
+
+/// Hold the real dispatched batch worker immediately before its actual diagnostics
+/// computation, so a test can prove the interactive response arrives while work is live.
+#[cfg(test)]
+pub(crate) fn g1_batch_barrier(pause: bool) {
+    if pause {
+        G1_BATCH_ENTERED.store(false, Ordering::Release);
+        G1_BATCH_CANCEL_OBSERVED.store(0, Ordering::Release);
+    }
+    G1_BATCH_PAUSE.store(pause, Ordering::Release);
+}
+
+#[cfg(test)]
+pub(crate) fn g1_batch_entered() -> bool {
+    G1_BATCH_ENTERED.load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+pub(crate) fn g1_batch_is_paused() -> bool {
+    G1_BATCH_PAUSE.load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+pub(crate) fn g1_batch_cancel_observed() -> u64 {
+    G1_BATCH_CANCEL_OBSERVED.load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+fn g1_wait_at_batch_barrier(analysis: &ide::Analysis, cancellation_baseline: u64) {
+    if !G1_BATCH_PAUSE.load(Ordering::Acquire) {
+        return;
+    }
+    G1_BATCH_ENTERED.store(true, Ordering::Release);
+    tracing::info!(g1_marker = "workspace_batch_worker_entered");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    analysis.attached(|analysis| {
+        while G1_BATCH_PAUSE.load(Ordering::Acquire) {
+            let observed = analysis
+                .database()
+                .salsa_event_global()
+                .map_or(cancellation_baseline, |events| events.set_cancellation);
+            if observed > cancellation_baseline {
+                G1_BATCH_CANCEL_OBSERVED.store(observed, Ordering::Release);
+                // Keep the snapshot attached while polling so Salsa observes the live
+                // writer's cancellation flag and unwinds through its real checkpoint.
+                analysis.database().unwind_if_revision_cancelled();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "test did not release workspace batch barrier"
+            );
+            std::thread::yield_now();
+        }
+    });
+}
 
 use crate::frozen_context::FrozenFilePaths;
 use crate::global_state::{
@@ -255,6 +320,8 @@ fn dispatch_next_chunk(state: &mut GlobalState) {
     };
 
     let db = state.analysis_host.raw_database().clone();
+    #[cfg(test)]
+    let cancellation_baseline = db.salsa_event_global().map_or(0, |events| events.set_cancellation);
     state.workspace_batch_token = Some(db.cancellation_token());
     let analysis = ide::Analysis::from_database(db);
 
@@ -264,6 +331,8 @@ fn dispatch_next_chunk(state: &mut GlobalState) {
         let started_at = Instant::now();
         // Catch everything so the worker always reports back and never wedges the batch.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(test)]
+            g1_wait_at_batch_barrier(&analysis, cancellation_baseline);
             compute_chunk(
                 &analysis,
                 &chunk,
