@@ -3851,6 +3851,18 @@ impl CarrierSnapshot {
 
 /// The store key of a workspace `.bsl` file under `roots`, or `None` when it is not a `.bsl`
 /// or lies outside every registered root (see [`SearchEngine::workspace_file_key`]).
+///
+/// A thin projection over [`WorkspaceRoots::file_key`], which owns the role branch: this computes
+/// the two spellings and the target's role — the only two facts the branch needs, and both read
+/// off the path rather than the table — and hands them over.
+///
+/// The role branch has ONE home, and this adapter is it; attribution as a whole does not, and does
+/// not have to. [`WorkspaceRoots::root_of`] is called directly elsewhere, legitimately — on the
+/// output of the shared walk, which admits only files whose two spellings agree by role, and on
+/// canonical paths, which have no role at all. What no caller may do is rank a canonical target
+/// that does not take part in attribution: for a `.bsl`-spelled link onto a non-source target that
+/// is a key the walk FORBIDS to exist, and the publisher used to mint one by calling `root_of`
+/// directly (github#278).
 pub fn workspace_file_key_in(roots: &WorkspaceRoots, path: &Path) -> Option<FileKey> {
     if !bsl_conventions::has_extension(path, bsl_conventions::BSL_EXTENSION) {
         return None;
@@ -3868,11 +3880,7 @@ pub fn workspace_file_key_in(roots: &WorkspaceRoots, path: &Path) -> Option<File
             Ok(metadata) => metadata.is_file(),
             Err(_) => true,
         };
-    if target_is_source {
-        roots.root_of(&walked, &canonical)
-    } else {
-        roots.root_of_declared(&walked)
-    }
+    roots.file_key(&walked, &canonical, target_is_source)
 }
 
 impl SearchEngine {
@@ -11390,6 +11398,70 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].root_id, CONFIGURATION_ROOT_ID);
         assert_eq!(engine.configuration_root(), Some(new_configuration.as_path()));
+    }
+
+    /// github#277: a root declared through a link that is retargeted keeps its id, and the
+    /// generation is re-stated explicitly before the transition is planned.
+    ///
+    /// The canonical spelling in the table is a fact about ONE generation: a rebuild after the
+    /// link moved would mint the NEW target's id, because `root_id_for` draws the id from the
+    /// canonical spelling. Feeding that table to a transition would drop every row of the old id
+    /// and add a stranger in its place — the durability of a root id would not survive the root's
+    /// own move. The rebind keeps the id's key space, not its bytes: content under the id is
+    /// re-read.
+    #[cfg(unix)]
+    #[test]
+    fn a_retargeted_root_transitions_under_the_same_id_and_re_reads_its_content() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("ws");
+        let outside = tempdir().unwrap();
+        let configuration = workspace.join("cf");
+        write_transition_module(&configuration, "Конфигурация");
+        let first = outside.path().join("one");
+        let second = outside.path().join("two");
+        write_transition_module(&first, "СтараяЦель");
+        write_transition_module(&second, "НоваяЦель");
+        let link = workspace.join("ext");
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+
+        let mut engine = SearchEngine::fts_only(&dir.path().join("search.db")).unwrap();
+        let (old, _) =
+            crate::WorkspaceRoots::build(&workspace, &configuration, std::slice::from_ref(&link));
+        let old_ids: Vec<String> = old.ids().map(str::to_owned).collect();
+        let ext_id = old_ids
+            .iter()
+            .find(|id| id.as_str() != CONFIGURATION_ROOT_ID)
+            .expect("the linked root is registered")
+            .clone();
+        engine.initialize_workspace_roots(old).unwrap();
+        engine.index_directory_fts(&configuration).unwrap();
+        assert_eq!(engine.text_search("СтараяЦель", 10, Some("code")).unwrap().len(), 1);
+
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&second, &link).unwrap();
+        let (fresh, _) =
+            crate::WorkspaceRoots::build(&workspace, &configuration, std::slice::from_ref(&link));
+        assert!(
+            !fresh.contains_id(&ext_id),
+            "control: the rebuild alone mints the new target's id and orphans the old one",
+        );
+
+        // What the publish hook does before it compares and plans (state/embed.rs).
+        let next = engine.workspace_roots().unwrap().inheriting_root_ids(&fresh);
+        let plan = engine.workspace_roots_transition_seed(next).unwrap().plan().unwrap();
+        engine
+            .apply_validated_workspace_roots_transition(plan.revalidate().unwrap().unwrap())
+            .unwrap();
+
+        assert_eq!(
+            engine.workspace_roots().unwrap().ids().collect::<Vec<_>>(),
+            old_ids.iter().map(String::as_str).collect::<Vec<_>>(),
+            "the id did not change across the retarget",
+        );
+        assert!(engine.text_search("СтараяЦель", 10, Some("code")).unwrap().is_empty());
+        let hits = engine.text_search("НоваяЦель", 10, Some("code")).unwrap();
+        assert_eq!(hits.len(), 1, "the new target's module is indexed once");
+        assert_eq!(hits[0].root_id, ext_id, "and re-read under the SAME id");
     }
 
     #[test]

@@ -381,6 +381,21 @@ impl SharedState {
             let Some(engine) = guard.as_mut() else {
                 return (false, false, false);
             };
+            // The published table's canonical spellings were read off the disk when the graph
+            // loaded its project, but identity is the id, and a root declared through a link that
+            // has been retargeted would be minted a NEW id from its new target. The project's
+            // table is already stated under the ids this engine serves
+            // (`crate::project::workspace_roots`); it is re-stated here against the table being
+            // replaced all the same, because a graph may have loaded its project before the
+            // engine's last change. A retarget then arrives as the REBIND the transition machinery
+            // already handles and every row and external address keyed by the root survives its
+            // own move (github#277). The workspace itself resolving elsewhere is another
+            // registration rather than the next generation, and `inheriting_root_ids` keeps the
+            // fresh table then.
+            let roots = match engine.workspace_roots() {
+                Some(current) => current.inheriting_root_ids(&roots),
+                None => roots,
+            };
             // Every graph publish asks the hook to check roots. The overwhelmingly common
             // unchanged case must stay O(1), not re-walk and re-chunk the whole workspace.
             // It still installs the new artifact provider: otherwise a later watcher point
@@ -512,6 +527,11 @@ impl SharedState {
                     std::ops::ControlFlow::Continue(Ok(
                         outcome @ WorkspaceRootsTransitionOutcome::Applied { .. },
                     )) => {
+                        // Recorded under the engine lock that applied the table, so the record
+                        // never names a table the engine is not serving.
+                        if let Some(roots) = engine.workspace_roots() {
+                            crate::project::record_served_roots(roots);
+                        }
                         // Preserve the already-committed outcome even if the provider lock is
                         // poisoned: its pending embedding signals must still reach their owners.
                         if let Err(error) =
@@ -561,6 +581,26 @@ impl SharedState {
         }
     }
 
+    /// The context provider of a published generation, paired with the root table that generation
+    /// was PUBLISHED with.
+    ///
+    /// The invariant this pair carries: the provider is always paired with the PUBLICATION table and
+    /// never with the engine's table after a re-state. The two can differ by
+    /// [`bsl_search::WorkspaceRoots::inheriting_root_ids`] — a re-state keeps the OLD ids while
+    /// taking the fresh canonical spellings — and the provider answers a stored key by resolving it
+    /// through `resolve_walked`, which joins the CANONICAL spelling of the root holding that id and
+    /// finds no root at all for an id the table does not carry. Handed the engine's post-re-state
+    /// table, it would look the publication's fresh ids up in a table whose ids came from the
+    /// previous generation: every such key resolves to `None`, and the freshly published files
+    /// silently lose their graph context. The call site therefore hands over
+    /// `signal.workspace_roots` — the table the graph actually published — and the re-stated table
+    /// stays with the engine.
+    ///
+    /// The invariant is about CHOOSING between the two tables when both exist. One call site pairs
+    /// the provider with the engine's table instead, and only because there is no publication table
+    /// to pair with: a cached graph published without a root table at all
+    /// (`Self::refresh_dirty_contexts`). That is a stated exception, not the choice this invariant
+    /// forbids.
     fn published_graph_context_provider(
         store: &crate::graph::GraphStore,
         owed: Option<&crate::graph::OwedContextMarks>,
@@ -2264,6 +2304,237 @@ mod tests {
             .workspace_roots()
             .unwrap()
             .contains_id("ext/live"));
+    }
+
+    /// A workspace whose extension is declared through the link `ext`, which leads to `one` and
+    /// can be retargeted to `two`, served by a search engine that the PRODUCTION publish hook
+    /// moves from one root table to the next.
+    #[cfg(unix)]
+    struct RetargetedLink {
+        _dir: tempfile::TempDir,
+        _outside: tempfile::TempDir,
+        _graph: crate::graph::GraphState,
+        workspace: std::path::PathBuf,
+        targets: Vec<std::path::PathBuf>,
+        link: std::path::PathBuf,
+        engine: super::SharedSearchEngine,
+        store: crate::graph::GraphStore,
+    }
+
+    #[cfg(unix)]
+    impl RetargetedLink {
+        fn new() -> Self {
+            let dir = tempdir().unwrap();
+            let workspace = dir.path().to_path_buf();
+            let outside = tempdir().unwrap();
+            let targets: Vec<std::path::PathBuf> = ["one", "two"]
+                .iter()
+                .map(|name| {
+                    let target = outside.path().join(name);
+                    fs::create_dir_all(&target).unwrap();
+                    fs::write(target.join("Configuration.xml"), "<Configuration/>").unwrap();
+                    write_common_module(
+                        &target,
+                        "Расширение",
+                        "Процедура Расширение() Экспорт\nКонецПроцедуры",
+                    );
+                    target
+                })
+                .collect();
+            let configuration = workspace.join("cf");
+            fs::create_dir_all(&configuration).unwrap();
+            fs::write(configuration.join("Configuration.xml"), "<Configuration/>").unwrap();
+            write_common_module(
+                &configuration,
+                "Основа",
+                "Процедура Основа() Экспорт\nКонецПроцедуры",
+            );
+            let link = workspace.join("ext");
+            std::os::unix::fs::symlink(&targets[0], &link).unwrap();
+            fs::write(
+                workspace.join("bsl-analyzer.toml"),
+                "[source]\nroot = \"cf\"\nextensions = [{ name = \"live\", path = \"ext\" }]\n",
+            )
+            .unwrap();
+
+            let db_path = crate::cache::search_db_path(&workspace);
+            fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+            let mut engine = SearchEngine::fts_only(&db_path).unwrap();
+            let (boot_roots, _) =
+                bsl_search::WorkspaceRoots::build(&workspace, &configuration, &[]);
+            engine.initialize_workspace_roots(boot_roots).unwrap();
+            let engine: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
+
+            let graph = crate::graph::GraphState::for_workspace(workspace.clone());
+            graph.ensure_loading();
+            for _ in 0..400 {
+                if matches!(graph.status(), crate::graph::GraphStatus::Ready { .. }) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(matches!(graph.status(), crate::graph::GraphStatus::Ready { .. }));
+            let store = crate::graph::GraphStore::serving_file_for_test(
+                &crate::cache::graph_db_path(&workspace),
+                None,
+            )
+            .unwrap();
+            Self {
+                _dir: dir,
+                _outside: outside,
+                _graph: graph,
+                workspace,
+                targets,
+                link,
+                engine,
+                store,
+            }
+        }
+
+        /// Run the production publish hook over the table a graph publish would carry now.
+        fn publish(&self) -> bool {
+            let signal = crate::graph::GraphPublishSignal {
+                drift_pending: false,
+                mark_bound: 0,
+                topology_changed: false,
+                topology: built_graph_topology(&self.workspace),
+                revision: built_graph_token(&self.workspace).0,
+                fingerprint: built_graph_token(&self.workspace).1,
+                roots_refresh_requested: true,
+                workspace_roots: crate::project::at(&self.workspace)
+                    .ok()
+                    .map(|project| crate::project::workspace_roots(&project, &[]).0),
+            };
+            SharedState::refresh_search_roots_after_graph(
+                &self.engine,
+                &crate::state::OwnerStop::default(),
+                &self.store,
+                None,
+                &AtomicU64::new(0),
+                &crate::workspace_lease::WorkspaceLease::unmanaged(),
+                &signal,
+            )
+            .0
+        }
+
+        fn retarget(&self) {
+            fs::remove_file(&self.link).unwrap();
+            std::os::unix::fs::symlink(&self.targets[1], &self.link).unwrap();
+        }
+
+        fn engine_roots(&self) -> bsl_search::WorkspaceRoots {
+            self.engine.lock().unwrap().as_ref().unwrap().workspace_roots().unwrap().clone()
+        }
+
+        fn extension_id(roots: &bsl_search::WorkspaceRoots) -> String {
+            roots
+                .ids()
+                .find(|id| *id != bsl_search::CONFIGURATION_ROOT_ID)
+                .expect("the linked extension is registered")
+                .to_owned()
+        }
+    }
+
+    /// github#277 through the production path: a root declared through a link that is RETARGETED
+    /// keeps its id when the publish hook installs the next table. The table a publish carries is
+    /// a fresh BUILD, canonicalised off the disk just now, so the id `root_id_for` mints from the
+    /// NEW target is a different one — installing it as it stands would orphan every row and
+    /// external address keyed by the old id. Re-stating the generation under the ids of the table
+    /// being replaced is what turns the retarget into a rebind.
+    #[cfg(unix)]
+    #[test]
+    fn publish_hook_keeps_a_retargeted_roots_id() {
+        let fixture = RetargetedLink::new();
+        assert!(fixture.publish(), "the linked extension root must be installed");
+        let before = fixture.engine_roots();
+        let ext_id = RetargetedLink::extension_id(&before);
+        assert_eq!(
+            ext_id,
+            std::fs::canonicalize(&fixture.targets[0]).unwrap().to_string_lossy(),
+            "control: the id is drawn from the target the link resolved to",
+        );
+
+        fixture.retarget();
+        assert!(fixture.publish(), "the retargeted root must transition");
+
+        let roots = fixture.engine_roots();
+        assert_eq!(
+            roots.ids().collect::<Vec<_>>(),
+            before.ids().collect::<Vec<_>>(),
+            "the id survives the retarget through the production hook",
+        );
+        assert_eq!(
+            roots
+                .entries_with_canonical()
+                .find(|(id, ..)| *id == ext_id)
+                .map(|(_, _, canonical)| canonical.to_path_buf()),
+            Some(std::fs::canonicalize(&fixture.targets[1]).unwrap()),
+            "and attribution follows the FRESH target",
+        );
+    }
+
+    /// The id search keeps across a retarget is the id every other reader of the workspace's roots
+    /// answers to: a caller copies `root_id` out of a search hit into any other tool. The project's
+    /// root table — the one `query.validate`, `outline` and an engine boot read — and the graph's
+    /// table must therefore carry the search engine's ids, not the ids a fresh build would mint for
+    /// the new target; otherwise search hands out an id the next tool calls unknown.
+    #[cfg(unix)]
+    #[test]
+    fn every_root_table_reader_answers_to_the_id_search_kept_across_a_retarget() {
+        let fixture = RetargetedLink::new();
+        assert!(fixture.publish(), "the linked extension root must be installed");
+        let kept = RetargetedLink::extension_id(&fixture.engine_roots());
+        fixture.retarget();
+        let (natural, _) = bsl_search::WorkspaceRoots::build(
+            &fixture.workspace,
+            &fixture.workspace.join("cf"),
+            std::slice::from_ref(&fixture.link),
+        );
+        let natural = RetargetedLink::extension_id(&natural);
+        assert_ne!(natural, kept, "control: a fresh build alone mints the new target's id");
+        assert!(fixture.publish(), "the retargeted root must transition");
+        let search = fixture.engine_roots();
+        assert_eq!(RetargetedLink::extension_id(&search), kept);
+
+        let project = crate::project::at(&fixture.workspace).unwrap();
+        let (project_roots, _) = crate::project::workspace_roots(&project, &[]);
+        assert_eq!(
+            project_roots.ids().collect::<Vec<_>>(),
+            search.ids().collect::<Vec<_>>(),
+            "the project's root table carries the ids search serves",
+        );
+        assert!(
+            project_roots.registration_is_current(&kept),
+            "and resolves them to the new target"
+        );
+
+        let graph_roots = crate::graph::ProjectSnapshot::load_excluding(&fixture.workspace, &[])
+            .search_roots
+            .expect("a valid project has a root table");
+        assert_eq!(
+            graph_roots.ids().collect::<Vec<_>>(),
+            search.ids().collect::<Vec<_>>(),
+            "the graph's root table carries the ids search serves",
+        );
+
+        let mut state = SharedState::shared();
+        state.set_workspace_root(fixture.workspace.clone());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let validate = |root_id: &str| {
+            runtime.block_on(crate::tools::query::validate_query(
+                &state,
+                "ВЫБРАТЬ 1",
+                Some(root_id),
+                None,
+                tokio_util::sync::CancellationToken::new(),
+                6000,
+            ))
+        };
+        assert!(validate(&kept).is_ok(), "query.validate accepts the id search handed out");
+        assert!(
+            validate(&natural).is_err(),
+            "and refuses the id search never served, like any unknown id",
+        );
     }
 
     /// The root transition reads the graph the daemon actually published. With the cache

@@ -297,6 +297,10 @@ fn build_anchor(
 /// be an honest-looking zero. The attributor that mints every published pair is
 /// asked instead, and the prefix is then compared inside the key — the same
 /// address the histogram publishes.
+///
+/// The id must also still mean what the resident's own table minted it to mean: an id survives a
+/// root's retarget, so a caller addressing a root the resident registered against another directory
+/// is refused, not answered ([`WorkspaceRoots::registration_is_current`]).
 fn select(
     resident: &DiagnosticsResident,
     db: &ide::RootDatabaseImpl,
@@ -310,6 +314,24 @@ fn select(
                 format!(
                     "no source root is registered under '{root_id}'; `search` reports the \
                      roots this workspace knows"
+                ),
+                None,
+            ));
+        }
+        // The resident's table is the one it was BUILT with, and an id survives a root's retarget
+        // (`WorkspaceRoots::inheriting_root_ids`): the same `(root_id, path)` then names one file to
+        // the resident and another to the workspace, and the selection below would be answered from
+        // the directory the id no longer leads to. Refused rather than answered: the correlation
+        // between the caller's address and the resident's corpus came apart.
+        //
+        // The refusal names the FACT and not a cause: the declared spelling failing to resolve is
+        // what was observed, and a retarget is only one of the ways it happens (a target that is
+        // merely unreachable — unmounted, not yet permitted — fails the same check).
+        if !roots.registration_is_current(root_id) {
+            return Err(McpError::invalid_params(
+                format!(
+                    "source root '{root_id}' can no longer be resolved to the directory it was \
+                     registered with; the resident's view may be stale — reload the workspace"
                 ),
                 None,
             ));
@@ -1511,6 +1533,96 @@ mod tests {
             }
             _ => panic!("expected Ready outcome"),
         }
+    }
+
+    /// A `root_id` a reader can find is not yet a `root_id` it may answer through (M6/M12).
+    ///
+    /// The resident's table is the one it was BUILT with, and an id survives its root's retarget: a
+    /// link declared as an extension can lead elsewhere while the id — and the rows keyed by it —
+    /// stays. A selection naming that id then addressed one file to the caller and another to the
+    /// resident, so it is refused before the walk, with the fact that was observed named (the
+    /// spelling no longer resolving to the registered directory — a retarget is one of its causes,
+    /// an unreachable target another).
+    ///
+    /// The stand is the production one — a real workspace whose extension is declared through a
+    /// link, a real `DiagnosticsState` over it — because the site reads the table the resident
+    /// holds, not one a test hands it. The retarget happens INSIDE the session read lock: a reload
+    /// needs the other side of that lock, so the resident cannot quietly re-register the root
+    /// between the two selections.
+    #[cfg(unix)]
+    #[test]
+    fn a_retargeted_root_id_is_refused_by_the_selection() {
+        use crate::diagnostics_state::{test_support, DiagnosticsState, ResidentOutcome};
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("ws");
+        let targets = dir.path().join("targets");
+        for (target, symbol) in [("one", "ПерваяЦель"), ("two", "ВтораяЦель")] {
+            let root = targets.join(target);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                root.join("Configuration.xml"),
+                format!("<Configuration><Name>{target}</Name></Configuration>"),
+            )
+            .unwrap();
+            test_support::write_common_module(
+                &root,
+                "Общий",
+                true,
+                &format!("&НаСервере\nФункция {symbol}() Экспорт Возврат 1; КонецФункции\n"),
+            );
+        }
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("Configuration.xml"), "<Configuration/>").unwrap();
+        test_support::write_common_module(
+            &workspace,
+            "Конфигурация",
+            true,
+            "&НаСервере\nФункция Конфигурации() Экспорт Возврат 1; КонецФункции\n",
+        );
+        let link = workspace.join("ext");
+        std::os::unix::fs::symlink(targets.join("one"), &link).unwrap();
+        test_support::write(
+            &workspace,
+            "bsl-analyzer.toml",
+            "[source]\nroot = \".\"\nextensions = [\"ext\"]\n",
+        );
+
+        let state = DiagnosticsState::for_workspace(workspace.clone());
+        state.ensure_loading();
+        test_support::wait_ready(&state);
+
+        let outcome = state.read(|resident, _| {
+            let db = resident.db().clone();
+            let ext_id =
+                resident.workspace_roots().ids().find(|id| !id.is_empty()).map(str::to_owned)?;
+            let before = select(resident, &db, Some(ext_id.as_str()), None)
+                .map(|selection| selection.root_id)
+                .map_err(|error| error.message.to_string());
+            // The link leads elsewhere now, and the table this resident holds was minted against
+            // the old target.
+            std::fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink(targets.join("two"), &link).unwrap();
+            let after = select(resident, &db, Some(ext_id.as_str()), None)
+                .map(|selection| selection.root_id)
+                .map_err(|error| error.message.to_string());
+            Some((ext_id, before, after))
+        });
+        let (ext_id, before, after) = match outcome {
+            ResidentOutcome::Ready(pair, _) => pair.expect("the linked extension is registered"),
+            _ => panic!("expected Ready outcome"),
+        };
+
+        assert_eq!(
+            before,
+            Ok(Some(ext_id.clone())),
+            "control: the selection is answered while the registration is current",
+        );
+        let refusal = after.expect_err("a stale root must not be answered through");
+        assert!(
+            refusal.contains("can no longer be resolved") && refusal.contains(ext_id.as_str()),
+            "the refusal must name the root and what was observed: {refusal}",
+        );
     }
 
     /// The section of the tools document that describes this tool.

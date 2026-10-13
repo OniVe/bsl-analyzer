@@ -1956,6 +1956,9 @@ impl SharedState {
         hash_mode: BaselineHashMode,
     ) -> Result<(), bsl_search::SearchError> {
         engine.initialize_workspace_roots(workspace_roots)?;
+        if let Some(roots) = engine.workspace_roots() {
+            crate::project::record_served_roots(roots);
+        }
         engine.set_workspace_baseline_hash_mode(hash_mode);
         Ok(())
     }

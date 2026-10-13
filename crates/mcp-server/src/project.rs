@@ -15,12 +15,17 @@
 //! `project-model` gains no global, and `Project::new` keeps meaning what it
 //! says everywhere else.
 
-use std::path::Path;
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, OnceLock, PoisonError, RwLock};
 
 use project_model::{Project, ProjectConfig, ProjectError, SourceSetOverride};
 
 static OVERRIDE: OnceLock<SourceSetOverride> = OnceLock::new();
+
+/// The root table each workspace's search engine serves, by the workspace's canonical spelling.
+static SERVED_ROOTS: LazyLock<RwLock<HashMap<PathBuf, bsl_search::WorkspaceRoots>>> =
+    LazyLock::new(RwLock::default);
 
 /// Installs the source set this process was launched with.
 ///
@@ -56,6 +61,13 @@ pub fn at(root: &Path) -> Result<Project, ProjectError> {
 /// exactly. Agreement that follows from calling one constructor cannot drift; agreement between
 /// two constructors is a claim someone has to keep true.
 ///
+/// The ids are the ones the workspace's search engine serves ([`record_served_roots`]): a root
+/// declared through a link keeps its id when the link is retargeted
+/// ([`bsl_search::WorkspaceRoots::inheriting_root_ids`]), while a fresh build would mint one from
+/// the new target. Search hands its ids out in every hit, and a caller passes them on to any other
+/// tool, so a table that took the fresh ids would call the id search just returned unknown. Before
+/// the engine serves anything there is nothing to inherit from, and the fresh build is the table.
+///
 /// Rejected roots come back rather than being logged here. Whether a dropped root is worth a
 /// line depends on how often the caller runs: the boot builds this once, while the resident
 /// rebuilds on every config drift, and a warning repeated per rebuild buries the one that is
@@ -88,10 +100,26 @@ pub fn workspace_roots(
         project.semantic_base_path(),
         &extensions,
     );
-    (
-        roots.with_excluded(excluded.to_vec()).with_user_excluded(project.source_exclusions()),
-        rejected,
-    )
+    let fresh =
+        roots.with_excluded(excluded.to_vec()).with_user_excluded(project.source_exclusions());
+    let served = SERVED_ROOTS.read().unwrap_or_else(PoisonError::into_inner);
+    let roots = match served.get(fresh.workspace_canonical()) {
+        Some(served) => served.inheriting_root_ids(&fresh),
+        None => fresh,
+    };
+    (roots, rejected)
+}
+
+/// Records the root table the workspace's search engine serves from now on, so that every later
+/// [`workspace_roots`] of that workspace is stated under its ids.
+///
+/// Called wherever the engine's table changes — its boot and every applied root transition —
+/// and nowhere else: the recorded table is a statement about the engine, not a cache of builds.
+pub fn record_served_roots(roots: &bsl_search::WorkspaceRoots) {
+    SERVED_ROOTS
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(roots.workspace_canonical().to_path_buf(), roots.clone());
 }
 
 /// Name every root that did not make it into the table, with its reason: a silently dropped
