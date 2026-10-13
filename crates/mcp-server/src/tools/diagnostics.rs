@@ -2602,6 +2602,64 @@ mod tests {
         }
 
         #[test]
+        fn mcp_file_diagnostics_loads_a_legacy_extension_baseline_identity() {
+            use ide::diagnostics_baseline::{
+                diagnostics_baseline_json, DiagnosticsBaseline, DiagnosticsBaselineExtension,
+                DiagnosticsBaselineScope, DIAGNOSTICS_BASELINE_SCHEMA_VERSION,
+            };
+
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            write(root, "src/cf/Configuration.xml", "<Configuration/>");
+            write(
+                root,
+                "ext/Configuration.xml",
+                "<Properties><ConfigurationExtensionPurpose>Customization</ConfigurationExtensionPurpose></Properties>",
+            );
+            write_common_module(
+                &root.join("ext"),
+                "Feature",
+                "&НаСервере\nФункция Считать() Экспорт Возврат 1; КонецФункции\n",
+            );
+            write(
+                root,
+                "bsl-analyzer.toml",
+                "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"Feature\", path = \"ext\" }]\n\n[diagnostics.baseline]\npath = \"baseline.json\"\n",
+            );
+            let baseline = DiagnosticsBaseline {
+                schema_version: DIAGNOSTICS_BASELINE_SCHEMA_VERSION,
+                scope: DiagnosticsBaselineScope {
+                    source_root: Some("src/cf".to_owned()),
+                    extensions: vec![DiagnosticsBaselineExtension {
+                        name: "Feature".to_owned(),
+                        path: "ext".to_owned(),
+                        scope: None,
+                        legacy_scope: Some(true),
+                        dependency_scopes: Vec::new(),
+                        depends_on: Vec::new(),
+                    }],
+                },
+                diagnostics: Vec::new(),
+            };
+            fs::write(root.join("baseline.json"), diagnostics_baseline_json(&baseline).unwrap())
+                .unwrap();
+
+            let state = ready_state(root);
+            let response = run(
+                &state,
+                &root.join("ext/CommonModules/Feature/Ext/Module.bsl"),
+                &default_filters(),
+            );
+            assert_eq!(
+                response["baseline"]["state"], "partial",
+                "the file action accepts the matching legacy baseline but only reports partial coverage: {response}"
+            );
+            assert_eq!(response["baseline"]["complete"], false);
+            assert_eq!(response["baseline"]["known"], 0);
+            state.shutdown();
+        }
+
+        #[test]
         fn diagnostics_baseline_file_in_active_diff_scope_resolves_nothing() {
             use ide::diagnostics_baseline::{
                 diagnostic_fingerprint, diagnostics_baseline_json, DiagnosticsBaseline,

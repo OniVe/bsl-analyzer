@@ -356,7 +356,7 @@ mod tests {
             root.join("bsl-analyzer.toml"),
             r#"[source]
 root = "src/cf"
-extensions = [{ name = "Ext", path = "src/cfe/Ext" }]
+extensions = [{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }]
 [diagnostics.baseline]
 directory = "baselines"
 "#,

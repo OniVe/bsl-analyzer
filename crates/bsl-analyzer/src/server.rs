@@ -118,6 +118,8 @@ pub fn main_loop(connection: Connection) -> Result<()> {
         && client_supports_pull_diagnostics(&initialize_params.capabilities);
     state.supports_workspace_diagnostic_refresh =
         client_supports_workspace_diagnostic_refresh(&raw_capabilities);
+    state.supports_semantic_tokens_refresh =
+        client_supports_semantic_tokens_refresh(&initialize_params.capabilities);
 
     state.init_empty_source_root();
 
@@ -214,6 +216,16 @@ fn client_folding_range_limit(caps: &lsp_types::ClientCapabilities) -> Option<u3
 /// suppresses push to avoid double-reporting open buffers.
 fn client_supports_pull_diagnostics(caps: &lsp_types::ClientCapabilities) -> bool {
     caps.text_document.as_ref().and_then(|td| td.diagnostic.as_ref()).is_some()
+}
+
+/// Whether the client advertised `workspace.semanticTokens.refreshSupport`, the only grant the
+/// spec gives the server to send `workspace/semanticTokens/refresh`.
+fn client_supports_semantic_tokens_refresh(caps: &lsp_types::ClientCapabilities) -> bool {
+    caps.workspace
+        .as_ref()
+        .and_then(|w| w.semantic_tokens.as_ref())
+        .and_then(|st| st.refresh_support)
+        .unwrap_or(false)
 }
 
 /// Whether the client advertised `workspace.diagnostics.refreshSupport`, so the server may ask it
@@ -485,9 +497,12 @@ fn handle_lsp_msg(state: &mut GlobalState, msg: Message) -> Result<()> {
         Message::Notification(not) => {
             handle_notification(state, not)?;
         }
-        Message::Response(resp) => {
-            tracing::warn!("Unexpected response: {:?}", resp);
-        }
+        // The server's own requests (refreshes, progress creation) are fire-and-forget: a client
+        // that answers them is following the protocol, and only a refusal is worth a warning.
+        Message::Response(resp) => match &resp.error {
+            Some(error) => tracing::warn!(id = ?resp.id, ?error, "client refused a server request"),
+            None => tracing::debug!(id = ?resp.id, "client answered a server request"),
+        },
     }
     Ok(())
 }
@@ -690,6 +705,8 @@ fn handle_loader_msg(state: &mut GlobalState, msg: vfs::loader::Message) -> Resu
                     for uri in uris {
                         crate::handlers::notification::schedule_diagnostics(state, &uri);
                     }
+                    // The cancellation above dropped in-flight semantic-tokens requests.
+                    state.request_semantic_tokens_refresh();
                 }
                 if baseline_changed {
                     state.mark_workspace_batch_dirty();
@@ -716,6 +733,7 @@ fn handle_loader_msg(state: &mut GlobalState, msg: vfs::loader::Message) -> Resu
                     for uri in state.opened_document_uris() {
                         crate::handlers::notification::schedule_diagnostics(state, &uri);
                     }
+                    state.request_semantic_tokens_refresh();
                 }
                 tracing::info!(removed_paths = n, "processed removed directory subtree");
             }
@@ -1044,6 +1062,9 @@ enum RetryRefusal {
     PolicyDisabled,
     RequestUnavailable,
     AttemptLimit,
+    /// No open document was captured when the request arrived, so there is nothing
+    /// that proves the original position still means the same thing.
+    UntrackedOrigin,
     InvalidOrigin,
     NoNewRevision,
 }
@@ -1057,6 +1078,7 @@ impl RetryRefusal {
             Self::PolicyDisabled => "policy-disabled",
             Self::RequestUnavailable => "request-unavailable",
             Self::AttemptLimit => "attempt-limit-exhausted",
+            Self::UntrackedOrigin => "untracked-origin",
             Self::InvalidOrigin => "invalid-origin",
             Self::NoNewRevision => "no-new-revision",
         }
@@ -1065,6 +1087,7 @@ impl RetryRefusal {
     fn message(self) -> &'static str {
         match self {
             Self::AttemptLimit => "content modified: retry limit exhausted",
+            Self::UntrackedOrigin => "content modified: document is not open in the project",
             Self::InvalidOrigin => "content modified: document origin changed",
             Self::PolicyDisabled => "content modified: automatic retry is not permitted",
             Self::NoNewRevision => "content modified: no newer workspace revision",
@@ -1095,7 +1118,7 @@ fn queue_latency_retry(
         return RetryQueueResult::Refused(RetryRefusal::MissingOwner);
     };
     let origin_matches =
-        lifecycle.origin.as_ref().is_some_and(|origin| request_origin_matches(state, origin));
+        lifecycle.origin.as_ref().map(|origin| request_origin_matches(state, origin));
     let refusal = if lifecycle.generation != key.generation
         || lifecycle.attempt != key.attempt
         || lifecycle.phase != RequestLifecyclePhase::Running
@@ -1109,7 +1132,9 @@ fn queue_latency_retry(
         Some(RetryRefusal::RequestUnavailable)
     } else if lifecycle.attempt >= MAX_LATENCY_ATTEMPTS {
         Some(RetryRefusal::AttemptLimit)
-    } else if !origin_matches {
+    } else if origin_matches.is_none() {
+        Some(RetryRefusal::UntrackedOrigin)
+    } else if origin_matches == Some(false) {
         Some(RetryRefusal::InvalidOrigin)
     } else if requires_new_revision && current_revision <= old_revision {
         Some(RetryRefusal::NoNewRevision)
@@ -1611,6 +1636,10 @@ fn handle_vfs_msg(
         if outcome.diagnostics_baseline_changed {
             state.request_workspace_diagnostic_refresh();
         }
+        // Semantic-tokens requests issued during the reindex were declined or
+        // cancelled; ask the client to pull them again, as the initial-load
+        // finalize does.
+        state.request_semantic_tokens_refresh();
     }
 
     Ok(())
@@ -1663,13 +1692,13 @@ fn handle_request(state: &mut GlobalState, req: Request) -> Result<()> {
         .on_latency::<CallHierarchyOutgoingCalls>(crate::handlers::handle_call_hierarchy_outgoing)
         .on_latency::<InlayHintRequest>(crate::handlers::handle_inlay_hint)
         .on_latency::<WorkspaceSymbolRequest>(crate::handlers::handle_workspace_symbol)
-        .on_latency::<SelectionRangeRequest>(crate::handlers::handle_selection_range)
+        .on_syntax_latency::<SelectionRangeRequest>(crate::handlers::handle_selection_range)
         .on_latency::<DocumentHighlightRequest>(crate::handlers::handle_document_highlight)
-        .on_latency::<FoldingRangeRequest>(crate::handlers::handle_folding_range)
+        .on_syntax_latency::<FoldingRangeRequest>(crate::handlers::handle_folding_range)
         .on_retryable_latency::<HoverRequest>(crate::handlers::handle_hover)
         .on_retryable_latency::<Completion>(crate::handlers::handle_completion)
         .on_latency::<SemanticTokensFullRequest>(crate::handlers::handle_semantic_tokens_full)
-        .on_latency::<DocumentSymbolRequest>(crate::handlers::handle_document_symbol)
+        .on_syntax_latency::<DocumentSymbolRequest>(crate::handlers::handle_document_symbol)
         .on_latency::<CodeActionRequest>(crate::handlers::handle_code_action)
         .on_latency::<DocumentDiagnosticRequest>(crate::handlers::handle_document_diagnostic)
         .on_latency::<WorkspaceDiagnosticRequest>(crate::handlers::handle_workspace_diagnostic)
@@ -3014,6 +3043,11 @@ mod tests {
                 response.error.as_ref().map(|error| error.code),
                 Some(lsp_server::ErrorCode::ContentModified as i32)
             );
+            assert_eq!(
+                response.error.as_ref().map(|error| error.message.as_str()),
+                Some(crate::handlers::dispatch::PROJECT_REJECTED_MESSAGE),
+                "a rejected project is terminal, not a load still in progress"
+            );
             assert!(state.request_tokens.is_empty());
             assert!(state.task_pool.receiver.try_recv().is_err());
             drop(error);
@@ -4169,6 +4203,41 @@ mod tests {
         );
         assert!(state.pending_latency_retries.is_empty());
         assert!(matches!(receiver.try_recv(), Ok(Message::Response(_))));
+
+        let unopened_id = lsp_server::RequestId::from(603);
+        state.request_lifecycles.insert(
+            unopened_id.clone(),
+            crate::global_state::RequestLifecycle {
+                generation: 21,
+                method: lsp_types::request::GotoDefinition::METHOD.to_owned(),
+                request: Some(g1_definition_request(603, uri.clone())),
+                attempt: 1,
+                phase: RequestLifecyclePhase::Running,
+                retry_origin_revision: None,
+                retry_eligible: true,
+                origin: None,
+                client_cancelled: false,
+            },
+        );
+        let unopened_key = crate::global_state::RequestAttemptKey {
+            id: unopened_id.clone(),
+            generation: 21,
+            attempt: 1,
+        };
+        assert_eq!(
+            queue_latency_retry(
+                &mut state,
+                &unopened_key,
+                lsp_types::request::GotoDefinition::METHOD,
+                "test-untracked-origin",
+                revision,
+                revision,
+                false,
+            ),
+            RetryQueueResult::Refused(RetryRefusal::UntrackedOrigin),
+            "a request with no captured document is not reported as a changed origin"
+        );
+        state.request_lifecycles.remove(&unopened_id);
     }
 
     #[test]
@@ -4403,7 +4472,7 @@ mod tests {
             .expect("production dispatcher admits workspace diagnostic request");
 
             let (done, emitted_items) = entered
-                .recv_timeout(std::time::Duration::from_secs(10))
+                .recv_timeout(std::time::Duration::from_secs(60))
                 .expect("real handler sends its first partial then reaches test gate");
             assert_eq!(done, 64);
             assert!(emitted_items > 0, "partial contains real diagnostics");
@@ -4994,6 +5063,125 @@ mod tests {
         );
         assert_eq!(state.diagnostics_generation.get(&uri).copied(), Some(1));
         assert!(state.diagnostics_tokens.contains_key(&uri));
+    }
+
+    /// An editor asks for the outline, folds and selection ranges the moment a file opens —
+    /// on a large configuration, long before the initial load finishes. Those requests read
+    /// only the file's own parse, so they are answered right away; requests that need the
+    /// rest of the workspace are still declined until the load completes.
+    #[test]
+    fn syntax_requests_are_answered_while_the_workspace_loads() {
+        use lsp_types::request::{
+            DocumentSymbolRequest, FoldingRangeRequest, HoverRequest, Request as _,
+            SelectionRangeRequest,
+        };
+
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let mut state = crate::global_state::GlobalState::new(sender);
+        state.init_empty_source_root();
+        state.analysis_host.raw_database_mut().set_workspace_load_complete(false);
+        assert!(!state.vfs_done);
+
+        let text = [
+            "#Область Интерфейс",
+            "",
+            "Процедура Тест() Экспорт",
+            "\tА = 1;",
+            "КонецПроцедуры",
+            "",
+            "#КонецОбласти",
+            "",
+            "Функция Ф()",
+            "\tВозврат 1;",
+            "КонецФункции",
+        ]
+        .join("\n");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("mod.bsl");
+        std::fs::write(&path, &text).expect("write");
+        let uri = lsp_types::Url::from_file_path(&path).unwrap();
+        crate::handlers::notification::handle_did_open(
+            &mut state,
+            lsp_types::DidOpenTextDocumentParams {
+                text_document: lsp_types::TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "bsl".to_string(),
+                    version: 1,
+                    text,
+                },
+            },
+        )
+        .unwrap();
+        while receiver.try_recv().is_ok() {}
+
+        let doc = || serde_json::json!({ "textDocument": { "uri": uri } });
+        let requests = [
+            (1, DocumentSymbolRequest::METHOD, doc()),
+            (2, FoldingRangeRequest::METHOD, doc()),
+            (
+                3,
+                SelectionRangeRequest::METHOD,
+                serde_json::json!({
+                    "textDocument": { "uri": uri },
+                    "positions": [{ "line": 3, "character": 1 }],
+                }),
+            ),
+            (
+                4,
+                HoverRequest::METHOD,
+                serde_json::json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": 2, "character": 11 },
+                }),
+            ),
+        ];
+        for (id, method, params) in requests {
+            handle_request(&mut state, Request::new(id.into(), method.to_string(), params))
+                .unwrap();
+        }
+
+        // Every answer is already on the client channel: nothing was handed to the pool,
+        // where the next streamed VFS batch would have cancelled it.
+        assert!(state.task_pool.receiver.try_recv().is_err(), "no pool job while loading");
+        assert!(state.request_tokens.is_empty(), "no in-flight request left behind");
+        let mut responses = std::collections::HashMap::new();
+        while let Ok(message) = receiver.try_recv() {
+            if let Message::Response(response) = message {
+                responses.insert(response.id.clone(), response);
+            }
+        }
+        let answer = |id: i32| {
+            let response = &responses[&lsp_server::RequestId::from(id)];
+            assert!(response.error.is_none(), "request {id} declined: {:?}", response.error);
+            response.result.clone().expect("a result")
+        };
+
+        let symbols: lsp_types::DocumentSymbolResponse = serde_json::from_value(answer(1)).unwrap();
+        let lsp_types::DocumentSymbolResponse::Nested(symbols) = symbols else {
+            panic!("expected a hierarchical outline, got {symbols:?}");
+        };
+        let outline: Vec<(String, Vec<String>)> = symbols
+            .iter()
+            .map(|s| {
+                let children = s.children.iter().flatten().map(|c| c.name.clone()).collect();
+                (s.name.clone(), children)
+            })
+            .collect();
+        assert_eq!(
+            outline,
+            vec![("Интерфейс".to_string(), vec!["Тест".to_string()]), ("Ф".to_string(), vec![]),]
+        );
+        let folds: Vec<lsp_types::FoldingRange> = serde_json::from_value(answer(2)).unwrap();
+        assert!(folds.iter().any(|f| f.start_line == 0 && f.end_line == 6), "{folds:?}");
+        let selections: Vec<lsp_types::SelectionRange> = serde_json::from_value(answer(3)).unwrap();
+        assert_eq!(selections.len(), 1);
+
+        let hover = &responses[&lsp_server::RequestId::from(4)];
+        assert_eq!(
+            hover.error.as_ref().map(|e| e.code),
+            Some(lsp_server::ErrorCode::ContentModified as i32),
+            "a request that needs the workspace must still wait for the load"
+        );
     }
 
     #[test]

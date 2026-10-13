@@ -312,7 +312,8 @@ impl WorkspaceCacheLayout {
         if family.starts_with(&workspace) && self.origin == CacheOrigin::Default {
             return Err(invalid(format!(
                 "default workspace cache {} is inside workspace {}; set --cache-dir or BSL_CACHE_DIR",
-                family.display(), workspace.display()
+                family.display(),
+                workspace.display()
             )));
         }
         if workspace.starts_with(&family) {
@@ -328,7 +329,8 @@ impl WorkspaceCacheLayout {
             if family.starts_with(&root) && self.origin == CacheOrigin::Default {
                 return Err(invalid(format!(
                     "default workspace cache {} is inside source root {}; set --cache-dir or BSL_CACHE_DIR",
-                    family.display(), root.display()
+                    family.display(),
+                    root.display()
                 )));
             }
             if root.starts_with(&family) {
@@ -671,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_cache_scope_normalizes_toml_and_cli_source_declarations() {
+    fn workspace_cache_scope_normalizes_toml_and_api_source_declarations() {
         let workspace = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(workspace.path().join("src/cf")).unwrap();
@@ -685,7 +687,7 @@ mod tests {
             std::fs::write(
                 &config_path,
                 format!(
-                    "[source]\nroot = \"src/cf\"\nextensions = [\"src/cfe/A\"]\nexclude = [{exclusions}]\n"
+                    "[source]\nroot = \"src/cf\"\nextensions = [{{ name = \"A\", path = \"src/cfe/A\", scope = \"InfoBase\" }}]\nexclude = [{exclusions}]\n"
                 ),
             )
             .unwrap();
@@ -702,19 +704,26 @@ mod tests {
         assert_eq!(first.scope_stamp(), second.scope_stamp());
         assert_eq!(first.root(), second.root(), "ordering and duplicates are normalized");
 
-        let mut cli_config = project_model::ProjectConfig::load_from_file(&config_path).unwrap();
+        let mut api_config = project_model::ProjectConfig::load_from_file(&config_path).unwrap();
         project_model::SourceSetOverride {
             configuration_root: Some("src/cf".to_owned()),
-            extensions: Some(vec![project_model::ExtensionDecl::from("src/cfe/A")]),
+            extensions: Some(vec![project_model::ExtensionDecl::Structured(
+                project_model::StructuredExtensionDecl {
+                    name: "A".to_owned(),
+                    path: "src/cfe/A".to_owned(),
+                    depends_on: Vec::new(),
+                    scope: Some(bsl_metadata::ExtensionScope::InfoBase),
+                },
+            )]),
             externals: None,
         }
-        .apply_to(&mut cli_config);
-        let cli_project =
-            project_model::Project::with_config(workspace.path(), cli_config).unwrap();
-        let cli =
-            WorkspaceCacheLayout::for_project(&cli_project, Some(&base), cwd.path(), None).unwrap();
-        assert_eq!(first.scope_stamp(), cli.scope_stamp());
-        assert_eq!(first.root(), cli.root(), "equivalent CLI and TOML source sets share a leaf");
+        .apply_to(&mut api_config);
+        let api_project =
+            project_model::Project::with_config(workspace.path(), api_config).unwrap();
+        let api =
+            WorkspaceCacheLayout::for_project(&api_project, Some(&base), cwd.path(), None).unwrap();
+        assert_eq!(first.scope_stamp(), api.scope_stamp());
+        assert_eq!(first.root(), api.root(), "equivalent API and TOML source sets share a leaf");
     }
 
     #[test]
@@ -744,11 +753,34 @@ mod tests {
                 name: name.to_owned(),
                 path: path.to_owned(),
                 depends_on: Vec::new(),
+                scope: Some(bsl_metadata::ExtensionScope::InfoBase),
+            })
+        };
+        let legacy =
+            project_model::ExtensionDecl::Structured(project_model::StructuredExtensionDecl {
+                name: "A".to_owned(),
+                path: "src/cfe/A".to_owned(),
+                depends_on: Vec::new(),
+                scope: None,
+            });
+        let scoped = |scope| {
+            project_model::ExtensionDecl::Structured(project_model::StructuredExtensionDecl {
+                name: "A".to_owned(),
+                path: "src/cfe/A".to_owned(),
+                depends_on: Vec::new(),
+                scope: Some(scope),
             })
         };
         let first = layout(vec![independent("A", "src/cfe/A"), independent("B", "src/cfe/B")]);
         let reordered = layout(vec![independent("B", "src/cfe/B"), independent("A", "src/cfe/A")]);
         assert_ne!(first.root(), reordered.root(), "extension order changes cache identity");
+        let different_scope = layout(vec![
+            scoped(bsl_metadata::ExtensionScope::DataSeparation),
+            independent("B", "src/cfe/B"),
+        ]);
+        assert_ne!(first.root(), different_scope.root(), "extension Scope changes cache identity");
+        let legacy = layout(vec![legacy, independent("B", "src/cfe/B")]);
+        assert_ne!(first.root(), legacy.root(), "legacy scope has its own cache identity");
 
         let dependency = layout(vec![
             independent("A", "src/cfe/A"),
@@ -756,6 +788,7 @@ mod tests {
                 name: "B".to_owned(),
                 path: "src/cfe/B".to_owned(),
                 depends_on: vec!["A".to_owned()],
+                scope: Some(bsl_metadata::ExtensionScope::InfoBase),
             }),
         ]);
         assert_ne!(first.root(), dependency.root(), "dependency visibility changes cache identity");

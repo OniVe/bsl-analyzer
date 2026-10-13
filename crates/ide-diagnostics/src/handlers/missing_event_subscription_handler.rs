@@ -437,7 +437,10 @@ mod tests {
         db.set_file_text(session_file, "Функция Маркер()\nКонецФункции\n");
 
         // Единственная конфигурация — расширение X: главной нет вовсе.
-        db.set_all_config_paths(vec![(Some("X".to_string()), root.clone())]);
+        db.set_all_config_paths(
+            vec![(Some("X".to_string()), root.clone())],
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+        );
 
         let configuration_path_input = ide_db::metadata::ConfigurationPathInput::new(
             &db,

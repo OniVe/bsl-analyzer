@@ -4555,7 +4555,7 @@ mod tests {
             write(&extension.join("Configuration.xml"), "<Configuration/>");
             fs::write(
                 workspace.join("bsl-analyzer.toml"),
-                "[source]\nroot = \"cf\"\nextensions = [{ name = \"a\", path = \"cfe\" }]\n",
+                "[source]\nroot = \"cf\"\nextensions = [{ name = \"a\", path = \"cfe\", scope = \"InfoBase\" }]\n",
             )
             .unwrap();
             (configuration, extension)

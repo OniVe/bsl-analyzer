@@ -30,6 +30,9 @@ pub struct Configuration {
     #[serde(rename = "metadataObjects", default)]
     metadata_objects: Vec<MetadataObject>,
 
+    #[serde(skip)]
+    common_attribute_set: crate::CommonAttributeSet,
+
     #[serde(rename = "registers", default)]
     registers: Vec<Register>,
 
@@ -115,6 +118,7 @@ impl PartialEq for Configuration {
             && self.name == other.name
             && self.common_modules == other.common_modules
             && self.metadata_objects == other.metadata_objects
+            && self.common_attribute_set == other.common_attribute_set
             && self.registers == other.registers
             && self.event_subscriptions == other.event_subscriptions
             && self.defined_types == other.defined_types
@@ -138,6 +142,7 @@ impl Configuration {
             name: name.into(),
             common_modules: Vec::new(),
             metadata_objects: Vec::new(),
+            common_attribute_set: crate::CommonAttributeSet::default(),
             registers: Vec::new(),
             event_subscriptions: Vec::new(),
             defined_types: Vec::new(),
@@ -223,6 +228,7 @@ impl Configuration {
         // Raw configurations have first-wins entries here; an overlay may have
         // intentionally redirected a key to an independent extension object.
         let previous_metadata_object_index = std::mem::take(&mut self.metadata_objects_by_key);
+        let previous_register_index = std::mem::take(&mut self.name_to_register);
         self.uri_to_module.clear();
         self.uri_lower_to_common_module.clear();
         self.name_to_common_module.clear();
@@ -263,6 +269,18 @@ impl Configuration {
 
         for (idx, register) in self.registers.iter().enumerate() {
             self.name_to_register.insert(NormName::intern(register.name()), idx);
+        }
+        // A later extension may overlay a register in an earlier vector slot after a
+        // different-kind namesake was appended. Keep the effective by-name winner chosen
+        // during overlay folding instead of letting vector order undo that precedence.
+        for (key, idx) in previous_register_index {
+            if self
+                .registers
+                .get(idx)
+                .is_some_and(|register| NormName::intern(register.name()) == key)
+            {
+                self.name_to_register.insert(key, idx);
+            }
         }
 
         for (idx, event_sub) in self.event_subscriptions.iter().enumerate() {
@@ -374,7 +392,13 @@ impl Configuration {
         self.metadata_objects.push(object);
     }
 
-    pub fn merge_extension_overlay(&mut self, extension: &Configuration) {
+    /// Compose an extension using its declared scope and the actual base's raw attributes.
+    pub fn merge_extension_overlay(
+        &mut self,
+        extension: &Configuration,
+        scope: Option<crate::ExtensionScope>,
+        base_attributes: Option<&crate::CommonAttributeSet>,
+    ) {
         for ext_module in &extension.common_modules {
             if let Some(base_module) =
                 self.common_modules.iter_mut().find(|module| ext_module.adopts(module))
@@ -385,10 +409,30 @@ impl Configuration {
             self.add_common_module(ext_module.clone());
         }
 
-        for ext_obj in &extension.metadata_objects {
+        for declaration in &extension.metadata_objects {
+            let mut ext_obj = declaration.clone();
+            let mut applied = match scope {
+                Some(scope) => extension.common_attribute_set.for_extension_object(
+                    base_attributes,
+                    scope,
+                    ext_obj.mdo_type,
+                    &ext_obj.name,
+                ),
+                None => extension
+                    .common_attribute_set
+                    .for_legacy_object(ext_obj.mdo_type, &ext_obj.name),
+            };
+            let adopted = self.metadata_objects.iter().position(|obj| ext_obj.adopts(obj));
+            if crate::kind_takes_common_attributes(ext_obj.mdo_type)
+                && ext_obj.object_belonging == crate::ObjectBelonging::Adopted
+                && adopted.is_none()
+            {
+                applied.open = true;
+            }
+            ext_obj.set_common_attributes(applied);
             if let Some(base_obj) = self.metadata_objects.iter_mut().find(|obj| ext_obj.adopts(obj))
             {
-                base_obj.apply_extension_overlay(ext_obj);
+                base_obj.apply_extension_overlay(&ext_obj);
                 continue;
             }
             let idx = self.metadata_objects.len();
@@ -397,17 +441,42 @@ impl Configuration {
                 .insert((ext_obj.mdo_type, NormName::intern(&ext_obj.name)), idx);
         }
 
-        for ext_reg in &extension.registers {
-            if let Some(idx) = self.registers.iter().position(|base| {
+        for declaration in &extension.registers {
+            let mut ext_reg = declaration.clone();
+            let mut applied = match scope {
+                Some(scope) => extension.common_attribute_set.for_extension_object(
+                    base_attributes,
+                    scope,
+                    ext_reg.mdo_type(),
+                    ext_reg.name(),
+                ),
+                None => extension
+                    .common_attribute_set
+                    .for_legacy_object(ext_reg.mdo_type(), ext_reg.name()),
+            };
+            let strict_match = self.registers.iter().any(|reg| ext_reg.adopts(reg));
+            if ext_reg.object_belonging() == crate::ObjectBelonging::Adopted && !strict_match {
+                applied.open = true;
+            }
+            ext_reg.set_common_attributes(applied);
+            let name_key = NormName::intern(ext_reg.name());
+            let winning_idx = if let Some(idx) = self.registers.iter().position(|base| {
                 base.mdo_type() == ext_reg.mdo_type()
                     && stdx::case::eq_ignore_case(base.name(), ext_reg.name())
             }) {
                 // An extension can add measurements/resources/attributes to a
                 // borrowed register, so merge rather than ignore the adopted copy.
-                self.registers[idx].apply_extension_overlay(ext_reg);
+                if ext_reg.adopts_by_kind_and_name(&self.registers[idx]) {
+                    self.registers[idx].apply_extension_overlay(&ext_reg);
+                } else {
+                    self.registers[idx] = ext_reg;
+                }
+                idx
             } else {
                 self.add_register(ext_reg.clone());
-            }
+                self.registers.len() - 1
+            };
+            self.name_to_register.insert(name_key, winning_idx);
         }
 
         for ext_defined_type in &extension.defined_types {
@@ -440,29 +509,73 @@ impl Configuration {
         self.build_caches();
     }
 
-    pub fn merged_with_extension(&self, extension: &Configuration) -> Self {
+    /// Return a scoped extension composition, retaining the raw declarations for later overlays.
+    pub fn merged_with_extension(
+        &self,
+        extension: &Configuration,
+        scope: Option<crate::ExtensionScope>,
+        base_attributes: Option<&crate::CommonAttributeSet>,
+    ) -> Self {
         let mut merged = self.clone();
-        merged.merge_extension_overlay(extension);
+        merged.merge_extension_overlay(extension, scope, base_attributes);
         merged
+    }
+
+    /// The raw declarations of this root, before extension composition.
+    pub fn common_attribute_set(&self) -> &crate::CommonAttributeSet {
+        &self.common_attribute_set
+    }
+
+    /// Apply a standalone extension's field projection without treating it as a base.
+    pub fn apply_extension_common_attributes(&mut self, scope: crate::ExtensionScope) {
+        for object in &mut self.metadata_objects {
+            let mut applied = self.common_attribute_set.for_extension_object(
+                None,
+                scope,
+                object.mdo_type,
+                &object.name,
+            );
+            applied.open |= crate::kind_takes_common_attributes(object.mdo_type)
+                && object.object_belonging == crate::ObjectBelonging::Adopted;
+            object.set_common_attributes(applied);
+        }
+        for register in &mut self.registers {
+            let mut applied = self.common_attribute_set.for_extension_object(
+                None,
+                scope,
+                register.mdo_type(),
+                register.name(),
+            );
+            applied.open |= register.object_belonging() == crate::ObjectBelonging::Adopted;
+            register.set_common_attributes(applied);
+        }
+    }
+
+    /// Attach common attributes using the legacy scope-unaware projection to this root's objects.
+    pub fn apply_legacy_common_attributes(&mut self) {
+        for object in &mut self.metadata_objects {
+            object.set_common_attributes(
+                self.common_attribute_set.for_legacy_object(object.mdo_type, &object.name),
+            );
+        }
+        for register in &mut self.registers {
+            register.set_common_attributes(
+                self.common_attribute_set.for_legacy_object(register.mdo_type(), register.name()),
+            );
+        }
     }
 
     /// Attach to every object and register the common attributes whose composition includes
     /// it. Runs once over a freshly loaded root, before any extension overlay is folded in.
     pub fn apply_common_attributes(&mut self, set: &crate::common_attribute::CommonAttributeSet) {
-        if set.is_empty() {
-            return;
-        }
+        self.common_attribute_set = set.clone();
         for object in &mut self.metadata_objects {
             let applied = set.for_object(object.mdo_type, &object.name);
-            if !applied.is_empty() {
-                object.set_common_attributes(applied);
-            }
+            object.set_common_attributes(applied);
         }
         for register in &mut self.registers {
             let applied = set.for_object(register.mdo_type(), register.name());
-            if !applied.is_empty() {
-                register.set_common_attributes(applied);
-            }
+            register.set_common_attributes(applied);
         }
     }
 
@@ -504,9 +617,15 @@ impl Configuration {
         mdo_type: MdoType,
         name: &str,
     ) -> Option<&Register> {
+        let name = NormName::intern(name);
         self.name_to_register
-            .get(&NormName::intern(name))
+            .get(&name)
             .and_then(|&idx| self.registers.get(idx).filter(|r| r.mdo_type() == mdo_type))
+            .or_else(|| {
+                self.registers.iter().rev().find(|register| {
+                    register.mdo_type() == mdo_type && NormName::intern(register.name()) == name
+                })
+            })
     }
 
     pub fn recorders_for_register(&self, parent: MdoType, name: &str) -> &[Name] {
@@ -650,7 +769,7 @@ impl Configuration {
     /// owned payload), and every `name -> index` lookup table `build_caches`
     /// maintains alongside them. New heap-owning fields must be added here too.
     pub fn estimated_heap_size(&self) -> usize {
-        let mut bytes = self.name.capacity();
+        let mut bytes = self.name.capacity() + self.common_attribute_set.estimated_heap_size();
 
         bytes += stdx::heap::vec_bytes::<CommonModule>(self.common_modules.len())
             + self.common_modules.iter().map(CommonModule::estimated_heap_size).sum::<usize>();
@@ -897,7 +1016,11 @@ mod tests {
         });
         extension.add_metadata_object(extension_catalog);
 
-        let merged = base.merged_with_extension(&extension);
+        let merged = base.merged_with_extension(
+            &extension,
+            Some(crate::ExtensionScope::InfoBase),
+            Some(base.common_attribute_set()),
+        );
         let catalog =
             merged.find_metadata_object(MdoType::Catalog, "Номенклатура").expect("merged catalog");
 
@@ -932,7 +1055,11 @@ mod tests {
                 .extends_uuid(base_uuid)
                 .build(),
         );
-        let inherited = base.merged_with_extension(&adopted);
+        let inherited = base.merged_with_extension(
+            &adopted,
+            Some(crate::ExtensionScope::InfoBase),
+            Some(base.common_attribute_set()),
+        );
         let inherited_module = inherited.find_common_module("Shared").unwrap();
         assert_eq!(inherited_module.return_values_reuse(), ReturnValueReuse::DontUse);
         assert!(inherited_module.is_server());
@@ -952,7 +1079,11 @@ mod tests {
                 .return_values_reuse(ReturnValueReuse::DuringSession)
                 .build(),
         );
-        let overridden = base.merged_with_extension(&explicit);
+        let overridden = base.merged_with_extension(
+            &explicit,
+            Some(crate::ExtensionScope::InfoBase),
+            Some(base.common_attribute_set()),
+        );
         assert_eq!(
             overridden.find_common_module("Shared").unwrap().return_values_reuse(),
             ReturnValueReuse::DuringSession,
@@ -960,7 +1091,11 @@ mod tests {
 
         let mut independent = Configuration::new("Independent");
         independent.add_common_module(CommonModule::builder().name("Shared").build());
-        let not_merged = base.merged_with_extension(&independent);
+        let not_merged = base.merged_with_extension(
+            &independent,
+            Some(crate::ExtensionScope::InfoBase),
+            Some(base.common_attribute_set()),
+        );
         assert_eq!(not_merged.common_modules().len(), 2, "an own namesake remains independent");
         let own =
             not_merged.common_modules().iter().find(|module| module.uuid() != &base_uuid).unwrap();
@@ -985,7 +1120,11 @@ mod tests {
                 .extends_uuid(uuid::Uuid::new_v4())
                 .build(),
         );
-        let wrong_target_result = base.merged_with_extension(&wrong_target);
+        let wrong_target_result = base.merged_with_extension(
+            &wrong_target,
+            Some(crate::ExtensionScope::InfoBase),
+            Some(base.common_attribute_set()),
+        );
         assert_eq!(
             wrong_target_result.common_modules().len(),
             2,
@@ -1045,7 +1184,11 @@ mod tests {
         });
         extension.add_metadata_object(adopted);
 
-        let merged = base.merged_with_extension(&extension);
+        let merged = base.merged_with_extension(
+            &extension,
+            Some(crate::ExtensionScope::InfoBase),
+            Some(base.common_attribute_set()),
+        );
         let object = merged.find_metadata_object(MdoType::Document, "Заказ").unwrap();
         assert!(object.find_attribute("Основание").is_some());
         assert!(object.find_attribute("НомерВнешнегоЗаказа").is_some());
@@ -1065,7 +1208,11 @@ mod tests {
             attr_type: AttributeType::String { length: Some(20) },
         });
         independent.add_metadata_object(own);
-        let separate = base.merged_with_extension(&independent);
+        let separate = base.merged_with_extension(
+            &independent,
+            Some(crate::ExtensionScope::InfoBase),
+            Some(base.common_attribute_set()),
+        );
         assert_eq!(separate.metadata_objects().len(), 2);
         assert!(separate.metadata_objects()[0].find_attribute("СвоеПоле").is_none());
         assert!(separate.metadata_objects()[1].find_attribute("Основание").is_none());
@@ -1084,7 +1231,11 @@ mod tests {
             attr_type: AttributeType::Boolean,
         });
         wrong_target.add_metadata_object(wrong_document);
-        let wrong_target_result = base.merged_with_extension(&wrong_target);
+        let wrong_target_result = base.merged_with_extension(
+            &wrong_target,
+            Some(crate::ExtensionScope::InfoBase),
+            Some(base.common_attribute_set()),
+        );
         assert_eq!(
             wrong_target_result.metadata_objects().len(),
             2,
@@ -1096,7 +1247,11 @@ mod tests {
         }));
 
         let second_extension = Configuration::new("SecondExtension");
-        let after_second_merge = separate.merged_with_extension(&second_extension);
+        let after_second_merge = separate.merged_with_extension(
+            &second_extension,
+            Some(crate::ExtensionScope::InfoBase),
+            Some(separate.common_attribute_set()),
+        );
         assert!(
             after_second_merge
                 .find_metadata_object(MdoType::Document, "Заказ")
@@ -1153,7 +1308,11 @@ mod tests {
             parse_constant_xml(&mdo("Constant", ext_uuid, "Флаг", &adopted, "")).unwrap(),
         );
 
-        let merged = base.merged_with_extension(&extension);
+        let merged = base.merged_with_extension(
+            &extension,
+            Some(crate::ExtensionScope::InfoBase),
+            Some(base.common_attribute_set()),
+        );
         assert_eq!(merged.metadata_objects().len(), 2, "adopted objects must not be duplicated");
         let statuses = merged.find_metadata_object(MdoType::Enum, "Статусы").unwrap();
         assert!(statuses.find_enum_value("А").is_some(), "base enum value must survive");
@@ -1210,7 +1369,11 @@ mod tests {
             attr_type: AttributeType::String { length: Some(30) },
         });
         without_section.add_metadata_object(doc_without_section);
-        let inherited = base.merged_with_extension(&without_section);
+        let inherited = base.merged_with_extension(
+            &without_section,
+            Some(crate::ExtensionScope::InfoBase),
+            Some(base.common_attribute_set()),
+        );
         let inherited_goods = inherited
             .find_metadata_object(MdoType::Document, "Заказ")
             .unwrap()
@@ -1264,7 +1427,11 @@ mod tests {
         extension_document.add_tabular_section(new_section);
         extension.add_metadata_object(extension_document);
 
-        let merged = base.merged_with_extension(&extension);
+        let merged = base.merged_with_extension(
+            &extension,
+            Some(crate::ExtensionScope::InfoBase),
+            Some(base.common_attribute_set()),
+        );
         let document = merged.find_metadata_object(MdoType::Document, "Заказ").unwrap();
         assert!(document.find_attribute("БазовыйРеквизит").is_some());
         assert!(document.find_attribute("РасшРеквизит").is_some());
@@ -1320,7 +1487,11 @@ mod tests {
             let mut overlay_config = Configuration::new("Extension");
             overlay_config.add_metadata_object(overlay_document);
 
-            let merged = base_config.merged_with_extension(&overlay_config);
+            let merged = base_config.merged_with_extension(
+                &overlay_config,
+                Some(crate::ExtensionScope::InfoBase),
+                Some(base_config.common_attribute_set()),
+            );
             let section = merged
                 .find_metadata_object(MdoType::Document, "Заказ")
                 .unwrap()
@@ -1395,7 +1566,11 @@ mod tests {
                 .build(),
         );
 
-        let merged = base.merged_with_extension(&extension);
+        let merged = base.merged_with_extension(
+            &extension,
+            Some(crate::ExtensionScope::InfoBase),
+            Some(base.common_attribute_set()),
+        );
         assert_eq!(merged.metadata_objects().len(), 1, "Заказ and заказ are one object");
         assert_eq!(merged.common_modules().len(), 1, "Сервер and сервер are one module");
         let document = merged.find_metadata_object(MdoType::Document, "ЗАКАЗ").unwrap();
@@ -1439,7 +1614,11 @@ mod tests {
             base.add_metadata_object(base_document.clone());
             let mut extension = Configuration::new("Extension");
             extension.add_metadata_object(overlay_document);
-            let merged = base.merged_with_extension(&extension);
+            let merged = base.merged_with_extension(
+                &extension,
+                Some(crate::ExtensionScope::InfoBase),
+                Some(base.common_attribute_set()),
+            );
             let goods = merged
                 .find_metadata_object(MdoType::Document, "Заказ")
                 .unwrap()
@@ -1469,7 +1648,11 @@ mod tests {
         base.add_metadata_object(base_document);
         let mut extension = Configuration::new("Extension");
         extension.add_metadata_object(overlay_without_sections);
-        let merged = base.merged_with_extension(&extension);
+        let merged = base.merged_with_extension(
+            &extension,
+            Some(crate::ExtensionScope::InfoBase),
+            Some(base.common_attribute_set()),
+        );
         let goods = merged
             .find_metadata_object(MdoType::Document, "Заказ")
             .unwrap()
@@ -1495,9 +1678,11 @@ mod tests {
         use crate::register::{Register, RegisterAttribute, RegisterResource};
         use uuid::Uuid;
 
+        let base_uuid = Uuid::new_v4();
         let mut base = Configuration::new("Base");
         base.add_register(
             Register::builder()
+                .uuid(base_uuid)
                 .name("РегистрСведений1")
                 .mdo_type(MdoType::InformationRegister)
                 .add_dimension(Dimension::builder().name("Изм1").build())
@@ -1508,6 +1693,7 @@ mod tests {
         let mut extension = Configuration::new("Extension");
         extension.add_register(
             Register::builder()
+                .extension_ownership(crate::ObjectBelonging::Adopted, Some(base_uuid))
                 .name("РегистрСведений1")
                 .mdo_type(MdoType::InformationRegister)
                 .add_dimension(Dimension::builder().name("Изм2").build())
@@ -1516,7 +1702,11 @@ mod tests {
                 .build(),
         );
 
-        let merged = base.merged_with_extension(&extension);
+        let merged = base.merged_with_extension(
+            &extension,
+            Some(crate::ExtensionScope::InfoBase),
+            Some(base.common_attribute_set()),
+        );
         let reg = merged
             .find_register_by_type_and_name(MdoType::InformationRegister, "РегистрСведений1")
             .expect("merged register");
@@ -1529,6 +1719,243 @@ mod tests {
         assert_eq!(dims, ["Изм1", "Изм2"], "base + extension measurements");
         assert_eq!(res, ["Рес1", "Рес2"], "base + extension resources");
         assert_eq!(attrs, ["Рекв1"], "extension attribute added to the borrowed register");
+    }
+
+    #[test]
+    fn mismatched_adopted_register_keeps_base_and_overlay_fields_open() {
+        use crate::common_attribute::{
+            CommonAttribute, CommonAttributeField, CommonAttributeSet, ObjectCommonAttributes,
+        };
+        use crate::dimension::Dimension;
+        use crate::register::{Register, RegisterResource};
+        use uuid::Uuid;
+
+        let base_uuid = Uuid::new_v4();
+        let mut base_register = Register::builder()
+            .uuid(base_uuid)
+            .name("Shared")
+            .mdo_type(MdoType::InformationRegister)
+            .add_dimension(Dimension::builder().name("BaseKey").build())
+            .add_resource(RegisterResource::new(Uuid::new_v4(), "BaseAmount"))
+            .build();
+        base_register.set_common_attributes(ObjectCommonAttributes {
+            fields: vec![CommonAttributeField {
+                name: "BaseCommon".into(),
+                attr_type: AttributeType::Number { precision: 9, scale: 2 },
+                separator: false,
+            }],
+            open: false,
+        });
+        let mut base = Configuration::new("Base");
+        base.add_register(base_register);
+
+        let overlay = Register::builder()
+            .extension_ownership(crate::ObjectBelonging::Adopted, Some(Uuid::new_v4()))
+            .name("Shared")
+            .mdo_type(MdoType::InformationRegister)
+            .add_dimension(Dimension::builder().name("ExtensionKey").build())
+            .add_resource(RegisterResource::new(Uuid::new_v4(), "ExtensionAmount"))
+            .build();
+        let mut extension = Configuration::new("Extension");
+        extension.add_register(overlay);
+        extension.common_attribute_set = CommonAttributeSet {
+            attributes: vec![CommonAttribute {
+                name: "ExtensionCommon".into(),
+                uuid: None,
+                object_belonging: crate::ObjectBelonging::Own,
+                extended_configuration_object: None,
+                attr_type: AttributeType::String { length: Some(20) },
+                attr_type_present: true,
+                auto_use: true,
+                data_separation: Some(true),
+                data_separation_present: true,
+                configuration_extensions_separation: None,
+                separated_data_use: None,
+                separated_data_use_present: false,
+                content: rustc_hash::FxHashMap::default(),
+                unattributed_members: false,
+            }],
+            unreadable: false,
+        };
+
+        let merged = base.merged_with_extension(&extension, None, None);
+        let register = merged.find_register("Shared").expect("register remains present");
+        assert_eq!(
+            register.dimensions().iter().map(|item| item.name()).collect::<Vec<_>>(),
+            ["BaseKey", "ExtensionKey"]
+        );
+        assert_eq!(
+            register.resources().iter().map(|item| item.name()).collect::<Vec<_>>(),
+            ["BaseAmount", "ExtensionAmount"]
+        );
+        assert_eq!(
+            register.common_attributes(),
+            &[
+                CommonAttributeField {
+                    name: "BaseCommon".into(),
+                    attr_type: AttributeType::Number { precision: 9, scale: 2 },
+                    separator: false,
+                },
+                CommonAttributeField {
+                    name: "ExtensionCommon".into(),
+                    attr_type: AttributeType::String { length: Some(20) },
+                    separator: true,
+                },
+            ]
+        );
+        assert!(register.common_attributes_open());
+        assert!(!extension
+            .find_register("Shared")
+            .unwrap()
+            .adopts(base.find_register("Shared").unwrap()));
+    }
+
+    #[test]
+    fn legacy_extension_projection_keeps_unknown_typed_separator_field() {
+        use crate::common_attribute::{CommonAttribute, CommonAttributeSet};
+        use crate::register::Register;
+        use rustc_hash::FxHashMap;
+
+        let attribute = CommonAttribute {
+            name: "LegacySeparator".into(),
+            uuid: None,
+            object_belonging: crate::ObjectBelonging::Own,
+            extended_configuration_object: None,
+            attr_type: AttributeType::Unknown,
+            attr_type_present: false,
+            auto_use: true,
+            data_separation: Some(true),
+            data_separation_present: true,
+            configuration_extensions_separation: None,
+            separated_data_use: None,
+            separated_data_use_present: false,
+            content: FxHashMap::default(),
+            unattributed_members: false,
+        };
+        let mut extension = Configuration::new("Extension");
+        extension.add_register(
+            Register::builder()
+                .extension_ownership(crate::ObjectBelonging::Own, None)
+                .name("Local")
+                .mdo_type(MdoType::InformationRegister)
+                .build(),
+        );
+        extension.common_attribute_set =
+            CommonAttributeSet { attributes: vec![attribute], unreadable: false };
+
+        let merged = Configuration::new("Base").merged_with_extension(&extension, None, None);
+        let register = merged.find_register("Local").expect("extension register remains present");
+        assert_eq!(register.common_attributes().len(), 1);
+        assert_eq!(register.common_attributes()[0].name, "LegacySeparator");
+        assert_eq!(register.common_attributes()[0].attr_type, AttributeType::Unknown);
+        assert!(register.common_attributes()[0].separator);
+        assert!(!register.common_attributes_open());
+    }
+
+    #[test]
+    fn independent_same_name_objects_do_not_inherit_base_fields() {
+        let mut base = Configuration::new("Base");
+        base.add_register(
+            Register::builder()
+                .name("Shared")
+                .mdo_type(MdoType::InformationRegister)
+                .add_dimension(crate::Dimension::builder().name("BaseField").build())
+                .build(),
+        );
+        base.add_metadata_object(MetadataObject::new(MdoType::Catalog, "Shared"));
+        let fixture = crate::load_from_directory(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/extension_common_attributes/base"),
+        )
+        .unwrap();
+        base.apply_common_attributes(fixture.common_attribute_set());
+        assert!(!base.find_register("Shared").unwrap().common_attributes().is_empty());
+        assert!(!base
+            .find_metadata_object(MdoType::Catalog, "Shared")
+            .unwrap()
+            .common_attributes
+            .is_empty());
+        let mut extension = Configuration::new("Extension");
+        extension.add_register(
+            Register::builder()
+                .name("Shared")
+                .mdo_type(MdoType::InformationRegister)
+                .extension_ownership(crate::ObjectBelonging::Own, None)
+                .add_dimension(crate::Dimension::builder().name("OwnField").build())
+                .build(),
+        );
+        let mut own_catalog = MetadataObject::new(MdoType::Catalog, "Shared");
+        own_catalog.set_object_belonging(crate::ObjectBelonging::Own);
+        extension.add_metadata_object(own_catalog);
+        let merged = base.merged_with_extension(
+            &extension,
+            Some(crate::ExtensionScope::InfoBase),
+            Some(base.common_attribute_set()),
+        );
+        let register = merged.find_register("Shared").unwrap();
+        assert_eq!(
+            register.dimensions().iter().map(|field| field.name()).collect::<Vec<_>>(),
+            ["OwnField"]
+        );
+        assert!(!register.common_attributes_open());
+        assert!(register.common_attributes().is_empty());
+        let catalog = merged.find_metadata_object(MdoType::Catalog, "Shared").unwrap();
+        assert!(catalog.common_attributes.is_empty());
+        assert!(!catalog.common_attributes_open);
+    }
+
+    #[test]
+    fn native_common_attribute_matrix_matches_full_overlay() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/extension_common_attributes");
+        let base = crate::load_from_directory(fixture.join("base")).unwrap();
+        for (scope, variant, expected) in [
+            (crate::ExtensionScope::InfoBase, "no-common", vec![]),
+            (crate::ExtensionScope::InfoBase, "explicit-use", vec!["OrdinaryAuto", "OtherUse"]),
+            (crate::ExtensionScope::InfoBase, "explicit-dont-use", vec![]),
+            (crate::ExtensionScope::DataSeparation, "no-common", vec![]),
+            (
+                crate::ExtensionScope::DataSeparation,
+                "explicit-use",
+                vec!["OrdinaryAuto", "OtherUse"],
+            ),
+        ] {
+            let extension =
+                crate::load_from_directory(fixture.join("extensions").join(variant)).unwrap();
+            let merged = base.merged_with_extension(
+                &extension,
+                Some(scope),
+                Some(base.common_attribute_set()),
+            );
+            assert_eq!(merged.common_attribute_set(), base.common_attribute_set());
+            let object = merged.find_metadata_object(MdoType::Catalog, "NativeCatalog").unwrap();
+            let register = merged.find_register("NativeRegister").unwrap();
+            for fields in [&object.common_attributes[..], register.common_attributes()] {
+                let mut names: Vec<_> = fields.iter().map(|field| field.name.as_str()).collect();
+                names.sort_unstable();
+                assert_eq!(names, expected, "{scope:?}/{variant}");
+                assert!(fields
+                    .iter()
+                    .all(|field| field.attr_type
+                        == (AttributeType::Number { precision: 7, scale: 0 })));
+                assert!(fields.iter().all(|field| field.separator == (field.name == "OtherUse")));
+            }
+            assert!(!object.common_attributes_open, "{scope:?}/{variant}");
+            assert!(!register.common_attributes_open(), "{scope:?}/{variant}");
+            assert_eq!(
+                merged
+                    .find_metadata_object(MdoType::Catalog, "BaseCatalog")
+                    .unwrap()
+                    .common_attributes,
+                base.find_metadata_object(MdoType::Catalog, "BaseCatalog")
+                    .unwrap()
+                    .common_attributes
+            );
+            assert_eq!(
+                merged.find_register("BaseRegister").unwrap().common_attributes(),
+                base.find_register("BaseRegister").unwrap().common_attributes()
+            );
+        }
     }
 
     #[test]
@@ -1558,7 +1985,11 @@ mod tests {
                 .build(),
         );
 
-        let merged = base.merged_with_extension(&extension);
+        let merged = base.merged_with_extension(
+            &extension,
+            Some(crate::ExtensionScope::InfoBase),
+            Some(base.common_attribute_set()),
+        );
         let dt = merged.find_defined_type("ОпределяемыйТип1").expect("merged defined type");
         assert_eq!(dt.underlying_type(), &refined, "extension refinement of the defined type wins");
     }
@@ -1596,7 +2027,11 @@ mod tests {
         );
         extension.add_subsystem(crate::subsystem::Subsystem::new("Сервис"));
 
-        let merged = base.merged_with_extension(&extension);
+        let merged = base.merged_with_extension(
+            &extension,
+            Some(crate::ExtensionScope::InfoBase),
+            Some(base.common_attribute_set()),
+        );
         let sales = merged
             .subsystems()
             .iter()
@@ -1692,7 +2127,11 @@ mod tests {
             .set_register_records(vec![(MdoType::InformationRegister, "B".to_string())]);
         extension.add_metadata_object(overlay_document);
 
-        let merged = base.merged_with_extension(&extension);
+        let merged = base.merged_with_extension(
+            &extension,
+            Some(crate::ExtensionScope::InfoBase),
+            Some(base.common_attribute_set()),
+        );
 
         assert_eq!(
             merged.recorders_for_register(MdoType::InformationRegister, "B"),

@@ -22,7 +22,7 @@ fn setup(fixture_text: &str) -> (RootDatabaseImpl, FileId) {
         db.set_file_text(*file_id, &file.content);
     }
 
-    db.set_all_config_paths(vec![(None, designer_fixture_path())]);
+    db.set_all_config_paths(vec![(None, designer_fixture_path())], None);
 
     let test_file = fixture
         .files

@@ -368,7 +368,7 @@ fn a_bare_name_owned_by_two_hosts_still_gets_what_its_documentation_points_at() 
     }
 
     let mut db = RootDatabaseImpl::new();
-    db.set_all_config_paths(fixture.config_paths());
+    db.set_all_config_paths(fixture.config_paths(), Some(bsl_metadata::ExtensionScope::InfoBase));
     let mut file_set = FileSet::default();
     for (index, (path, _)) in bodies.iter().enumerate() {
         file_set.insert(FileId(index as u32), VfsPath::new(path.to_string_lossy().into_owned()));

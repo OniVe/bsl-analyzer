@@ -58,6 +58,12 @@ fn setup() -> (RootDatabaseImpl, Files) {
     // `tests` (slot 2) depends on `yaxunit` (slot 1); everything else is independent.
     let snapshot = WorkspaceConfigsSnapshot {
         kinds: ide_db::metadata::RootKind::from_labels(&paths),
+        extension_scopes: vec![
+            None,
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+        ],
         paths,
         canonical_paths,
         closures: vec![Vec::new(), Vec::new(), vec![1], Vec::new()],
@@ -201,6 +207,7 @@ fn project_built_snapshot_resolves_a_transitive_chain() {
             name: name.to_string(),
             path: format!("../bsl-metadata/fixtures/cfe_dependencies/{dir}"),
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            scope: Some(bsl_metadata::ExtensionScope::InfoBase),
         })
     };
     let config = ProjectConfig {

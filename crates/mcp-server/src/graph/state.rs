@@ -3706,6 +3706,11 @@ mod tests {
         let graph = GraphState::for_workspace(root.to_path_buf()).with_publish_hook(hook);
         graph.ensure_loading();
         wait_ready(&graph);
+        super::super::test_support::wait_publish_pass_within(
+            &graph,
+            super::super::test_support::WAIT_CEILING,
+            1,
+        );
         let before = refreshes.load(Ordering::SeqCst);
 
         // A comparison that will answer without building — disk matches what is published —
@@ -3763,6 +3768,11 @@ mod tests {
         let graph = GraphState::for_workspace(root.to_path_buf()).with_publish_hook(hook);
         graph.ensure_loading();
         wait_ready(&graph);
+        super::super::test_support::wait_publish_pass_within(
+            &graph,
+            super::super::test_support::WAIT_CEILING,
+            1,
+        );
         armed.store(true, Ordering::SeqCst);
 
         graph.record_hook_debt(HookDebt { topology: true, roots: false, marks: false });
@@ -3871,6 +3881,11 @@ mod tests {
         let graph = GraphState::for_workspace(root.to_path_buf()).with_publish_hook(hook);
         graph.ensure_loading();
         wait_ready(&graph);
+        super::super::test_support::wait_publish_pass_within(
+            &graph,
+            super::super::test_support::WAIT_CEILING,
+            1,
+        );
         armed.store(true, Ordering::SeqCst);
 
         graph.record_hook_debt(HookDebt { topology: true, roots: false, marks: false });
@@ -3934,6 +3949,11 @@ mod tests {
         let graph = GraphState::for_workspace(root.to_path_buf()).with_publish_hook(hook);
         graph.ensure_loading();
         wait_ready(&graph);
+        super::super::test_support::wait_publish_pass_within(
+            &graph,
+            super::super::test_support::WAIT_CEILING,
+            1,
+        );
         *lock_recover(&slot) = Some(graph.clone());
         armed.store(true, Ordering::SeqCst);
 
@@ -3975,6 +3995,11 @@ mod tests {
         let graph = GraphState::for_workspace(root.to_path_buf()).with_publish_hook(hook);
         graph.ensure_loading();
         wait_ready(&graph);
+        super::super::test_support::wait_publish_pass_within(
+            &graph,
+            super::super::test_support::WAIT_CEILING,
+            1,
+        );
         armed.store(true, Ordering::SeqCst);
 
         graph.record_hook_debt(HookDebt { topology: true, roots: false, marks: false });
@@ -6866,8 +6891,10 @@ mod tests {
         let graph = GraphState::for_workspace(root.to_path_buf()).with_probe_window_hook(hook);
         graph.ensure_loading();
         wait_ready(&graph);
+        // A ready snapshot can still have a builder holding its admission ticket.
         wait_until(&graph, "the initial builder to release its ticket", || {
-            !graph.build_in_flight()
+            let inner = lock_recover(&graph.inner);
+            inner.building.is_none() && inner.claimed.is_none()
         });
         assert!(graph.owes_recovery(), "the fixture needs an outstanding obligation");
         // Due, because a walk is only ever reserved for work the schedule says is ripe.
@@ -7473,8 +7500,8 @@ mod tests {
             )
             .unwrap();
         };
-        let both = "  { name = \"a\", path = \"ext/a\" },\n  { name = \"b\", path = \"ext/b\" },\n";
-        let only_a = "  { name = \"a\", path = \"ext/a\" },\n";
+        let both = "  { name = \"a\", path = \"ext/a\", scope = \"InfoBase\" },\n  { name = \"b\", path = \"ext/b\", scope = \"InfoBase\" },\n";
+        let only_a = "  { name = \"a\", path = \"ext/a\", scope = \"InfoBase\" },\n";
         declare(both);
 
         // A subtree that cannot be walked, so the verdict of a complete walk and of a short
@@ -7507,7 +7534,7 @@ mod tests {
                 }
                 fs::write(
                     root.join("bsl-analyzer.toml"),
-                    "[source]\nroot = \"src\"\nextensions = [\n  { name = \"a\", path = \"ext/a\" },\n]\n",
+                    "[source]\nroot = \"src\"\nextensions = [\n  { name = \"a\", path = \"ext/a\", scope = \"InfoBase\" },\n]\n",
                 )
                 .unwrap();
                 // Another owner reads the new declaration and refreshes every cache a
@@ -7782,8 +7809,8 @@ mod tests {
             )
             .unwrap();
         };
-        let both = "  { name = \"a\", path = \"ext/a\" },\n  { name = \"b\", path = \"ext/b\" },\n";
-        let only_a = "  { name = \"a\", path = \"ext/a\" },\n";
+        let both = "  { name = \"a\", path = \"ext/a\", scope = \"InfoBase\" },\n  { name = \"b\", path = \"ext/b\", scope = \"InfoBase\" },\n";
+        let only_a = "  { name = \"a\", path = \"ext/a\", scope = \"InfoBase\" },\n";
 
         // One module under the root that is always declared — the anchor — and one under the
         // root that comes and goes. Both unreadable, so both are obligations.
@@ -8784,8 +8811,8 @@ mod tests {
             )
             .unwrap();
         };
-        let both = "  { name = \"a\", path = \"ext/a\" },\n  { name = \"b\", path = \"ext/b\" },\n";
-        let only_a = "  { name = \"a\", path = \"ext/a\" },\n";
+        let both = "  { name = \"a\", path = \"ext/a\", scope = \"InfoBase\" },\n  { name = \"b\", path = \"ext/b\", scope = \"InfoBase\" },\n";
+        let only_a = "  { name = \"a\", path = \"ext/a\", scope = \"InfoBase\" },\n";
         declare(both);
         let graph = GraphState::for_workspace(root.to_path_buf());
 
@@ -9400,6 +9427,7 @@ mod tests {
         let graph = GraphState::for_workspace(root.to_path_buf());
         graph.ensure_loading();
         wait_ready(&graph);
+        wait_until(&graph, "the initial build to leave its slot", || !graph.facts().in_flight);
         let generation =
             lock_recover(&graph.inner).published.as_ref().expect("the build published").generation;
         let first_interval = lock_recover(&graph.debt).probe_interval().expect("a probe is owed");

@@ -33,7 +33,7 @@ fn setup() -> TempDir {
         temp.path().join("bsl-analyzer.toml"),
         r#"[source]
 root = "src/cf"
-extensions = [{ name = "Ext", path = "src/cfe/ext" }]
+extensions = [{ name = "Ext", path = "src/cfe/ext", scope = "InfoBase" }]
 
 [diagnostics.baseline]
 path = ".bsl-diagnostics-baseline.json"
@@ -53,6 +53,7 @@ fn diagnostics_baseline_cli() {
         serde_json::from_slice(&fs::read(&baseline_path).unwrap()).unwrap();
     assert_eq!(baseline["scope"]["source_root"], "src/cf");
     assert_eq!(baseline["scope"]["extensions"][0]["name"], "Ext");
+    assert_eq!(baseline["scope"]["extensions"][0]["scope"], "InfoBase");
     assert!(!baseline["diagnostics"].as_array().unwrap().is_empty());
 
     let reports = root.join("reports");
@@ -101,9 +102,53 @@ fn diagnostics_baseline_cli() {
 }
 
 #[test]
+fn legacy_extension_baseline_identity_changes_when_scope_becomes_explicit() {
+    let temp = setup();
+    let root = temp.path();
+    let config_path = root.join("bsl-analyzer.toml");
+    let explicit = fs::read_to_string(&config_path).unwrap();
+    fs::write(&config_path, explicit.replace(", scope = \"InfoBase\"", "")).unwrap();
+
+    assert_success(&run(root, &["diagnostics", "baseline", "create", "-s", "."]));
+    let baseline_path = root.join(".bsl-diagnostics-baseline.json");
+    let legacy: serde_json::Value =
+        serde_json::from_slice(&fs::read(&baseline_path).unwrap()).unwrap();
+    let legacy_bytes = fs::read(&baseline_path).unwrap();
+    assert_eq!(legacy["scope"]["extensions"][0]["legacyScope"], true);
+    assert!(legacy["scope"]["extensions"][0].get("scope").is_none());
+    assert_success(&run(root, &["diagnostics", "baseline", "check", "-s", "."]));
+
+    fs::write(&config_path, explicit).unwrap();
+    assert!(
+        !run(root, &["diagnostics", "baseline", "check", "-s", "."]).status.success(),
+        "explicit scope must invalidate the legacy baseline identity"
+    );
+    assert!(
+        !run(root, &["diagnostics", "baseline", "update", "-s", "."]).status.success(),
+        "update must not silently rewrite a baseline from another project scope"
+    );
+    assert_eq!(
+        fs::read(&baseline_path).unwrap(),
+        legacy_bytes,
+        "refused update leaves the old baseline untouched"
+    );
+    fs::remove_file(&baseline_path).unwrap();
+    assert_success(&run(root, &["diagnostics", "baseline", "create", "-s", "."]));
+    let explicit_baseline: serde_json::Value =
+        serde_json::from_slice(&fs::read(&baseline_path).unwrap()).unwrap();
+    assert_eq!(explicit_baseline["scope"]["extensions"][0]["scope"], "InfoBase");
+    assert!(explicit_baseline["scope"]["extensions"][0].get("legacyScope").is_none());
+    assert_success(&run(root, &["diagnostics", "baseline", "check", "-s", "."]));
+}
+
+#[test]
 fn create_without_configuration_fails_before_analysis() {
     let temp = setup();
-    fs::write(temp.path().join("bsl-analyzer.toml"), "[source]\nroot = \"src/cf\"\n").unwrap();
+    fs::write(
+        temp.path().join("bsl-analyzer.toml"),
+        "[source]\nroot = \"src/cf\"\nextensions = []\n",
+    )
+    .unwrap();
 
     let output = run(temp.path(), &["diagnostics", "baseline", "create", "-s", "."]);
 

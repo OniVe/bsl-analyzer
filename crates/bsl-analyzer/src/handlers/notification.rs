@@ -619,21 +619,20 @@ pub fn handle_did_change_watched_files(
                 || project_model::is_metadata_path(std_path));
         let relevant_config = workspace_root.is_some_and(|root| {
             std_path.parent() == Some(root)
-                && std_path.file_name().is_some_and(|name| {
-                    matches!(
-                        name.to_str(),
-                        Some("bsl-analyzer.toml")
-                            | Some(".bsl-analyzer.json")
-                            | Some(".bsl-language-server.json")
-                    )
-                })
+                && std_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(project_model::is_project_input_file_name)
         });
         if !relevant_source && !relevant_config {
             rejected += 1;
             continue;
         }
 
+        // Watcher events can arrive stale or coalesced: only a file that is really gone
+        // invalidates the open document's origin, as on the native loader path.
         if event.typ == lsp_types::FileChangeType::DELETED
+            && !std_path.exists()
             && project_model::is_bsl_source_path(std_path)
         {
             state.mem_docs.invalidate_identity(&event.uri);
@@ -717,6 +716,7 @@ mod tests {
         let deleted_bsl = root.path().join("Deleted.bsl");
         let xml = root.path().join("Catalogs/New.xml");
         let config = root.path().join("bsl-analyzer.toml");
+        let env = root.path().join(project_model::PROJECT_ENV_FILE_NAME);
         let outside = root.path().parent().unwrap().join("outside.bsl");
         let remote = Url::parse("https://example.invalid/Remote.bsl").unwrap();
         let uri = |path: &std::path::Path| Url::from_file_path(path).unwrap();
@@ -730,6 +730,15 @@ mod tests {
             1,
         );
         let deleted_identity = state.mem_docs.identity(&deleted_uri).unwrap();
+        let stale_deleted_bsl = root.path().join("StillThere.bsl");
+        std::fs::write(&stale_deleted_bsl, "Процедура StillThere() КонецПроцедуры").unwrap();
+        let stale_deleted_uri = uri(&stale_deleted_bsl);
+        state.mem_docs.insert(
+            stale_deleted_uri.clone(),
+            "Процедура StillThere() КонецПроцедуры".to_owned(),
+            1,
+        );
+        let stale_deleted_identity = state.mem_docs.identity(&stale_deleted_uri).unwrap();
         handle_did_change_watched_files(
             &mut state,
             DidChangeWatchedFilesParams {
@@ -743,11 +752,19 @@ mod tests {
                         typ: lsp_types::FileChangeType::DELETED,
                     },
                     lsp_types::FileEvent {
+                        uri: stale_deleted_uri.clone(),
+                        typ: lsp_types::FileChangeType::DELETED,
+                    },
+                    lsp_types::FileEvent {
                         uri: uri(&xml),
                         typ: lsp_types::FileChangeType::CHANGED,
                     },
                     lsp_types::FileEvent {
                         uri: uri(&config),
+                        typ: lsp_types::FileChangeType::CHANGED,
+                    },
+                    lsp_types::FileEvent {
+                        uri: uri(&env),
                         typ: lsp_types::FileChangeType::CHANGED,
                     },
                     lsp_types::FileEvent {
@@ -762,7 +779,12 @@ mod tests {
 
         let paths: Vec<_> =
             invalidated.lock().iter().map(|path| path.as_path().to_path_buf()).collect();
-        assert_eq!(paths, vec![bsl, deleted_bsl, xml, config]);
+        assert_eq!(paths, vec![bsl, deleted_bsl, stale_deleted_bsl, xml, config, env]);
+        assert_eq!(
+            state.mem_docs.identity(&stale_deleted_uri),
+            Some(stale_deleted_identity),
+            "a stale DELETED event for a file still on disk keeps the open document's origin"
+        );
         assert_eq!(state.mem_docs.identity(&open_uri), Some(open_identity));
         assert_eq!(state.mem_docs.get(&open_uri).as_deref(), Some("Процедура X() КонецПроцедуры"));
         assert_ne!(state.mem_docs.identity(&deleted_uri), Some(deleted_identity));

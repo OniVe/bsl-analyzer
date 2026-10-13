@@ -61,6 +61,23 @@ fn ensure_every_declared_root_is_accounted_for(
     Ok(())
 }
 
+/// The key the publisher stores a walked file under: the engine's ONE role branch, never a second
+/// one of its own.
+///
+/// `workspace_file_key_in` is the thin adapter over that branch, so a key written here is a key the
+/// daemon derives for the same file: the drift and removal paths on the reading side already go
+/// through this very adapter, and for a file the WALK produced its answer is the one a direct
+/// [`bsl_search::WorkspaceRoots::root_of`] gives — the walk admits only files whose two spellings
+/// agree by role. What the adapter adds is the input a walk cannot yield (a `.bsl`-spelled link onto
+/// a non-source target), and routing the publisher through it is what makes that one implementation
+/// rather than two that have to stay in step (github#278).
+fn walked_file_key(
+    roots: &bsl_search::WorkspaceRoots,
+    file: &project_model::WalkedFile,
+) -> Option<bsl_search::FileKey> {
+    bsl_search::workspace_file_key_in(roots, &file.walked)
+}
+
 /// Walk the source tree ONCE and index what it found.
 ///
 /// The walk happens here, not inside the engine, so that its verdict and its corpus cannot
@@ -113,7 +130,7 @@ pub(super) fn build_workspace_code(
                 if file.role != project_model::FileRole::Source {
                     continue;
                 }
-                let Some(key) = roots.root_of(&file.walked, &file.canonical) else {
+                let Some(key) = walked_file_key(&roots, file) else {
                     continue;
                 };
                 if !seen.insert(key.clone()) {
@@ -187,6 +204,20 @@ mod tests {
         std::fs::write(path, body).unwrap();
     }
 
+    fn write_source_config(root: &Path, configuration: &str, extensions: &[(&str, &str)]) {
+        let entries = extensions
+            .iter()
+            .map(|(name, path)| {
+                format!("  {{ name = {name:?}, path = {path:?}, scope = \"InfoBase\" }}")
+            })
+            .collect::<Vec<_>>()
+            .join(",\n");
+        write(
+            &root.join("bsl-analyzer.toml"),
+            &format!("[source]\nroot = {configuration:?}\nextensions = [\n{entries}\n]\n"),
+        );
+    }
+
     fn module(name: &str) -> String {
         format!("Процедура {name}()\n    Сообщить(\"{name}\");\nКонецПроцедуры\n")
     }
@@ -205,35 +236,86 @@ mod tests {
             .collect()
     }
 
-    /// The keys the CONSUMER derives from the same tree: the daemon's own root table
-    /// (`project::workspace_roots`), its own walk universe (every REGISTERED root, as
-    /// `workspace_overlay::scan_workspace_files` declares it) and its own attribution
-    /// (`WorkspaceRoots::root_of`).
-    ///
-    /// Both halves matter. A model built with no extensions, or walking the configuration
-    /// root alone, agrees with any publisher on a tree without extensions and cannot
-    /// disagree with one on a tree with them — which is exactly the case this exists for.
-    fn consumed_keys(root: &Path) -> Keys {
-        let project = project_at(root);
+    /// The root table `build_workspace_code` publishes under: the same call, off the same model,
+    /// with the user's `[source].exclude` applied — the table, the walk of the consumer below and
+    /// the publisher's own walk must all be built the same way, or a parity fixture that uses
+    /// exclusions would compare two different source universes.
+    fn publisher_roots(project: &project_model::Project) -> bsl_search::WorkspaceRoots {
         let extensions: Vec<std::path::PathBuf> = project
             .extension_paths()
             .iter()
             .chain(project.external_paths())
             .map(|(_, path)| path.clone())
             .collect();
-        let (roots, _) = bsl_search::WorkspaceRoots::build_optional(
+        bsl_search::WorkspaceRoots::build_optional(
             &project.root,
             project.semantic_base_path(),
             &extensions,
-        );
+        )
+        .0
+        .with_user_excluded(project.source_exclusions())
+    }
+
+    /// A walk entry as the walk hands it over: the spelling the walk used, the physical
+    /// spelling, the target's metadata and the role of both.
+    #[cfg(unix)]
+    fn walked_file(walked: &Path) -> project_model::WalkedFile {
+        project_model::WalkedFile {
+            root: walked.parent().unwrap().to_path_buf(),
+            role: project_model::FileRole::Source,
+            walked: walked.to_path_buf(),
+            canonical: std::fs::canonicalize(walked).unwrap(),
+            metadata: std::fs::metadata(walked).unwrap(),
+        }
+    }
+
+    /// The keys the CONSUMER derives from the same tree: the daemon's own root table
+    /// (`project::workspace_roots`), its own walk universe and its own attribution.
+    ///
+    /// Both halves are built the way the publisher builds them, and deliberately by the same calls:
+    /// the root table through `publisher_roots` (which applies `with_user_excluded`), and the walk
+    /// through `SourceSet::scan_in_scope` over the REGISTERED roots with the project's exclusions.
+    /// `SourceSet::scan` or a table without the user's exclusions would compare two source universes
+    /// and read a false divergence on any fixture that excludes something.
+    ///
+    /// The attribution here goes through the SAME engine adapter the publisher calls, so the ROLE
+    /// branch has one implementation instead of two (github#278). The role branch is what the two
+    /// used to disagree about, and the divergent inputs are the links a walk cannot yield at all:
+    /// the tests that pin the branch call the procedure directly, on a `WalkedFile` the shared walk
+    /// would have dropped.
+    ///
+    /// Both halves matter. A model built with no extensions, or walking the configuration
+    /// root alone, agrees with any publisher on a tree without extensions and cannot
+    /// disagree with one on a tree with them — which is exactly the case this exists for.
+    fn consumed_keys(root: &Path) -> Keys {
+        let project = project_at(root);
+        let roots = publisher_roots(&project);
         let declared: Vec<std::path::PathBuf> =
             roots.entries().map(|(_, path)| path.to_path_buf()).collect();
-        project_model::SourceSet::scan(&declared)
+        project_model::SourceSet::scan_in_scope(&declared, &[], project.source_exclusions())
             .files
             .iter()
             .filter(|file| file.role == project_model::FileRole::Source)
-            .filter_map(|file| roots.root_of(&file.walked, &file.canonical))
+            .filter_map(|file| bsl_search::workspace_file_key_in(&roots, &file.walked))
             .map(|key| (key.root_id, key.path))
+            .collect()
+    }
+
+    /// The files the SAME shared walk yields for a project, spelled as the walk reached them.
+    ///
+    /// A parity fixture needs this to state the half a walk can speak about: the walk DROPS every
+    /// entry whose two spellings disagree by role, so it can never contain the divergent inputs the
+    /// direct tests below are about.
+    #[cfg(unix)]
+    fn walked_paths(root: &Path) -> Vec<std::path::PathBuf> {
+        let project = project_at(root);
+        let roots = publisher_roots(&project);
+        let declared: Vec<std::path::PathBuf> =
+            roots.entries().map(|(_, path)| path.to_path_buf()).collect();
+        project_model::SourceSet::scan_in_scope(&declared, &[], project.source_exclusions())
+            .files
+            .iter()
+            .map(|file| file.walked.clone())
             .collect()
     }
 
@@ -251,6 +333,11 @@ mod tests {
             write(&owner_root.join("Configuration.xml"), "<MetaDataObject/>");
             write(&owner_root.join(relative), &module(&owner.replace('/', "_")));
         }
+        write_source_config(
+            &root,
+            "src/cf",
+            &[("Первое", "src/cfe/Первое"), ("Второе", "src/cfe/Второе")],
+        );
         root
     }
 
@@ -288,6 +375,160 @@ mod tests {
             !published.contains(&(String::new(), "Призрак.bsl".to_owned())),
             "a name that claims to be BSL over a target that is not gets no row: the key \
              would name a file no walk of the target's root can rebuild; published: {published:?}"
+        );
+    }
+
+    /// The ROLE branch is ONE procedure, and it is the engine's (github#278). The publisher used to
+    /// call the canonical-ranked `root_of(walked, canonical)` directly, without the engine's role
+    /// branch; on a `.bsl`-spelled link onto a target that is not a source the two answer DIFFERENT
+    /// keys, and the canonical-ranked one names a key the walk forbids to exist.
+    ///
+    /// This is the first of the two divergent shapes the engine pins in `bsl-search`
+    /// (`a_link_to_a_non_source_target_keys_by_its_walked_spelling`): the link sits in the
+    /// configuration and its target in an extension. The positive control below asserts the two
+    /// procedures really do disagree here — that is why the publisher may not carry a call of its
+    /// own, and what reverting `walked_file_key` to `root_of` would break.
+    ///
+    /// It is a DIRECT test of the procedure: the input is a `WalkedFile` the shared walk would have
+    /// dropped, because its two spellings disagree by role. The parity tests elsewhere in this
+    /// module therefore cannot see this shape — and must not be read as if the old publisher had
+    /// been publishing a forbidden key: it could only ever mint this one for a path no walk yields.
+    #[cfg(unix)]
+    #[test]
+    fn a_bsl_link_to_a_non_source_target_keeps_the_walked_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = workspace_with_two_extensions(dir.path());
+        let notes = root.join("src/cfe/Первое/Заметки.txt");
+        write(&notes, "не исходник");
+        let alias = root.join("src/cf/Призрак.bsl");
+        std::os::unix::fs::symlink(&notes, &alias).unwrap();
+        let file = walked_file(&alias);
+        let roots = publisher_roots(&project_at(&root));
+
+        assert_eq!(
+            walked_file_key(&roots, &file),
+            Some(bsl_search::FileKey::configuration("Призрак.bsl")),
+            "a name that claims to be BSL over a target that is not keeps the spelling it was \
+             walked under: the key under the target's root is one the walk forbids to exist"
+        );
+        assert_eq!(
+            roots.root_of(&file.walked, &file.canonical),
+            Some(bsl_search::FileKey::new("src/cfe/Первое", "Заметки.txt")),
+            "control: the canonical-ranked answer disagrees with the single procedure, and this \
+             is the key the publisher used to store"
+        );
+        let walked = walked_paths(&root);
+        assert!(
+            walked.iter().all(|path| !path.ends_with("Призрак.bsl")),
+            "control: the shared walk drops the divergent entry, so no walk ever rebuilds the \
+             canonical-ranked key for it; walked: {walked:?}",
+        );
+    }
+
+    /// The second divergent shape, the one the root itself makes: the extension is declared
+    /// THROUGH A LINK, so the walked path also lies under the enclosing root's canonical spelling.
+    /// Ranking the canonical spelling hands the file to the CONFIGURATION, while the declared
+    /// spelling names the extension that walked to it — the key a removal has to reach
+    /// (`a_non_source_target_under_a_linked_root_keys_by_the_declared_root`).
+    ///
+    /// The walk of this tree holds no such entry at all: both spellings of a walked file have to
+    /// agree by role, and this one's do not. The direct call below is therefore the only way this
+    /// input reaches the procedure.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_source_target_under_a_linked_root_keeps_the_declared_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        write(&root.join("src/cf/Configuration.xml"), "<MetaDataObject/>");
+        write(&root.join("src/cf/Заметки.txt"), "не исходник");
+        let outside = dir.path().join("outside/Первое");
+        write(&outside.join("Configuration.xml"), "<MetaDataObject/>");
+        let link = root.join("src/cf/ext");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        // The alias of the extension is a `.bsl` NAME over a target under the configuration.
+        std::os::unix::fs::symlink(root.join("src/cf/Заметки.txt"), outside.join("Alias.bsl"))
+            .unwrap();
+        std::fs::write(
+            root.join("bsl-analyzer.toml"),
+            "[source]\nroot = \"src/cf\"\nextensions = [\"src/cf/ext\"]\n",
+        )
+        .unwrap();
+
+        let file = walked_file(&link.join("Alias.bsl"));
+        let roots = publisher_roots(&project_at(&root));
+        let ext_id = roots
+            .ids()
+            .find(|id| !id.is_empty())
+            .expect("the linked extension is registered")
+            .to_owned();
+
+        assert_eq!(
+            walked_file_key(&roots, &file),
+            Some(bsl_search::FileKey::new(ext_id, "Alias.bsl")),
+            "the extension that walked to the file owns the key it could have been indexed under"
+        );
+        assert_eq!(
+            roots.root_of(&file.walked, &file.canonical),
+            Some(bsl_search::FileKey::configuration("Заметки.txt")),
+            "control: the canonical-ranked answer hands the file to the configuration instead"
+        );
+        let walked = walked_paths(&root);
+        assert!(
+            walked.iter().all(|path| !path.ends_with("Alias.bsl")),
+            "control: the shared walk agrees the divergent entry belongs to no walk of either \
+             root; walked: {walked:?}",
+        );
+    }
+
+    /// Parity on the tree shape the two procedures were able to disagree about: a root declared
+    /// through a link, holding a `.bsl`-spelled link onto a non-source target. The shared walk
+    /// DROPS such a file — its two spellings do not share a role — so this also pins that the
+    /// publisher and the consumer agree about its absence, and about the real module of the
+    /// linked root, which is keyed from the target it resolves to.
+    #[cfg(unix)]
+    #[test]
+    fn the_published_keys_match_the_consumer_on_a_tree_with_a_linked_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let configuration = root.join("src/cf");
+        write(&configuration.join("Configuration.xml"), "<MetaDataObject/>");
+        write(&configuration.join("Настоящий/Module.bsl"), &module("Настоящий"));
+        write(&configuration.join("Заметки.txt"), "не исходник");
+        let outside = dir.path().join("outside/Первое");
+        write(&outside.join("Configuration.xml"), "<MetaDataObject/>");
+        write(&outside.join("CommonModules/Расш/Ext/Module.bsl"), &module("Расш"));
+        let link = configuration.join("ext");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        std::os::unix::fs::symlink(configuration.join("Заметки.txt"), outside.join("Alias.bsl"))
+            .unwrap();
+        std::fs::write(
+            root.join("bsl-analyzer.toml"),
+            "[source]\nroot = \"src/cf\"\nextensions = [\"src/cf/ext\"]\n",
+        )
+        .unwrap();
+
+        let published = published_keys(&root);
+
+        assert_eq!(
+            published,
+            consumed_keys(&root),
+            "the writer of the baseline and its reader must agree on what a file is called, \
+             including on the files the shared walk drops; published: {published:?}"
+        );
+        assert!(
+            published.contains(&(
+                std::fs::canonicalize(&outside).unwrap().to_string_lossy().into_owned(),
+                "CommonModules/Расш/Ext/Module.bsl".to_owned(),
+            )),
+            "the linked root's module is keyed by the target the link resolves to; \
+             published: {published:?}"
+        );
+        assert!(
+            published
+                .iter()
+                .all(|(_, path)| !path.ends_with("Заметки.txt") && !path.ends_with("Alias.bsl")),
+            "a key under the configuration for the extension's non-source target, or one under \
+             the link for it, is a row the walk can never rebuild; published: {published:?}"
         );
     }
 
@@ -393,11 +634,7 @@ mod tests {
         if std::fs::read_dir(&closed).is_ok() {
             return;
         }
-        std::fs::write(
-            root.join("bsl-analyzer.toml"),
-            "[source]\nroot = \"src/cf\"\nextensions = [\"src/cf/Вложенное\"]\n",
-        )
-        .unwrap();
+        write_source_config(&root, "src/cf", &[("Вложенное", "src/cf/Вложенное")]);
 
         let corpus = build_workspace_code(&project_at(&root)).unwrap();
 
@@ -424,11 +661,7 @@ mod tests {
         let nested = root.join("src/cf/Вложенное");
         write(&nested.join("Configuration.xml"), "<MetaDataObject/>");
         write(&nested.join("CommonModules/Вложенный/Ext/Module.bsl"), &module("Вложенный"));
-        std::fs::write(
-            root.join("bsl-analyzer.toml"),
-            "[source]\nroot = \"src/cf\"\nextensions = [\"src/cf/Вложенное\"]\n",
-        )
-        .unwrap();
+        write_source_config(&root, "src/cf", &[("Вложенное", "src/cf/Вложенное")]);
 
         let published = published_keys(&root);
 
@@ -461,14 +694,20 @@ mod tests {
         let root = dir.path().join("project");
         write(&root.join("src/cf/Configuration.xml"), "<MetaDataObject/>");
         write(&root.join("src/cf/CommonModules/Общий/Ext/Module.bsl"), &module("Общий"));
-        // The identifier is a lossy rendering of the path, so two names differing only in
-        // bytes no `str` can hold render identically. Discovered rather than declared,
-        // because a config entry is a `String` and could not spell them apart either.
-        for tail in [vec![b'a', 0x80], vec![b'a', 0x81]] {
+        // Structured declarations give both roots a Scope through UTF-8 symlinks. Their
+        // canonical target names differ only in bytes that the root ID cannot retain.
+        for (name, tail) in [("Первое", vec![b'a', 0x80]), ("Второе", vec![b'a', 0x81])]
+        {
             let extension = root.join("src/cfe").join(OsString::from_vec(tail));
             write(&extension.join("Configuration.xml"), "<MetaDataObject/>");
             write(&extension.join("CommonModules/Расш/Ext/Module.bsl"), &module("Расш"));
+            std::os::unix::fs::symlink(&extension, root.join("src/cfe").join(name)).unwrap();
         }
+        write_source_config(
+            &root,
+            "src/cf",
+            &[("Первое", "src/cfe/Первое"), ("Второе", "src/cfe/Второе")],
+        );
 
         let error = match build_workspace_code(&project_at(&root)) {
             Ok(corpus) => panic!(

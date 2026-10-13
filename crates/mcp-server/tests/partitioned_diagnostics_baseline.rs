@@ -99,7 +99,7 @@ async fn partitioned_baseline_uses_one_snapshot_for_file_workspace_error_and_rec
         "bsl-analyzer.toml",
         r#"[source]
 root = "src/cf"
-extensions = [{ name = "A", path = "src/cfe/A" }, { name = "B", path = "src/cfe/B" }]
+extensions = [{ name = "A", path = "src/cfe/A", scope = "InfoBase" }, { name = "B", path = "src/cfe/B", scope = "InfoBase" }]
 
 [diagnostics.baseline]
 directory = "baselines"

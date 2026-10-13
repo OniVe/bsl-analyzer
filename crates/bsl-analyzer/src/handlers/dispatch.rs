@@ -19,6 +19,11 @@ use crate::global_state::{
     RequestOriginGuard, Task,
 };
 
+/// Why a latency request is declined once the initial project was rejected: unlike a
+/// load in progress, nothing will open the gate before the server restarts.
+pub(crate) const PROJECT_REJECTED_MESSAGE: &str =
+    "project failed to load; fix the configuration and restart the server";
+
 pub struct RequestDispatcher<'a> {
     pub req: Option<Request>,
     pub global_state: &'a mut GlobalState,
@@ -28,6 +33,19 @@ pub struct RequestDispatcher<'a> {
 enum LatencyExecutor {
     TaskPool,
     DedicatedThread,
+}
+
+/// What a latency request gets while the initial workspace load is still streaming in.
+#[derive(Clone, Copy)]
+enum WhileLoading {
+    Decline,
+    /// Answer on the event-loop thread. Only for handlers that read nothing but the
+    /// requested file's own text and parse: those are exact against a half-loaded
+    /// workspace, and their cost is bounded by one file. Running inline, rather than on
+    /// the pool, means the db clone is gone before the loop applies the next streamed
+    /// VFS batch — so the batch's revision bump neither waits on the request nor
+    /// cancels it into a `RequestCanceled` the client would not retry.
+    AnswerInline,
 }
 
 #[cfg(test)]
@@ -165,7 +183,25 @@ impl RequestDispatcher<'_> {
         R::Params: DeserializeOwned + fmt::Debug + Send + 'static,
         R::Result: Serialize + Send + 'static,
     {
-        self.on_latency_with::<R>(f, LatencyExecutor::TaskPool, false)
+        self.on_latency_with::<R>(f, LatencyExecutor::TaskPool, WhileLoading::Decline, false)
+    }
+
+    /// Like [`Self::on_latency`], but for a request answered from the requested file's own
+    /// syntax tree (document outline, folding, selection ranges): such a request is
+    /// answered even while the workspace is loading instead of being declined, because
+    /// nothing it reads depends on the rest of the workspace. An editor asks for these
+    /// the moment a file is opened, and a decline there leaves the outline empty for the
+    /// whole load.
+    pub fn on_syntax_latency<R>(
+        &mut self,
+        f: fn(&LatencyRequestContext, R::Params) -> Result<R::Result>,
+    ) -> &mut Self
+    where
+        R: lsp_types::request::Request,
+        R::Params: DeserializeOwned + fmt::Debug + Send + 'static,
+        R::Result: Serialize + Send + 'static,
+    {
+        self.on_latency_with::<R>(f, LatencyExecutor::TaskPool, WhileLoading::AnswerInline, false)
     }
 
     pub fn on_retryable_latency<R>(
@@ -177,7 +213,7 @@ impl RequestDispatcher<'_> {
         R::Params: DeserializeOwned + fmt::Debug + Send + 'static,
         R::Result: Serialize + Send + 'static,
     {
-        self.on_latency_with::<R>(f, LatencyExecutor::TaskPool, true)
+        self.on_latency_with::<R>(f, LatencyExecutor::TaskPool, WhileLoading::Decline, true)
     }
 
     pub fn on_waiting_latency<R>(
@@ -189,13 +225,14 @@ impl RequestDispatcher<'_> {
         R::Params: DeserializeOwned + fmt::Debug + Send + 'static,
         R::Result: Serialize + Send + 'static,
     {
-        self.on_latency_with::<R>(f, LatencyExecutor::DedicatedThread, false)
+        self.on_latency_with::<R>(f, LatencyExecutor::DedicatedThread, WhileLoading::Decline, false)
     }
 
     fn on_latency_with<R>(
         &mut self,
         f: fn(&LatencyRequestContext, R::Params) -> Result<R::Result>,
         executor: LatencyExecutor,
+        while_loading: WhileLoading,
         retry_eligible: bool,
     ) -> &mut Self
     where
@@ -222,12 +259,37 @@ impl RequestDispatcher<'_> {
         // silently, and the vfs_done finalize replays diagnostics and requests
         // a semantic-tokens refresh, so nothing is permanently lost.
         if !self.global_state.vfs_done {
-            tracing::debug!(method = R::METHOD, id = ?req.id, "declining request: workspace loading");
-            self.global_state.respond(Response::new_err(
-                req.id,
-                ErrorCode::ContentModified as i32,
-                "workspace is still loading".to_string(),
-            ));
+            match while_loading {
+                WhileLoading::Decline => {
+                    tracing::debug!(
+                        method = R::METHOD,
+                        id = ?req.id,
+                        "declining request: workspace loading"
+                    );
+                    let message = if self.global_state.project_rejected {
+                        PROJECT_REJECTED_MESSAGE
+                    } else {
+                        "workspace is still loading"
+                    };
+                    self.global_state.respond(Response::new_err(
+                        req.id,
+                        ErrorCode::ContentModified as i32,
+                        message.to_string(),
+                    ));
+                }
+                WhileLoading::AnswerInline => {
+                    tracing::debug!(
+                        method = R::METHOD,
+                        id = ?req.id,
+                        "answering syntax request inline: workspace loading"
+                    );
+                    // No cancellation token is registered: a `$/cancelRequest` is read by
+                    // this same loop, so it cannot arrive while the handler runs.
+                    let (ctx, _token) = self.latency_context();
+                    let response = run_latency_handler::<R>(req.id, ctx, params, f);
+                    self.global_state.respond(response);
+                }
+            }
             return self;
         }
 
@@ -297,36 +359,9 @@ impl RequestDispatcher<'_> {
             RequestAttemptKey { id: req.id.clone(), generation, attempt: 1 }
         };
 
-        let db = self.global_state.analysis_host.raw_database().clone();
-        let token = db.cancellation_token();
-        let analysis = ide::Analysis::from_database(db);
+        let (ctx, token) = self.latency_context();
         self.global_state.request_token_owners.insert(req.id.clone(), key.clone());
         self.global_state.request_tokens.insert(req.id.clone(), token);
-
-        let ctx = LatencyRequestContext {
-            analysis,
-            workspace_root: self.global_state.workspace_root.clone(),
-            project: self.global_state.project.clone(),
-            diagnostics_baseline: Arc::clone(&self.global_state.diagnostics_baseline),
-            diagnostics_config: self.global_state.diagnostics_config().clone(),
-            position_encoding: self.global_state.position_encoding,
-            supports_code_description: self.global_state.supports_code_description,
-            supports_diagnostic_tags: self.global_state.supports_diagnostic_tags,
-            supports_insert_text_mode_adjust_indentation: self
-                .global_state
-                .supports_insert_text_mode_adjust_indentation,
-            supports_workspace_edit_document_changes: self
-                .global_state
-                .supports_workspace_edit_document_changes,
-            folding_range_limit: self.global_state.folding_range_limit,
-            task_sender: self.global_state.task_pool.pool.sender.clone(),
-            call_hierarchy_index: self.global_state.call_hierarchy_index.ensure(),
-            call_hierarchy_wait_policy: self.global_state.call_hierarchy_wait_policy,
-            client_sender: self.global_state.sender.clone(),
-            mem_docs: self.global_state.mem_docs.freeze(),
-            file_paths: FrozenFilePaths::freeze(&self.global_state.vfs.read()),
-            scope_dirty_docs: self.global_state.scope_dirty_docs.clone(),
-        };
 
         let job_key = key.clone();
         match executor {
@@ -354,6 +389,37 @@ impl RequestDispatcher<'_> {
             }
         }
         self
+    }
+
+    /// A frozen view of the server for one latency handler, with the token that cancels
+    /// the queries it runs.
+    fn latency_context(&self) -> (LatencyRequestContext, salsa::CancellationToken) {
+        let state = &*self.global_state;
+        let db = state.analysis_host.raw_database().clone();
+        let token = db.cancellation_token();
+        let ctx = LatencyRequestContext {
+            analysis: ide::Analysis::from_database(db),
+            workspace_root: state.workspace_root.clone(),
+            project: state.project.clone(),
+            diagnostics_baseline: Arc::clone(&state.diagnostics_baseline),
+            diagnostics_config: state.diagnostics_config().clone(),
+            position_encoding: state.position_encoding,
+            supports_code_description: state.supports_code_description,
+            supports_diagnostic_tags: state.supports_diagnostic_tags,
+            supports_insert_text_mode_adjust_indentation: state
+                .supports_insert_text_mode_adjust_indentation,
+            supports_workspace_edit_document_changes: state
+                .supports_workspace_edit_document_changes,
+            folding_range_limit: state.folding_range_limit,
+            task_sender: state.task_pool.pool.sender.clone(),
+            call_hierarchy_index: state.call_hierarchy_index.ensure(),
+            call_hierarchy_wait_policy: state.call_hierarchy_wait_policy,
+            client_sender: state.sender.clone(),
+            mem_docs: state.mem_docs.freeze(),
+            file_paths: FrozenFilePaths::freeze(&state.vfs.read()),
+            scope_dirty_docs: state.scope_dirty_docs.clone(),
+        };
+        (ctx, token)
     }
 
     fn reject_latency_launch<R>(&mut self, key: &RequestAttemptKey, error: impl fmt::Debug)
@@ -512,7 +578,6 @@ where
     }
 }
 
-#[cfg(test)]
 fn run_latency_handler<R>(
     id: lsp_server::RequestId,
     ctx: LatencyRequestContext,
@@ -592,12 +657,19 @@ where
 
     match catch_unwind(AssertUnwindSafe(run)) {
         Ok(outcome) => outcome,
-        Err(_) => {
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&'static str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic>".to_string());
             tracing::error!(
                 request_id = ?key.id,
                 method = R::METHOD,
                 attempt = key.attempt,
                 revision = ?revision,
+                panic = %msg,
+                backtrace = %std::backtrace::Backtrace::force_capture(),
                 "async LSP handler panicked"
             );
             LatencyAttemptOutcome::Response(Response::new_err(

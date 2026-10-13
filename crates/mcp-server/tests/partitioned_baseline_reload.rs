@@ -17,7 +17,7 @@ fn partitioned_baseline_reload_reuses_unchanged_arcs_and_observes_every_object()
     }
     let config: project_model::ProjectConfig = serde_json::from_value(serde_json::json!({
         "configurationRoot": "src/cf",
-        "extensions": [{"name": "Ext", "path": "src/cfe/Ext"}],
+        "extensions": [{"name": "Ext", "path": "src/cfe/Ext", "scope": "InfoBase"}],
         "diagnostics": {"baseline": {"directory": "baselines"}}
     }))
     .unwrap();

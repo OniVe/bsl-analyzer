@@ -1,6 +1,15 @@
 use serde::{Deserialize, Serialize};
 use stdx::case::CaseExt;
 
+/// The declared installation scope of a configuration extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ExtensionScope {
+    /// The extension applies to the whole infobase.
+    InfoBase,
+    /// The extension applies to an individual data area.
+    DataSeparation,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum ReturnValueReuse {
     #[serde(rename = "DontUse")]

@@ -10,9 +10,8 @@ use clap::{Args, Subcommand, ValueEnum};
 use ide::diagnostics_baseline::{
     classify_diagnostics, diagnostics_baseline_json, is_protected_diagnostic,
     parse_diagnostics_baseline, BaselineDiagnosticCandidate, DiagnosticsBaseline,
-    DiagnosticsBaselineCoverage, DiagnosticsBaselineEntry, DiagnosticsBaselineExtension,
-    DiagnosticsBaselineRange, DiagnosticsBaselineScope, DiagnosticsBaselineSummary,
-    DIAGNOSTICS_BASELINE_SCHEMA_VERSION,
+    DiagnosticsBaselineCoverage, DiagnosticsBaselineEntry, DiagnosticsBaselineRange,
+    DiagnosticsBaselineScope, DiagnosticsBaselineSummary, DIAGNOSTICS_BASELINE_SCHEMA_VERSION,
 };
 use ide::partitioned_diagnostics_baseline::{
     classify_partitioned_diagnostics, diagnostics_manifest, diagnostics_manifest_json,
@@ -1079,16 +1078,7 @@ fn scope_from_plan(
 ) -> DiagnosticsBaselineScope {
     DiagnosticsBaselineScope {
         source_root: plan.project_scope.source_root.clone(),
-        extensions: plan
-            .project_scope
-            .extensions
-            .iter()
-            .map(|extension| DiagnosticsBaselineExtension {
-                name: extension.name.clone(),
-                path: extension.path.clone(),
-                depends_on: extension.depends_on.clone(),
-            })
-            .collect(),
+        extensions: plan.project_scope.extensions.clone(),
     }
 }
 
@@ -1195,15 +1185,7 @@ fn operation_from_classified<T>(
 fn scope(scope: &project_model::DiagnosticsBaselineProjectScope) -> DiagnosticsBaselineScope {
     DiagnosticsBaselineScope {
         source_root: scope.source_root.clone(),
-        extensions: scope
-            .extensions
-            .iter()
-            .map(|extension| DiagnosticsBaselineExtension {
-                name: extension.name.clone(),
-                path: extension.path.clone(),
-                depends_on: extension.depends_on.clone(),
-            })
-            .collect(),
+        extensions: scope.extensions.clone(),
     }
 }
 

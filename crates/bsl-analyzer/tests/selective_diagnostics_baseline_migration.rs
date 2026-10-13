@@ -50,7 +50,7 @@ fn write_config(root: &Path, partitioned: bool) {
         format!(
             r#"[source]
 root = "src/cf"
-extensions = [{{ name = "Ext", path = "src/cfe/Ext" }}]
+extensions = [{{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }}]
 
 [diagnostics.baseline]
 {baseline}
@@ -267,7 +267,11 @@ fn selective_v1_migration_tracks_uniqueness_only_for_enabled_entries() {
 fn selective_existing_full_manifest_needs_no_file_migration() {
     let temp = setup();
     let root = temp.path();
-    write_partitioned_config(root, r#"{ name = "Ext", path = "src/cfe/Ext" }"#, None);
+    write_partitioned_config(
+        root,
+        r#"{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }"#,
+        None,
+    );
     assert!(run(root, &["diagnostics", "baseline", "create", "-s", "."]).status.success());
     let before: serde_json::Value =
         serde_json::from_slice(&fs::read(root.join("baselines/manifest.json")).unwrap()).unwrap();
@@ -280,7 +284,11 @@ fn selective_existing_full_manifest_needs_no_file_migration() {
         .clone();
     let dormant_path = root.join("baselines").join(dormant["file"].as_str().unwrap());
     fs::write(&dormant_path, b"corrupt but dormant").unwrap();
-    write_partitioned_config(root, r#"{ name = "Ext", path = "src/cfe/Ext" }"#, Some(&["main"]));
+    write_partitioned_config(
+        root,
+        r#"{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }"#,
+        Some(&["main"]),
+    );
 
     assert!(run(root, &["diagnostics", "baseline", "check", "-s", "."]).status.success());
     assert!(run(root, &["diagnostics", "baseline", "update", "-s", "."]).status.success());
@@ -302,7 +310,11 @@ fn selective_existing_full_manifest_needs_no_file_migration() {
 fn selective_full_update_reconciles_topology_and_prunes_dormant_metadata() {
     let temp = setup();
     let root = temp.path();
-    write_partitioned_config(root, r#"{ name = "Ext", path = "src/cfe/Ext" }"#, None);
+    write_partitioned_config(
+        root,
+        r#"{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }"#,
+        None,
+    );
     assert!(run(root, &["diagnostics", "baseline", "create", "-s", "."]).status.success());
     let before = fs::read(root.join("baselines/manifest.json")).unwrap();
     let old: serde_json::Value = serde_json::from_slice(&before).unwrap();
@@ -320,7 +332,7 @@ fn selective_full_update_reconciles_topology_and_prunes_dormant_metadata() {
     fs::write(root.join("src/cfe/NewExt/New.bsl"), BROKEN).unwrap();
     write_partitioned_config(
         root,
-        r#"{ name = "Ext", path = "src/cfe/Ext" }, { name = "NewExt", path = "src/cfe/NewExt" }"#,
+        r#"{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }, { name = "NewExt", path = "src/cfe/NewExt", scope = "InfoBase" }"#,
         Some(&["main", "extension:NewExt"]),
     );
 
@@ -349,11 +361,15 @@ fn selective_full_update_reconciles_topology_and_prunes_dormant_metadata() {
 fn selective_reenable_is_fail_closed_until_explicit_creation_or_repair() {
     let temp = setup();
     let root = temp.path();
-    write_partitioned_config(root, r#"{ name = "Ext", path = "src/cfe/Ext" }"#, Some(&["main"]));
+    write_partitioned_config(
+        root,
+        r#"{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }"#,
+        Some(&["main"]),
+    );
     assert!(run(root, &["diagnostics", "baseline", "create", "-s", "."]).status.success());
     write_partitioned_config(
         root,
-        r#"{ name = "Ext", path = "src/cfe/Ext" }"#,
+        r#"{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }"#,
         Some(&["main", "extension:Ext"]),
     );
     assert!(!run(root, &["diagnostics", "baseline", "check", "-s", "."]).status.success());
@@ -366,7 +382,11 @@ fn selective_reenable_is_fail_closed_until_explicit_creation_or_repair() {
 
     let temp = setup();
     let root = temp.path();
-    write_partitioned_config(root, r#"{ name = "Ext", path = "src/cfe/Ext" }"#, None);
+    write_partitioned_config(
+        root,
+        r#"{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }"#,
+        None,
+    );
     assert!(run(root, &["diagnostics", "baseline", "create", "-s", "."]).status.success());
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(root.join("baselines/manifest.json")).unwrap()).unwrap();
@@ -380,7 +400,7 @@ fn selective_reenable_is_fail_closed_until_explicit_creation_or_repair() {
     fs::write(&object, b"corrupt").unwrap();
     write_partitioned_config(
         root,
-        r#"{ name = "Ext", path = "src/cfe/Ext" }"#,
+        r#"{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }"#,
         Some(&["main", "extension:Ext"]),
     );
     assert!(!run(root, &["diagnostics", "baseline", "check", "-s", "."]).status.success());

@@ -20,19 +20,20 @@ fn write(root: &Path, relative: &str, contents: &str) {
 
 fn config(root: &Path, include: &[&str]) {
     let include = include.iter().map(|id| format!(r#""{id}""#)).collect::<Vec<_>>().join(", ");
-    write(
-        root,
-        "bsl-analyzer.toml",
-        &format!(
-            r#"[source]
+    // The scope guard must not see truncated TOML as a different source composition.
+    let mut replacement = tempfile::NamedTempFile::new_in(root).unwrap();
+    write!(
+        replacement,
+        r#"[source]
 root = "src/cf"
-extensions = [{{ name = "Ext", path = "src/cfe/Ext" }}]
+extensions = [{{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }}]
 [diagnostics.baseline]
 directory = "baselines"
 include = [{include}]
 "#
-        ),
-    );
+    )
+    .unwrap();
+    replacement.persist(root.join("bsl-analyzer.toml")).unwrap();
 }
 
 fn setup() -> tempfile::TempDir {

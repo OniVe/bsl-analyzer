@@ -154,7 +154,7 @@ fn setup_catalog() -> RootDatabaseImpl {
              Возврат Истина;\n\
          КонецФункции\n",
     );
-    db.set_all_config_paths(vec![(None, designer.clone())]);
+    db.set_all_config_paths(vec![(None, designer.clone())], None);
     db.set_metadata_listing(
         &designer.to_string_lossy(),
         MetadataListingData {
@@ -193,7 +193,7 @@ fn setup_register() -> RootDatabaseImpl {
     db.set_file_source_root(xml, SourceRootId(0));
     db.set_file_text(bsl, "Процедура Тест()\nКонецПроцедуры\n");
     db.set_file_text(xml, REGISTER_XML);
-    db.set_all_config_paths(vec![(None, designer.clone())]);
+    db.set_all_config_paths(vec![(None, designer.clone())], None);
     db.set_metadata_listing(
         &designer.to_string_lossy(),
         MetadataListingData {
@@ -270,13 +270,13 @@ fn setup_forms_with_extension(extension_module: Option<&str>) -> RootDatabaseImp
     db.set_file_text(report_xml, REPORT_XML);
     if let Some(module) = extension_module {
         db.set_file_text(extension_form, module);
-        db.set_all_config_paths(vec![
-            (None, designer.clone()),
-            (Some("Расширение".to_string()), extension.clone()),
-        ]);
+        db.set_all_config_paths(
+            vec![(None, designer.clone()), (Some("Расширение".to_string()), extension.clone())],
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+        );
         db.set_metadata_listing(&extension.to_string_lossy(), empty_listing_data());
     } else {
-        db.set_all_config_paths(vec![(None, designer.clone())]);
+        db.set_all_config_paths(vec![(None, designer.clone())], None);
     }
     db.set_metadata_listing(
         &designer.to_string_lossy(),
@@ -344,6 +344,10 @@ fn setup_applied_visibility() -> RootDatabaseImpl {
     ];
     let mut db = RootDatabaseImpl::new();
     db.set_workspace_configs_snapshot(WorkspaceConfigsSnapshot {
+        extension_scopes: paths
+            .iter()
+            .map(|(label, _)| label.as_ref().map(|_| bsl_metadata::ExtensionScope::InfoBase))
+            .collect(),
         kinds: ide_db::metadata::RootKind::from_labels(&paths),
         canonical_paths: paths.iter().map(|(_, path)| path.clone()).collect(),
         paths,
@@ -415,6 +419,10 @@ fn setup_form_resolution_visibility() -> (RootDatabaseImpl, PathBuf) {
     ];
     let mut db = RootDatabaseImpl::new();
     db.set_workspace_configs_snapshot(WorkspaceConfigsSnapshot {
+        extension_scopes: paths
+            .iter()
+            .map(|(label, _)| label.as_ref().map(|_| bsl_metadata::ExtensionScope::InfoBase))
+            .collect(),
         kinds: ide_db::metadata::RootKind::from_labels(&paths),
         canonical_paths: paths.iter().map(|(_, path)| path.clone()).collect(),
         paths,

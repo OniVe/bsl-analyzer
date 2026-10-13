@@ -58,7 +58,7 @@ async fn partitioned_baseline_cli_mcp_lsp_parity() {
         root.join("bsl-analyzer.toml"),
         r#"[source]
 root = "src/cf"
-extensions = [{ name = "Ext", path = "src/cfe/Ext" }]
+extensions = [{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }]
 [diagnostics.baseline]
 directory = "baselines"
 "#,

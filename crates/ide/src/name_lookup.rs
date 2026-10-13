@@ -1446,7 +1446,7 @@ mod tests {
         db.set_file_text(file_id, "<MetaDataObject/>");
 
         let root_path = std::path::PathBuf::from(root);
-        db.set_all_config_paths(vec![(None, root_path.clone())]);
+        db.set_all_config_paths(vec![(None, root_path.clone())], None);
         db.set_metadata_listing(
             &root_path.to_string_lossy(),
             MetadataListingData {
@@ -1622,7 +1622,7 @@ mod tests {
         let mut db = build(&modules);
 
         let root = std::path::PathBuf::from("/ws");
-        db.set_all_config_paths(vec![(None, root.clone())]);
+        db.set_all_config_paths(vec![(None, root.clone())], None);
         db.set_metadata_listing(
             &root.to_string_lossy(),
             MetadataListingData {
@@ -1656,10 +1656,13 @@ mod tests {
 
         let base_root = std::path::PathBuf::from("/ws/src/cf");
         let extension_root = std::path::PathBuf::from("/ws/src/cfe");
-        db.set_all_config_paths(vec![
-            (None, base_root.clone()),
-            (Some("Расширение".to_string()), extension_root.clone()),
-        ]);
+        db.set_all_config_paths(
+            vec![
+                (None, base_root.clone()),
+                (Some("Расширение".to_string()), extension_root.clone()),
+            ],
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+        );
         for (root, file_id) in [(&base_root, FileId(0)), (&extension_root, FileId(1))] {
             db.set_metadata_listing(
                 &root.to_string_lossy(),
@@ -2108,10 +2111,13 @@ mod tests {
         let mut db = db_with_files(&[(base, body), (extension, body)]);
         let base_root = std::path::PathBuf::from("/ws/src/cf");
         let extension_root = std::path::PathBuf::from("/ws/src/cfe");
-        db.set_all_config_paths(vec![
-            (None, base_root.clone()),
-            (Some("Расширение".to_string()), extension_root.clone()),
-        ]);
+        db.set_all_config_paths(
+            vec![
+                (None, base_root.clone()),
+                (Some("Расширение".to_string()), extension_root.clone()),
+            ],
+            Some(bsl_metadata::ExtensionScope::InfoBase),
+        );
         for (root, file_id) in [(&base_root, FileId(0)), (&extension_root, FileId(1))] {
             db.set_metadata_listing(
                 &root.to_string_lossy(),

@@ -30,7 +30,7 @@ fn setup(fixture_text: &str) -> (RootDatabaseImpl, FileId) {
         db.set_file_source_root(*file_id, SourceRootId(0));
         db.set_file_text(*file_id, &file.content);
     }
-    db.set_all_config_paths(vec![(None, designer_fixture_path())]);
+    db.set_all_config_paths(vec![(None, designer_fixture_path())], None);
     let test_file = fixture
         .files
         .iter()
@@ -284,7 +284,7 @@ fn a_global_export_named_max_is_not_narrowed() {
         db.set_file_source_root(id, SourceRootId(0));
         db.set_file_text(id, text);
     }
-    db.set_all_config_paths(vec![(None, designer_fixture_path())]);
+    db.set_all_config_paths(vec![(None, designer_fixture_path())], None);
 
     let ty = local_ty(&db, caller_id, "результат");
     assert!(

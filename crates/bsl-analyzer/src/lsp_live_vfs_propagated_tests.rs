@@ -721,6 +721,8 @@ fn g1_propagated_cancellation_from_real_query_panic_is_terminal_internal_error()
 #[test]
 fn g1_propagated_without_new_revision_is_refused_controller_control() {
     g1_with_tracing(|| {
+        let _panic_guard = crate::panic_watch::panic_test_guard();
+        crate::panic_watch::reset_for_test();
         let (_dir, mut state, client_receiver, _changed, caller_uri, _control) =
             live_definition_fixture();
         let task_receiver = state.task_pool.receiver.clone();

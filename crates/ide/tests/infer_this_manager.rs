@@ -29,7 +29,7 @@ fn setup_at(path: PathBuf, text: &str) -> (RootDatabaseImpl, FileId) {
     db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
     db.set_file_source_root(file_id, SourceRootId(0));
     db.set_file_text(file_id, text);
-    db.set_all_config_paths(vec![(None, designer_fixture_path())]);
+    db.set_all_config_paths(vec![(None, designer_fixture_path())], None);
     (db, file_id)
 }
 

@@ -42,7 +42,7 @@
 			</Content>
 			<AutoUse>Use</AutoUse>
 			<DataSeparation>Separate</DataSeparation>
-			<SeparatedDataUse>Independently</SeparatedDataUse>
+			<SeparatedDataUse>IndependentlyAndSimultaneously</SeparatedDataUse>
 			<DataSeparationValue/>
 			<DataSeparationUse/>
 			<ConditionalSeparation/>

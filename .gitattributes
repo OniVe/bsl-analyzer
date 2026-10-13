@@ -4,3 +4,5 @@ crates/bsl-platform/data/platform_data.json -diff
 # The built-in interface facts are regenerated as a whole by
 # scripts/strip-help-corpus-texts.py; an 11 MB line-by-line diff says nothing.
 crates/bsl-platform/data/platform_facts.json -diff
+# Preserve byte-for-byte Designer XML exports, including CRLF, across checkouts.
+crates/bsl-metadata/fixtures/extension_common_attributes/**/*.xml -text whitespace=trailing-space,space-before-tab,cr-at-eol

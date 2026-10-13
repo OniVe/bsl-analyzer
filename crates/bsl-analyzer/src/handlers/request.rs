@@ -1694,13 +1694,13 @@ fn g1_wait_at_workspace_diagnostic_chunk(
         .as_ref()
         .filter(|gate| gate.token == *token && gate.after_files == done)
         .cloned();
+    // A test that already gave up must not turn into a panic here: this runs with the
+    // database attached, so panic_watch would stamp it and flip the verdict of every
+    // propagated-cancellation test running alongside.
     if let Some(gate) = gate {
-        gate.entered
-            .send((done, emitted_items))
-            .expect("test waits for the real partial-result chunk");
-        gate.release
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("test releases the handler after the VFS writer starts");
+        if gate.entered.send((done, emitted_items)).is_ok() {
+            let _ = gate.release.recv_timeout(std::time::Duration::from_secs(60));
+        }
     }
 }
 
@@ -4049,7 +4049,7 @@ mod tests {
 
         {
             let db = state.analysis_host.raw_database_mut();
-            db.set_all_config_paths(vec![(None, tmp.path().to_path_buf())]);
+            db.set_all_config_paths(vec![(None, tmp.path().to_path_buf())], None);
             db.set_metadata_listing(
                 &tmp.path().to_string_lossy(),
                 ide_db::metadata::MetadataListingData {
