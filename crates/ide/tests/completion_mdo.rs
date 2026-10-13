@@ -31,7 +31,7 @@ fn setup_with_config_path(fixture_text: &str, config_path: &Path) -> (Analysis, 
         db.set_file_text(*file_id, &file.content);
     }
 
-    db.set_all_config_paths(vec![(None, config_path.to_path_buf())]);
+    db.set_all_config_paths(vec![(None, config_path.to_path_buf())], None);
 
     let test_file = fixture
         .files

@@ -264,8 +264,8 @@ pub(super) fn write_extension_config(root: &Path, depends_on: bool) {
         root.join("bsl-analyzer.toml"),
         format!(
             "[source]\nroot = \".\"\nextensions = [\n  \
-             {{ name = \"a\", path = \"ext/a\" }},\n  \
-             {{ name = \"b\", path = \"ext/b\"{deps} }},\n]\n"
+             {{ name = \"a\", path = \"ext/a\", scope = \"InfoBase\" }},\n  \
+             {{ name = \"b\", path = \"ext/b\", scope = \"InfoBase\"{deps} }},\n]\n"
         ),
     )
     .unwrap();

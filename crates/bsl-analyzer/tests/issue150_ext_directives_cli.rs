@@ -74,7 +74,7 @@ fn run(source: &str) -> Vec<(String, String)> {
         r#"[source]
 root = "cf"
 extensions = [
-  { name = "Repro", path = "cfe/Repro" },
+  { name = "Repro", path = "cfe/Repro", scope = "InfoBase" },
 ]
 
 [diagnostics.parameters]

@@ -38,7 +38,7 @@ fn setup_with_configs(
         db.set_file_text(*file_id, &file.content);
     }
 
-    db.set_all_config_paths(config_paths);
+    db.set_all_config_paths(config_paths, Some(bsl_metadata::ExtensionScope::InfoBase));
 
     let test_file = fixture
         .files

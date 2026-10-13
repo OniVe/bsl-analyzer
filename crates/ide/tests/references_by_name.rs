@@ -468,7 +468,7 @@ fn db_with_catalog() -> RootDatabaseImpl {
     db.set_file_source_root(xml, SourceRootId(0));
     db.set_file_text(module, SALES);
     db.set_file_text(xml, CATALOG_XML);
-    db.set_all_config_paths(vec![(None, designer.clone())]);
+    db.set_all_config_paths(vec![(None, designer.clone())], None);
     db.set_metadata_listing(
         &designer.to_string_lossy(),
         MetadataListingData {
@@ -524,7 +524,7 @@ fn the_type_of_an_implicit_local_follows_the_occurrence() {
     db.set_file_text(module, TWO_METADATA_WRITES);
     db.set_file_text(catalog_xml, CATALOG_XML);
     db.set_file_text(document_xml, DOCUMENT_XML);
-    db.set_all_config_paths(vec![(None, designer.clone())]);
+    db.set_all_config_paths(vec![(None, designer.clone())], None);
     db.set_metadata_listing(
         &designer.to_string_lossy(),
         MetadataListingData {
@@ -812,6 +812,10 @@ fn references_follow_the_declared_dependency_matrix() {
     let canonical_paths =
         paths.iter().map(|(_, p)| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone())).collect();
     db.set_workspace_configs_snapshot(ide_db::metadata::WorkspaceConfigsSnapshot {
+        extension_scopes: paths
+            .iter()
+            .map(|(label, _)| label.as_ref().map(|_| bsl_metadata::ExtensionScope::InfoBase))
+            .collect(),
         kinds: ide_db::metadata::RootKind::from_labels(&paths),
         paths,
         canonical_paths,
@@ -910,6 +914,10 @@ fn manager_module_references_follow_the_declared_dependency_matrix() {
     let canonical_paths =
         paths.iter().map(|(_, p)| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone())).collect();
     db.set_workspace_configs_snapshot(ide_db::metadata::WorkspaceConfigsSnapshot {
+        extension_scopes: paths
+            .iter()
+            .map(|(label, _)| label.as_ref().map(|_| bsl_metadata::ExtensionScope::InfoBase))
+            .collect(),
         kinds: ide_db::metadata::RootKind::from_labels(&paths),
         paths,
         canonical_paths,
@@ -999,6 +1007,10 @@ fn object_module_references_follow_the_declared_dependency_matrix() {
     let canonical_paths =
         paths.iter().map(|(_, p)| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone())).collect();
     db.set_workspace_configs_snapshot(ide_db::metadata::WorkspaceConfigsSnapshot {
+        extension_scopes: paths
+            .iter()
+            .map(|(label, _)| label.as_ref().map(|_| bsl_metadata::ExtensionScope::InfoBase))
+            .collect(),
         kinds: ide_db::metadata::RootKind::from_labels(&paths),
         paths,
         canonical_paths,
@@ -1102,6 +1114,10 @@ fn record_set_module_references_follow_the_declared_dependency_matrix() {
     let canonical_paths =
         paths.iter().map(|(_, p)| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone())).collect();
     db.set_workspace_configs_snapshot(ide_db::metadata::WorkspaceConfigsSnapshot {
+        extension_scopes: paths
+            .iter()
+            .map(|(label, _)| label.as_ref().map(|_| bsl_metadata::ExtensionScope::InfoBase))
+            .collect(),
         kinds: ide_db::metadata::RootKind::from_labels(&paths),
         paths,
         canonical_paths,
@@ -1190,6 +1206,10 @@ fn adopter_first_input() -> (RootDatabaseImpl, FileId, FileId, FileId) {
     let canonical_paths =
         paths.iter().map(|(_, p)| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone())).collect();
     db.set_workspace_configs_snapshot(ide_db::metadata::WorkspaceConfigsSnapshot {
+        extension_scopes: paths
+            .iter()
+            .map(|(label, _)| label.as_ref().map(|_| bsl_metadata::ExtensionScope::InfoBase))
+            .collect(),
         kinds: ide_db::metadata::RootKind::from_labels(&paths),
         paths,
         canonical_paths,
@@ -1291,7 +1311,7 @@ fn a_form_module_method_is_a_working_anchor() {
         db.set_file_source_root(file_id, SourceRootId(0));
         db.set_file_text(file_id, text);
     }
-    db.set_all_config_paths(vec![(None, designer.clone())]);
+    db.set_all_config_paths(vec![(None, designer.clone())], None);
     db.set_metadata_listing(
         &designer.to_string_lossy(),
         MetadataListingData {
@@ -1356,7 +1376,7 @@ fn an_attribute_outranks_a_module_method_of_the_same_name() {
         "Процедура Реквизит1() Экспорт\nКонецПроцедуры\n\nПроцедура Пересчитать() Экспорт\nКонецПроцедуры\n",
     );
     db.set_file_text(xml, CATALOG_XML);
-    db.set_all_config_paths(vec![(None, designer.clone())]);
+    db.set_all_config_paths(vec![(None, designer.clone())], None);
     db.set_metadata_listing(
         &designer.to_string_lossy(),
         MetadataListingData {
@@ -1424,7 +1444,7 @@ fn a_form_attribute_outranks_a_form_module_method_of_the_same_name() {
         "Процедура Объект()\nКонецПроцедуры\n\nПроцедура ПриЗаписиНаСервере()\nКонецПроцедуры\n",
     );
     db.set_file_text(xml, DOCUMENT_XML);
-    db.set_all_config_paths(vec![(None, designer.clone())]);
+    db.set_all_config_paths(vec![(None, designer.clone())], None);
     db.set_metadata_listing(
         &designer.to_string_lossy(),
         MetadataListingData {

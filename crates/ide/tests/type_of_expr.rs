@@ -28,13 +28,16 @@ fn setup(fixture_text: &str) -> (RootDatabaseImpl, FileId) {
 
 fn setup_with_designer(fixture_text: &str) -> (RootDatabaseImpl, FileId) {
     let (mut db, file_id) = setup(fixture_text);
-    db.set_all_config_paths(vec![(
+    db.set_all_config_paths(
+        vec![(
+            None,
+            std::path::PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../bsl-metadata/fixtures/designer"
+            )),
+        )],
         None,
-        std::path::PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../bsl-metadata/fixtures/designer"
-        )),
-    )]);
+    );
     (db, file_id)
 }
 

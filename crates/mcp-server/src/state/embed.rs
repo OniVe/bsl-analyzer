@@ -2206,7 +2206,7 @@ mod tests {
             "Процедура Расширение() Экспорт\nКонецПроцедуры",
         );
         let config = if include_extension {
-            "[source]\nroot = \"cf\"\nextensions = [{ name = \"live\", path = \"ext/live\" }]\n"
+            "[source]\nroot = \"cf\"\nextensions = [{ name = \"live\", path = \"ext/live\", scope = \"InfoBase\" }]\n"
         } else {
             "[source]\nroot = \"cf\"\nextensions = []\n"
         };

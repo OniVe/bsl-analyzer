@@ -40,10 +40,13 @@ fn setup_main_plus_cfe() -> (RootDatabaseImpl, FileId, FileId) {
         db.set_file_text(file_id, "Процедура Тест() КонецПроцедуры");
     }
 
-    db.set_all_config_paths(vec![
-        (None, designer_fixture_path()),
-        (Some("РасширениеОбщегоМодуля".to_string()), extension_common_module_path()),
-    ]);
+    db.set_all_config_paths(
+        vec![
+            (None, designer_fixture_path()),
+            (Some("РасширениеОбщегоМодуля".to_string()), extension_common_module_path()),
+        ],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
     (db, base_file, ext_file)
 }
 

@@ -26,7 +26,7 @@ fn setup_form_module(disk_path: PathBuf, bsl: &str, cursor: u32) -> (Analysis, F
     db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
     db.set_file_source_root(file_id, SourceRootId(0));
     db.set_file_text(file_id, bsl);
-    db.set_all_config_paths(vec![(None, designer_fixture_path())]);
+    db.set_all_config_paths(vec![(None, designer_fixture_path())], None);
     (Analysis::from_database(db), file_id, cursor)
 }
 

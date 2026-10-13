@@ -51,7 +51,7 @@ fn setup_at(relative: &str, text: &str) -> (RootDatabaseImpl, FileId) {
         db.set_file_source_root(global_id, SourceRootId(0));
         db.set_file_text(global_id, &global_text);
     }
-    db.set_all_config_paths(vec![(None, designer_fixture_path())]);
+    db.set_all_config_paths(vec![(None, designer_fixture_path())], None);
     (db, file_id)
 }
 

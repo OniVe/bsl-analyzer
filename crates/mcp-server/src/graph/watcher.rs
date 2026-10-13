@@ -1245,22 +1245,40 @@ mod tests {
             "a declared extension's descriptor must force a reload",
         );
 
-        // Discovered extensions, including one that appears while the watcher runs.
-        let discovered = tempfile::tempdir().unwrap();
-        let root = discovered.path();
+        // A declared scoped extension's descriptor is part of this project's topology.
+        let scoped = tempfile::tempdir().unwrap();
+        let root = scoped.path();
         sample_workspace(root);
         write(root, "Configuration.xml", "<Configuration/>");
         write(root, "cfe/Existing/Configuration.xml", "<Configuration/>");
+        write(
+            root,
+            "bsl-analyzer.toml",
+            "[source]\nroot = \".\"\nextensions = [{ name = \"Existing\", path = \"cfe/Existing\", scope = \"InfoBase\" }]\n",
+        );
         assert!(
             delivery_forces_a_reload(root, "cfe/Existing/Configuration.xml", || {}),
-            "a discovered extension's descriptor must force a reload",
+            "a scoped extension's descriptor must force a reload",
         );
+
+        // A new extension enters the project only when its valid scoped declaration is
+        // written alongside its descriptor; the descriptor event observes the new roots.
+        let appearing = tempfile::tempdir().unwrap();
+        let root = appearing.path();
+        sample_workspace(root);
+        write(root, "Configuration.xml", "<Configuration/>");
+        write(root, "bsl-analyzer.toml", "[source]\nroot = \".\"\nextensions = []\n");
         let appearing = root.to_path_buf();
         assert!(
             delivery_forces_a_reload(root, "cfe/New/Configuration.xml", move || {
                 write(&appearing, "cfe/New/Configuration.xml", "<Configuration/>");
+                write(
+                    &appearing,
+                    "bsl-analyzer.toml",
+                    "[source]\nroot = \".\"\nextensions = [{ name = \"New\", path = \"cfe/New\", scope = \"InfoBase\" }]\n",
+                );
             }),
-            "a descriptor that turns a directory into an extension must force a reload",
+            "a descriptor for a newly scoped extension must force a reload",
         );
     }
 

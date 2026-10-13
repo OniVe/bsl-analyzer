@@ -34,7 +34,7 @@ fn setup_impl(
         db.set_file_text(*file_id, &file.content);
     }
     if attach_designer_config {
-        db.set_all_config_paths(vec![(None, designer_fixture_path())]);
+        db.set_all_config_paths(vec![(None, designer_fixture_path())], None);
     }
 
     let test_file = fixture

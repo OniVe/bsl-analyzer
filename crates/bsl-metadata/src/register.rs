@@ -157,6 +157,12 @@ pub struct Register {
     #[serde(rename = "uuid")]
     uuid: Uuid,
 
+    #[serde(rename = "objectBelonging", default)]
+    object_belonging: ObjectBelonging,
+
+    #[serde(rename = "extendedConfigurationObject", default)]
+    extended_configuration_object: Option<Uuid>,
+
     #[serde(rename = "name")]
     name: String,
 
@@ -204,6 +210,24 @@ impl Register {
 
     pub fn uuid(&self) -> &Uuid {
         &self.uuid
+    }
+
+    /// Whether this declaration adopts the identified register.
+    pub fn adopts(&self, base: &Register) -> bool {
+        self.adopts_by_kind_and_name(base) && self.extended_configuration_object == Some(base.uuid)
+    }
+
+    /// Whether this declaration can be treated as a partial overlay when the target UUID is
+    /// missing or stale. The caller still has to mark the resulting model open.
+    pub fn adopts_by_kind_and_name(&self, base: &Register) -> bool {
+        self.object_belonging == ObjectBelonging::Adopted
+            && self.mdo_type == base.mdo_type
+            && stdx::case::eq_ignore_case(&self.name, &base.name)
+    }
+
+    /// The ownership declared by the metadata export.
+    pub fn object_belonging(&self) -> ObjectBelonging {
+        self.object_belonging
     }
 
     pub fn name(&self) -> &str {
@@ -386,7 +410,7 @@ impl MdObject for Register {
     }
 
     fn object_belonging(&self) -> ObjectBelonging {
-        ObjectBelonging::Own
+        self.object_belonging
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -397,6 +421,8 @@ impl MdObject for Register {
 #[derive(Debug, Default)]
 pub struct RegisterBuilder {
     uuid: Option<Uuid>,
+    object_belonging: ObjectBelonging,
+    extended_configuration_object: Option<Uuid>,
     name: Option<String>,
     mdo_type: Option<MdoType>,
     dimensions: Vec<Dimension>,
@@ -410,6 +436,13 @@ pub struct RegisterBuilder {
 }
 
 impl RegisterBuilder {
+    /// Set the ownership and confirmed target of an extension declaration.
+    pub fn extension_ownership(mut self, belonging: ObjectBelonging, target: Option<Uuid>) -> Self {
+        self.object_belonging = belonging;
+        self.extended_configuration_object = target;
+        self
+    }
+
     pub fn uuid(mut self, uuid: Uuid) -> Self {
         self.uuid = Some(uuid);
         self
@@ -483,6 +516,8 @@ impl RegisterBuilder {
     pub fn build(self) -> Register {
         Register {
             uuid: self.uuid.unwrap_or_else(Uuid::new_v4),
+            object_belonging: self.object_belonging,
+            extended_configuration_object: self.extended_configuration_object,
             name: self.name.unwrap_or_default(),
             mdo_type: self.mdo_type.unwrap_or(MdoType::InformationRegister),
             dimensions: self.dimensions,
@@ -552,6 +587,31 @@ mod tests {
 
         let calc_reg = Register::builder().mdo_type(MdoType::CalculationRegister).build();
         assert!(calc_reg.is_calculation_register());
+    }
+
+    #[test]
+    fn strict_adoption_still_requires_the_extended_configuration_uuid() {
+        let target = Uuid::new_v4();
+        let base = Register::builder()
+            .uuid(target)
+            .name("BaseRegister")
+            .mdo_type(MdoType::InformationRegister)
+            .build();
+        let stale_overlay = Register::builder()
+            .uuid(Uuid::new_v4())
+            .extension_ownership(ObjectBelonging::Adopted, Some(Uuid::new_v4()))
+            .name("baseregister")
+            .mdo_type(MdoType::InformationRegister)
+            .build();
+        assert!(stale_overlay.adopts_by_kind_and_name(&base));
+        assert!(!stale_overlay.adopts(&base));
+        let confirmed_overlay = Register::builder()
+            .uuid(Uuid::new_v4())
+            .extension_ownership(ObjectBelonging::Adopted, Some(target))
+            .name("BaseRegister")
+            .mdo_type(MdoType::InformationRegister)
+            .build();
+        assert!(confirmed_overlay.adopts(&base));
     }
 
     #[test]

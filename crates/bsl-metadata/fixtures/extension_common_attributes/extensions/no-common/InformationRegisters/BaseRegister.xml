@@ -1,0 +1,42 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:app="http://v8.1c.ru/8.2/managed-application/core" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:cmi="http://v8.1c.ru/8.2/managed-application/cmi" xmlns:ent="http://v8.1c.ru/8.1/data/enterprise" xmlns:lf="http://v8.1c.ru/8.2/managed-application/logform" xmlns:style="http://v8.1c.ru/8.1/data/ui/style" xmlns:sys="http://v8.1c.ru/8.1/data/ui/fonts/system" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:v8ui="http://v8.1c.ru/8.1/data/ui" xmlns:web="http://v8.1c.ru/8.1/data/ui/colors/web" xmlns:win="http://v8.1c.ru/8.1/data/ui/colors/windows" xmlns:xen="http://v8.1c.ru/8.3/xcf/enums" xmlns:xpr="http://v8.1c.ru/8.3/xcf/predef" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="2.20">
+	<InformationRegister uuid="bab2a172-c47f-5ad4-a672-de220bfa909a">
+		<InternalInfo>
+			<xr:GeneratedType name="InformationRegisterRecord.BaseRegister" category="Record">
+				<xr:TypeId>dbfbfaeb-75c9-5874-a507-62a691323057</xr:TypeId>
+				<xr:ValueId>22fd70c9-52db-5724-ad4e-1aac1a4c4a99</xr:ValueId>
+			</xr:GeneratedType>
+			<xr:GeneratedType name="InformationRegisterManager.BaseRegister" category="Manager">
+				<xr:TypeId>62b38e5e-5383-5661-8fd7-5cd65019f8ff</xr:TypeId>
+				<xr:ValueId>e51d1581-86d6-5498-8e46-fc144836ab37</xr:ValueId>
+			</xr:GeneratedType>
+			<xr:GeneratedType name="InformationRegisterSelection.BaseRegister" category="Selection">
+				<xr:TypeId>7e23a754-1f3c-5b85-9590-71cf30d91b11</xr:TypeId>
+				<xr:ValueId>666830b8-8f07-56e8-8b8f-de5f2b786185</xr:ValueId>
+			</xr:GeneratedType>
+			<xr:GeneratedType name="InformationRegisterList.BaseRegister" category="List">
+				<xr:TypeId>08d5062c-34a3-5614-9fc3-db97b18b80fb</xr:TypeId>
+				<xr:ValueId>5800d48b-830d-56f6-b6b3-3e983ba6c38b</xr:ValueId>
+			</xr:GeneratedType>
+			<xr:GeneratedType name="InformationRegisterRecordSet.BaseRegister" category="RecordSet">
+				<xr:TypeId>75d1c1ba-71ba-553e-9189-d8357a4657e7</xr:TypeId>
+				<xr:ValueId>0c4d0952-9f73-5de2-9f9a-1e0592571c4c</xr:ValueId>
+			</xr:GeneratedType>
+			<xr:GeneratedType name="InformationRegisterRecordKey.BaseRegister" category="RecordKey">
+				<xr:TypeId>744bf0b9-12e1-5548-b7e3-15edb04c0fc2</xr:TypeId>
+				<xr:ValueId>70050fcc-7794-51ca-9b15-5162c5f2c0bd</xr:ValueId>
+			</xr:GeneratedType>
+			<xr:GeneratedType name="InformationRegisterRecordManager.BaseRegister" category="RecordManager">
+				<xr:TypeId>73741cf4-a56a-57d1-affa-5172e3df96f3</xr:TypeId>
+				<xr:ValueId>47441f77-c42e-56a9-9834-426638ab78df</xr:ValueId>
+			</xr:GeneratedType>
+		</InternalInfo>
+		<Properties>
+			<ObjectBelonging>Adopted</ObjectBelonging>
+			<Name>BaseRegister</Name>
+			<Comment/>
+			<ExtendedConfigurationObject>0974fddb-727e-5ee2-bbb2-f9896e3c8862</ExtendedConfigurationObject>
+		</Properties>
+		<ChildObjects/>
+	</InformationRegister>
+</MetaDataObject>

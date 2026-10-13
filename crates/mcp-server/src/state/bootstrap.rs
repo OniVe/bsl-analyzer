@@ -748,7 +748,6 @@ impl SharedState {
         crate::project::warn_about_rejected_roots(
             &crate::project::workspace_roots(&project, &source_exclusions).1,
         );
-
         let search_engine: SharedSearchEngine = super::shared_engine(None);
         let workspace_search_initializing = Arc::new(AtomicBool::new(true));
         let index_progress = IndexProgress::new();
@@ -973,6 +972,9 @@ impl SharedState {
         );
 
         let reference_search = ReferenceSearchState::new(Some(&source_dir));
+        // The complete workspace snapshot has passed its validation and owner setup;
+        // emit the aggregate advisory once from this accepted snapshot.
+        project.warn_about_legacy_extension_scope();
         Ok(Self {
             workspace_root: Some(source_dir),
             source_root,
@@ -3979,6 +3981,82 @@ mod tests {
         state.shutdown();
     }
 
+    #[test]
+    fn workspace_boot_logs_one_aggregate_legacy_scope_warning() {
+        use tracing_subscriber::prelude::*;
+
+        struct Capture(Arc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Visitor(Option<String>);
+                impl tracing::field::Visit for Visitor {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "message" {
+                            self.0 = Some(format!("{value:?}"));
+                        }
+                    }
+
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        if field.name() == "message" {
+                            self.0 = Some(value.to_owned());
+                        }
+                    }
+                }
+                let mut visitor = Visitor(None);
+                event.record(&mut visitor);
+                if event.metadata().target() == "project_model::legacy_extension_scope" {
+                    self.0.lock().unwrap().push(visitor.0.unwrap_or_default());
+                }
+            }
+        }
+
+        let _env_lock = env_lock();
+        let _embedding_url = EnvVarGuard::unset("EMBEDDING_URL");
+        let _embedding_model = EnvVarGuard::unset("EMBEDDING_MODEL");
+        let workspace = tempdir().unwrap();
+        let root = workspace.path();
+        let main = root.join("src/cf");
+        let extension = root.join("ext");
+        fs::create_dir_all(&main).unwrap();
+        fs::create_dir_all(&extension).unwrap();
+        fs::write(main.join("Configuration.xml"), "<Configuration/>").unwrap();
+        fs::write(
+            extension.join("Configuration.xml"),
+            "<Properties><ConfigurationExtensionPurpose>Customization</ConfigurationExtensionPurpose></Properties>",
+        )
+        .unwrap();
+        fs::write(
+            root.join("bsl-analyzer.toml"),
+            "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"Feature\", path = \"ext\" }]\n",
+        )
+        .unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::from_root(
+            workspace.path().join("cache").to_path_buf(),
+        );
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let state = test_utils::with_subscriber(
+            tracing_subscriber::registry().with(Capture(warnings.clone())),
+            || SharedState::workspace_with_cache(root.to_path_buf(), cache).unwrap(),
+        );
+        state.shutdown();
+
+        let warnings = warnings.lock().unwrap();
+        assert_eq!(warnings.len(), 1, "one warning is logged for the boot snapshot");
+        assert!(warnings[0].contains("Feature") && warnings[0].contains("ext"), "{warnings:?}");
+        assert!(
+            warnings[0].contains("InfoBase") && warnings[0].contains("DataSeparation"),
+            "the log carries the full actionable precision warning: {warnings:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn workspace_cache_scope_ignores_current_and_sibling_leaf_writes() {
@@ -4013,7 +4091,7 @@ mod tests {
         fs::write(&legitimate_build, "Процедура ИзBuild() КонецПроцедуры\n").unwrap();
         fs::write(
             workspace.join("bsl-analyzer.toml"),
-            "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"Neighbor\", path = \".derived/workspaces/v1-neighbor\" }]\n",
+            "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"Neighbor\", path = \".derived/workspaces/v1-neighbor\", scope = \"InfoBase\" }]\n",
         )
         .unwrap();
 
@@ -4320,7 +4398,7 @@ mod tests {
         // Only now is the extension part of the project.
         fs::write(
             workspace.join("bsl-analyzer.toml"),
-            "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"e\", path = \"ext\" }]\n",
+            "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"e\", path = \"ext\", scope = \"InfoBase\" }]\n",
         )
         .unwrap();
         let new_cache = resolved_workspace_cache(&workspace);
@@ -5008,6 +5086,198 @@ mod tests {
     }
 
     #[test]
+    fn workspace_cache_scope_change_invalidates_frozen_extension_scope() {
+        use std::time::Duration;
+
+        let workspace = tempdir().unwrap();
+        let cache_parent = tempdir().unwrap();
+        let root = workspace.path().to_path_buf();
+        let configuration = root.join("src/cf");
+        let extension = root.join("ext");
+        fs::create_dir_all(&configuration).unwrap();
+        fs::create_dir_all(&extension).unwrap();
+        fs::write(configuration.join("Configuration.xml"), "<Configuration/>").unwrap();
+        fs::write(
+            extension.join("Configuration.xml"),
+            "<Properties><ConfigurationExtensionPurpose>Customization</ConfigurationExtensionPurpose></Properties>",
+        )
+        .unwrap();
+        let project_file = root.join("bsl-analyzer.toml");
+        let config_for_scope = |scope: Option<&str>| {
+            let scope = scope.map_or_else(String::new, |scope| format!(", scope = \"{scope}\""));
+            format!(
+                "[source]\nroot = \"src/cf\"\nextensions = [{{ name = \"Feature\", path = \"ext\"{scope} }}]\n"
+            )
+        };
+        fs::write(&project_file, config_for_scope(None)).unwrap();
+
+        let old_project = crate::project::at(&root).expect("legacy Project parses");
+        assert_eq!(old_project.extension_paths().len(), 1);
+        let cache_base = cache_parent.path().join("cache");
+        let old_cache = crate::cache::WorkspaceCacheLayout::for_project(
+            &old_project,
+            Some(&cache_base),
+            cache_parent.path(),
+            None,
+        )
+        .expect("old frozen scope resolves");
+        let old_leaf = old_cache.root().to_path_buf();
+        assert!(!old_leaf.exists());
+
+        let hub = WorkspaceChangeHub::start(vec![root.clone()]);
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        let owners = super::super::OwnerStop::default();
+        let transport_stop = tokio_util::sync::CancellationToken::new();
+        owners.set_scope_transport_stop(transport_stop.clone());
+        SharedState::start_scope_guard(
+            hub.clone(),
+            root.clone(),
+            old_cache.clone(),
+            owners.clone(),
+            transport_stop.clone(),
+        );
+        assert!(crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
+            hub.active_cursor_count() == 1
+        }));
+
+        // Scope is the only project input changed: the named extension and both source roots stay fixed.
+        fs::write(&project_file, config_for_scope(Some("InfoBase"))).unwrap();
+        assert!(crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
+            owners.is_stopped() && transport_stop.is_cancelled()
+        }));
+        assert!(crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
+            hub.active_cursor_count() == 0
+        }));
+
+        let new_project = crate::project::at(&root).expect("InfoBase Project parses");
+        assert_eq!(new_project.extension_paths(), old_project.extension_paths());
+        let new_cache = crate::cache::WorkspaceCacheLayout::for_project(
+            &new_project,
+            Some(&cache_base),
+            cache_parent.path(),
+            None,
+        )
+        .expect("new Project selects its own frozen scope");
+        assert_ne!(new_cache.root(), old_cache.root());
+
+        let error = SharedState::workspace_with_cache(root.clone(), old_cache.clone())
+            .err()
+            .expect("the old frozen session must reconnect after scope drift");
+        assert!(error.to_string().contains("cache scope no longer matches"));
+        assert!(!old_leaf.exists(), "the invalidated session never creates its old cache leaf");
+        hub.shutdown();
+        assert!(owners.wait_empty(Duration::from_secs(1)));
+
+        let reverse_hub = WorkspaceChangeHub::start(vec![root.clone()]);
+        assert!(reverse_hub.wait_until_watching(Duration::from_secs(5)));
+        let reverse_owners = super::super::OwnerStop::default();
+        let reverse_stop = tokio_util::sync::CancellationToken::new();
+        reverse_owners.set_scope_transport_stop(reverse_stop.clone());
+        SharedState::start_scope_guard(
+            reverse_hub.clone(),
+            root.clone(),
+            new_cache.clone(),
+            reverse_owners.clone(),
+            reverse_stop.clone(),
+        );
+        assert!(crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
+            reverse_hub.active_cursor_count() == 1
+        }));
+        fs::write(&project_file, config_for_scope(None)).unwrap();
+        assert!(crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
+            reverse_owners.is_stopped() && reverse_stop.is_cancelled()
+        }));
+
+        let legacy_project = crate::project::at(&root).expect("restored legacy Project parses");
+        let legacy_cache = crate::cache::WorkspaceCacheLayout::for_project(
+            &legacy_project,
+            Some(&cache_base),
+            cache_parent.path(),
+            None,
+        )
+        .expect("legacy Project selects its own frozen scope");
+        assert_ne!(legacy_cache.root(), new_cache.root());
+        let error = SharedState::workspace_with_cache(root.clone(), new_cache)
+            .err()
+            .expect("the explicit frozen session must reconnect after scope drift");
+        assert!(error.to_string().contains("cache scope no longer matches"));
+        reverse_hub.shutdown();
+        assert!(reverse_owners.wait_empty(Duration::from_secs(1)));
+
+        // Keep the pre-existing explicit-to-explicit invalidation case as well: scope
+        // is a frozen session input even when both snapshots are explicit.
+        let explicit_hub = WorkspaceChangeHub::start(vec![root.clone()]);
+        assert!(explicit_hub.wait_until_watching(Duration::from_secs(5)));
+        let explicit_owners = super::super::OwnerStop::default();
+        let explicit_stop = tokio_util::sync::CancellationToken::new();
+        explicit_owners.set_scope_transport_stop(explicit_stop.clone());
+        SharedState::start_scope_guard(
+            explicit_hub.clone(),
+            root.clone(),
+            legacy_cache.clone(),
+            explicit_owners.clone(),
+            explicit_stop.clone(),
+        );
+        assert!(crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
+            explicit_hub.active_cursor_count() == 1
+        }));
+        fs::write(&project_file, config_for_scope(Some("InfoBase"))).unwrap();
+        assert!(crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
+            explicit_owners.is_stopped() && explicit_stop.is_cancelled()
+        }));
+        let info_base = crate::project::at(&root).expect("InfoBase Project parses");
+        let info_base_cache = crate::cache::WorkspaceCacheLayout::for_project(
+            &info_base,
+            Some(&cache_base),
+            cache_parent.path(),
+            None,
+        )
+        .expect("InfoBase frozen scope resolves");
+        assert_ne!(info_base_cache.root(), legacy_cache.root());
+        let error = SharedState::workspace_with_cache(root.clone(), legacy_cache.clone())
+            .err()
+            .expect("legacy session cannot reconnect as InfoBase");
+        assert!(error.to_string().contains("cache scope no longer matches"));
+        explicit_hub.shutdown();
+        assert!(explicit_owners.wait_empty(Duration::from_secs(1)));
+
+        let data_separation_hub = WorkspaceChangeHub::start(vec![root.clone()]);
+        assert!(data_separation_hub.wait_until_watching(Duration::from_secs(5)));
+        let data_separation_owners = super::super::OwnerStop::default();
+        let data_separation_stop = tokio_util::sync::CancellationToken::new();
+        data_separation_owners.set_scope_transport_stop(data_separation_stop.clone());
+        SharedState::start_scope_guard(
+            data_separation_hub.clone(),
+            root.clone(),
+            info_base_cache.clone(),
+            data_separation_owners.clone(),
+            data_separation_stop.clone(),
+        );
+        assert!(crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
+            data_separation_hub.active_cursor_count() == 1
+        }));
+        fs::write(&project_file, config_for_scope(Some("DataSeparation"))).unwrap();
+        assert!(crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
+            data_separation_owners.is_stopped() && data_separation_stop.is_cancelled()
+        }));
+        let data_separation = crate::project::at(&root).expect("DataSeparation Project parses");
+        let data_separation_cache = crate::cache::WorkspaceCacheLayout::for_project(
+            &data_separation,
+            Some(&cache_base),
+            cache_parent.path(),
+            None,
+        )
+        .expect("DataSeparation frozen scope resolves");
+        assert_ne!(data_separation_cache.root(), info_base_cache.root());
+        let error = SharedState::workspace_with_cache(root, info_base_cache)
+            .err()
+            .expect("InfoBase session cannot reconnect as DataSeparation");
+        assert!(error.to_string().contains("cache scope no longer matches"));
+        data_separation_hub.shutdown();
+        assert!(data_separation_owners.wait_empty(Duration::from_secs(1)));
+    }
+
+    #[test]
     fn workspace_cache_scope_supplied_layout_rejects_project_drift_before_cache_creation() {
         let workspace = tempdir().unwrap();
         let cache_parent = tempdir().unwrap();
@@ -5109,7 +5379,7 @@ mod tests {
         .unwrap();
         fs::write(
             ws.join("bsl-analyzer.toml"),
-            "[source]\nextensions = [\"Расширения/Feature\"]\n",
+            "[source]\nextensions = [{ name = \"Feature\", path = \"Расширения/Feature\", scope = \"InfoBase\" }]\n",
         )
         .unwrap();
 
@@ -5581,7 +5851,7 @@ mod tests {
         fs::write(
             workspace.join("bsl-analyzer.toml"),
             "[source]\nroot = \"src/cf\"\n\
-             extensions = [{ name = \"a\", path = \"ext-a\" }, { name = \"b\", path = \"ext-b\" }]\n",
+             extensions = [{ name = \"a\", path = \"ext-a\", scope = \"InfoBase\" }, { name = \"b\", path = \"ext-b\", scope = \"InfoBase\" }]\n",
         )
         .unwrap();
         (dir, workspace)
@@ -5918,7 +6188,7 @@ mod tests {
         fs::write(extension.join("Configuration.xml"), "<Configuration/>").unwrap();
         fs::write(
             workspace.join("bsl-analyzer.toml"),
-            "[source]\nroot = \"cf\"\nextensions = [{ name = \"extra\", path = \"extra-extension\" }]\n",
+            "[source]\nroot = \"cf\"\nextensions = [{ name = \"extra\", path = \"extra-extension\", scope = \"InfoBase\" }]\n",
         )
         .unwrap();
         assert!(
@@ -6123,8 +6393,8 @@ mod tests {
         fs::write(
             workspace.join("bsl-analyzer.toml"),
             "[source]\nroot = \"src/cf\"\n\
-             extensions = [{ name = \"inner\", path = \"src/cf/inner-ext\" }, \
-             { name = \"outer\", path = \".\" }]\n",
+             extensions = [{ name = \"inner\", path = \"src/cf/inner-ext\", scope = \"InfoBase\" }, \
+             { name = \"outer\", path = \".\", scope = \"InfoBase\" }]\n",
         )
         .unwrap();
         let project = crate::project::at(&workspace);
@@ -6202,7 +6472,7 @@ mod tests {
         }
         fs::write(
             workspace.join("bsl-analyzer.toml"),
-            "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"a\", path = \"ext-a\" }]\n",
+            "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"a\", path = \"ext-a\", scope = \"InfoBase\" }]\n",
         )
         .unwrap();
 
@@ -6291,7 +6561,7 @@ mod tests {
         // The extension is declared while the daemon is down.
         fs::write(
             workspace.join("bsl-analyzer.toml"),
-            "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"a\", path = \"ext-a\" }]\n",
+            "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"a\", path = \"ext-a\", scope = \"InfoBase\" }]\n",
         )
         .unwrap();
         let warm = SharedState::init_workspace_search_engine_unmanaged(

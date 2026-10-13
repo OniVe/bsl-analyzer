@@ -33,6 +33,7 @@ pub use type_facade::{
 };
 
 pub use hir_def::execution_env;
+pub use hir_def::sdbl_cache::DbSdblResolver;
 pub use hir_def::{all_sdbl_in_file_query, sdbl_hir_for_file_query, SdblHirEntries, SdblInFile};
 pub use hir_def::{
     BindingId, DefWithBodyId, ExprId, IdConversion, ModuleMetadata, Name, PathResolution, StmtId,

@@ -453,9 +453,13 @@ fn analyze_salsa(
     };
     // Deliberately not gated on `--quiet`: this explains why the findings that
     // follow are wrong, and suppressing it leaves the run looking merely broken.
-    for notice in [project.standalone_extension_notice(), project.standalone_external_notice()]
-        .into_iter()
-        .flatten()
+    for notice in [
+        project.standalone_extension_notice(),
+        project.standalone_external_notice(),
+        project.legacy_extension_scope_warning(),
+    ]
+    .into_iter()
+    .flatten()
     {
         eprintln!("warning: {notice}");
     }
@@ -552,9 +556,10 @@ fn analyze_salsa(
     };
 
     let diagnostics = proj_config.diagnostics.rules_json();
-    let mut config = DiagnosticsConfig::from_project_json(
+    let mut config = DiagnosticsConfig::from_project_file(
         &diagnostics,
         proj_config.output.resolve_locale().unwrap_or_default(),
+        proj_config.config_file_path(),
     );
 
     if let Some(ref diag_name) = only_diagnostic {

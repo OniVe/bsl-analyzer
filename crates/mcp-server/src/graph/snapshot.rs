@@ -2678,7 +2678,7 @@ mod tests {
         std::fs::write(
             root.join("bsl-analyzer.toml"),
             format!(
-                "[source]\nroot = \".\"\nextensions = [{{ name = \"a\", path = {:?} }}]\n",
+                "[source]\nroot = \".\"\nextensions = [{{ name = \"a\", path = {:?}, scope = \"InfoBase\" }}]\n",
                 ext.to_string_lossy()
             ),
         )

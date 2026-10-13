@@ -34,7 +34,9 @@ pub use common_module::{CommonModule, CommonModuleBuilder};
 pub use configuration::Configuration;
 pub use defined_type::{DefinedType, DefinedTypeBuilder};
 pub use dimension::{Dimension, DimensionBuilder};
-pub use enums::{CodeSeries, FormType, ModuleType, ObjectBelonging, ReturnValueReuse};
+pub use enums::{
+    CodeSeries, ExtensionScope, FormType, ModuleType, ObjectBelonging, ReturnValueReuse,
+};
 pub use error::{MetadataError, Result};
 pub use event_subscription::{EventSubscription, EventSubscriptionHandler};
 pub use external_object::{

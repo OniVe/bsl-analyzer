@@ -67,6 +67,10 @@ pub struct Lsp {
     pub child: Child,
     pub stdin: ChildStdin,
     pub messages: Receiver<Value>,
+    /// Server notifications sent during initialize are valid LSP traffic too; keep
+    /// them for the test that owns the channel instead of eating them while waiting
+    /// for the initialize response.
+    pending: std::sync::Mutex<std::collections::VecDeque<Value>>,
     /// The methods of the last few messages a wait took in, for the failure message of a
     /// wait that ran out: what the server was saying is the context of what it did not.
     recent: std::sync::Mutex<std::collections::VecDeque<String>>,
@@ -120,13 +124,29 @@ impl Lsp {
                 }
             }
         });
-        let mut lsp = Self { child, stdin, messages, recent: Default::default() };
+        let mut lsp = Self {
+            child,
+            stdin,
+            messages,
+            pending: Default::default(),
+            recent: Default::default(),
+        };
         let root_uri = lsp_types::Url::from_directory_path(root).unwrap();
         lsp.send(json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"rootUri": root_uri, "capabilities": capabilities}
         }));
-        lsp.wait_for(|message| message["id"] == 1);
+        let deadline = std::time::Instant::now() + SILENCE;
+        loop {
+            let remaining = deadline.checked_duration_since(std::time::Instant::now()).unwrap();
+            let message =
+                lsp.messages.recv_timeout(remaining).expect("the LSP server answers initialize");
+            lsp.note_seen(&message);
+            if message["id"] == 1 {
+                break;
+            }
+            lsp.pending.lock().unwrap().push_back(message);
+        }
         lsp.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
         lsp
     }
@@ -254,7 +274,8 @@ impl Lsp {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
-            match self.messages.recv_timeout(remaining) {
+            let pending = self.pending.lock().unwrap().pop_front();
+            match pending.map(Ok).unwrap_or_else(|| self.messages.recv_timeout(remaining)) {
                 Ok(message) => {
                     self.note_seen(&message);
                     if predicate(&message) {

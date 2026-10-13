@@ -79,7 +79,7 @@ fn infer_invalidates_when_config_set_changes() {
         unresolved_kinds(&db, file_id)
     );
 
-    db.set_all_config_paths(vec![(None, std::path::PathBuf::from("/does-not-exist"))]);
+    db.set_all_config_paths(vec![(None, std::path::PathBuf::from("/does-not-exist"))], None);
 
     let kinds = unresolved_kinds(&db, file_id);
     assert_eq!(
@@ -99,7 +99,7 @@ fn infer_invalidates_when_config_set_changes() {
         mismatched_arg_counts(&db, file_id)
     );
 
-    db.set_all_config_paths(vec![]);
+    db.set_all_config_paths(vec![], None);
 
     assert_eq!(
         mismatched_arg_counts(&db, file_id),

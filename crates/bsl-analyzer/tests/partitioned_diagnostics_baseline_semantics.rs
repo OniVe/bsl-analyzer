@@ -21,7 +21,7 @@ fn one_semantic_run_classifies_main_and_extension_before_reporting() {
         temp.path().join("bsl-analyzer.toml"),
         r#"[source]
 root = "src/cf"
-extensions = [{ name = "Ext", path = "src/cfe/Ext" }]
+extensions = [{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }]
 
 [diagnostics.baseline]
 directory = "baselines"

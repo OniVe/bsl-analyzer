@@ -348,6 +348,11 @@ mod tests {
             true,
             "&НаСервере\nФункция Р() Экспорт КонецФункции",
         );
+        fs::write(
+            root.join("bsl-analyzer.toml"),
+            "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"Расш\", path = \"src/cfe/Расш\", scope = \"InfoBase\" }]\n",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -426,6 +431,14 @@ mod tests {
             root,
             project_model::ProjectConfig {
                 configuration_root: Some("src/cf".to_owned()),
+                extensions: Some(vec![project_model::ExtensionDecl::Structured(
+                    project_model::StructuredExtensionDecl {
+                        name: "Расш".to_owned(),
+                        path: "src/cfe/Расш".to_owned(),
+                        depends_on: Vec::new(),
+                        scope: Some(bsl_metadata::ExtensionScope::InfoBase),
+                    },
+                )]),
                 ..project_model::ProjectConfig::default()
             },
         )
@@ -434,6 +447,14 @@ mod tests {
             root,
             project_model::ProjectConfig {
                 configuration_root: Some("src/cf".to_owned()),
+                extensions: Some(vec![project_model::ExtensionDecl::Structured(
+                    project_model::StructuredExtensionDecl {
+                        name: "Расш".to_owned(),
+                        path: "src/cfe/Расш".to_owned(),
+                        depends_on: Vec::new(),
+                        scope: Some(bsl_metadata::ExtensionScope::InfoBase),
+                    },
+                )]),
                 source_exclude: vec!["src/cf/CommonModules/Hidden".to_owned()],
                 ..project_model::ProjectConfig::default()
             },
