@@ -1503,6 +1503,10 @@ impl McpServer {
                 let poll_cycle = self.state.poll_cycle();
                 let backlog = self.state.overlay_backlog_state();
                 let slow_holds = self.state.overlay_backlog_slow_holds();
+                // The boot's own flag, not the runtime status: an empty slot with a failed
+                // runtime is terminal only once that thread has gone.
+                let initialization =
+                    tools::search::index_initialization(&self.state, McpProfile::Workspace);
                 let status = tokio::task::spawn_blocking(move || {
                     tools::search::search_status(
                         McpProfile::Workspace,
@@ -1514,6 +1518,7 @@ impl McpServer {
                         baseline.configured,
                         baseline.external,
                         baseline.pending,
+                        initialization,
                     )
                 })
                 .await
@@ -2935,6 +2940,10 @@ impl McpServer {
                 // The reference/shared path runs no overlay warmup, so its state is always
                 // `Pending`; the Summary block words this profile as a reference docs index.
                 let overlay_warmup = crate::state::OverlayWarmupState::Pending;
+                // The reference profile runs its own lifecycle, not the workspace init flag: its
+                // own source is the only place a refusal exists before the load reaches a verdict.
+                let initialization =
+                    tools::search::index_initialization(&self.state, McpProfile::Reference);
                 tokio::task::spawn_blocking(move || {
                     tools::search::search_status(
                         McpProfile::Reference,
@@ -2946,6 +2955,7 @@ impl McpServer {
                         baseline.configured,
                         baseline.external,
                         baseline.pending,
+                        initialization,
                     )
                 })
                 .await
@@ -3918,7 +3928,7 @@ mod graph_supersession_contract {
         // the graph then stays idle for as long as this test needs it to.
         assert!(
             crate::change_hub::test_support::eventually(Duration::from_secs(60), || !state
-                .search_init_running()),
+                .search_initializing()),
             "the boot's workspace-search init never finished",
         );
         drop(held);

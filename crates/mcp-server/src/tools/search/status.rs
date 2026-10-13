@@ -137,6 +137,7 @@ pub fn search_status(
     configured_baseline: Option<ConfiguredBaselineStatus>,
     external_baseline: Option<Arc<ExternalBaselineService>>,
     baseline_pending: bool,
+    initialization: EmptyIndex,
 ) -> Result<CallToolResult, McpError> {
     // Status is a polling primitive: agents call it in a loop to decide when search is usable,
     // so it answers within the cap and degrades to the "busy" note instead of waiting out a
@@ -153,15 +154,74 @@ pub fn search_status(
         configured_baseline,
         external_baseline,
         baseline_pending,
+        initialization,
         std::time::Duration::from_secs(2),
     )
+}
+
+/// What an empty engine slot means, as the profile that OWNS the initialization reports it. The
+/// slot itself cannot say: an empty slot is a build in flight, an initialization that failed, or
+/// — for a unit test's bare slot, or a profile that does not own this index — neither. Every
+/// surface below branches on this one value, so prose and `state` can never disagree about it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum EmptyIndex {
+    /// The initialization is still running: a build is coming, whatever a runtime status already
+    /// says (a refused token profile is recorded before the engine is published).
+    Initializing,
+    /// The initialization ran, published nothing, and its OWNER declares the outcome terminal:
+    /// waiting will not produce an index in this process.
+    Failed,
+    /// Not running and no declared failure: an empty slot nobody is filling for now.
+    Idle,
+}
+
+/// The profile's own answer about an empty engine slot — one derivation per profile, read from
+/// the source that DECLARES the verdict, never inferred from the runtime by the wrong profile:
+///
+/// - the workspace owns a boot thread (`workspace_search_initializing`) and a runtime whose
+///   terminal states are `Failed`/`EmbeddingFailed` and `Stopped` (terminal by its own contract);
+/// - the reference owns its load lifecycle, which records refusals the runtime never sees (an
+///   unreadable project config, an unavailable baseline, a worker that never spawned) and is the
+///   only place a verdict exists before the load finishes.
+pub(crate) fn index_initialization(
+    state: &crate::state::SharedState,
+    profile: crate::McpProfile,
+) -> EmptyIndex {
+    use crate::state::ReferenceSearchLifecycle;
+    match profile {
+        crate::McpProfile::Workspace => {
+            if state.search_initializing() {
+                return EmptyIndex::Initializing;
+            }
+            let terminal = state
+                .semantic_runtime()
+                .lock()
+                .map(|runtime| {
+                    runtime.is_failed() || matches!(*runtime, SemanticRuntimeStatus::Stopped)
+                })
+                .unwrap_or(false);
+            if terminal {
+                EmptyIndex::Failed
+            } else {
+                EmptyIndex::Idle
+            }
+        }
+        crate::McpProfile::Reference => match state.reference_lifecycle() {
+            ReferenceSearchLifecycle::Uninitialized | ReferenceSearchLifecycle::Loading => {
+                EmptyIndex::Initializing
+            }
+            ReferenceSearchLifecycle::Failed { .. } => EmptyIndex::Failed,
+            ReferenceSearchLifecycle::Ready => EmptyIndex::Idle,
+        },
+    }
 }
 
 /// The status body, parameterized over the engine-acquire cap so tests can drive the timeout
 /// (busy) branch without a multi-second sleep. Production goes through [`search_status`].
 // Each argument is a distinct status input (engine, progress, runtime status, mode, warmup
-// outcome, baselines) plus the test-only acquire cap; bundling them into a context struct would
-// only rename the same fields, so the one-over-limit arity is accepted here.
+// outcome, baselines, the empty slot's own verdict) plus the test-only acquire cap; bundling
+// them into a context struct would only rename the same fields, so the one-over-limit arity is
+// accepted here.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn search_status_with_cap(
     profile: crate::McpProfile,
@@ -173,6 +233,7 @@ pub(super) fn search_status_with_cap(
     configured_baseline: Option<ConfiguredBaselineStatus>,
     external_baseline: Option<Arc<ExternalBaselineService>>,
     baseline_pending: bool,
+    initialization: EmptyIndex,
     engine_acquire_cap: std::time::Duration,
 ) -> Result<CallToolResult, McpError> {
     let mut out = String::new();
@@ -215,6 +276,14 @@ pub(super) fn search_status_with_cap(
     } else {
         SummaryEngineState::Building
     };
+    // An empty engine slot is not one state, and the two readings call for opposite advice.
+    // `index_empty` names the slot; `index_terminal` narrows it to the case where NOTHING will
+    // ever fill it — and the verdict is the profile's own ([`index_initialization`]), never
+    // inferred here: a failed-looking runtime can sit right next to a healthy, in-flight build
+    // (a token-profile refusal is recorded before the engine is published), while a terminal
+    // one can be declared where the runtime says nothing at all (a refused reference config).
+    let index_empty = guard.as_ref().is_some_and(|g| g.is_none());
+    let index_terminal = index_empty && initialization == EmptyIndex::Failed;
 
     // Prepend a plain-language summary an agent can act on directly: the detailed field list
     // below is precise but hard to interpret, and a bare `Ready` + empty overlay is ambiguous
@@ -230,6 +299,7 @@ pub(super) fn search_status_with_cap(
         external_baseline.as_ref(),
         baseline_probe.as_ref(),
         engine_state,
+        index_terminal,
     );
 
     // Which roots are indexed at all. Without it an empty search over an extension reads
@@ -262,8 +332,10 @@ pub(super) fn search_status_with_cap(
             }
             // An empty engine slot is not one state. The index may still be building, or its
             // initialization may have failed — and on that path nothing will publish a table
-            // later, so telling the reader to wait would be advice to wait forever.
-            None if semantic_runtime.is_failed() => {
+            // later, so telling the reader to wait would be advice to wait forever. The verdict
+            // comes from the profile that owns the initialization, so a build in flight (which a
+            // failed-looking runtime status can accompany) stays on the waiting side of it.
+            None if index_terminal => {
                 let _ = writeln!(
                     out,
                     "  unavailable (search index initialization failed; see the runtime status \
@@ -566,13 +638,18 @@ pub(super) fn search_status_with_cap(
         }
     } else if engine_busy {
         let _ = writeln!(out, "Local index: busy (overlay syncing)");
+    } else if index_terminal {
+        let _ = writeln!(
+            out,
+            "Search index: unavailable (initialization failed; waiting will not publish it)"
+        );
     } else {
         let _ = writeln!(out, "Search index: building (background initialization in progress)");
     }
 
     // Everything below is engine-free; release the lock now so a concurrent search never
-    // queues behind status rendering. `index_building` is captured while the guard is held.
-    let index_building = guard.as_ref().is_some_and(|g| g.is_none());
+    // queues behind status rendering. `index_empty`/`index_terminal` were captured above,
+    // while the guard was held.
     let embedding_profile = guard
         .as_ref()
         .and_then(|guard| guard.as_ref())
@@ -667,8 +744,18 @@ pub(super) fn search_status_with_cap(
         }
     }
 
-    if index_building && !progress.is_active() {
-        let _ = writeln!(out, "\nIndexing pending: initializing (no live counters yet)");
+    if index_empty && !progress.is_active() {
+        if index_terminal {
+            // "Pending" here would be the same lie the header just stopped telling: nothing is
+            // pending, and no pass will produce the counters this line exists to announce.
+            let _ = writeln!(
+                out,
+                "\nIndexing failed: initialization failed, so no pass will run and there are no \
+                 counters to report"
+            );
+        } else {
+            let _ = writeln!(out, "\nIndexing pending: initializing (no live counters yet)");
+        }
     }
 
     let _ = writeln!(out);
@@ -680,7 +767,10 @@ pub(super) fn search_status_with_cap(
 
     let state = match engine_state {
         SummaryEngineState::Busy => "busy",
-        SummaryEngineState::Building if semantic_runtime.is_failed() => "failed",
+        // The same discriminator the prose uses, so a poller and a reader never read different
+        // facts off one answer: a build in flight is `loading` even when the runtime already
+        // carries a failure, and only the profile's own terminal verdict says `failed`.
+        SummaryEngineState::Building if index_terminal => "failed",
         SummaryEngineState::Building => "loading",
         SummaryEngineState::Ready => "ready",
     };
@@ -759,6 +849,7 @@ fn write_summary_block(
     external_baseline: Option<&Arc<ExternalBaselineService>>,
     baseline_probe: Option<&BaselineStatusProbe>,
     engine_state: SummaryEngineState,
+    index_terminal: bool,
 ) {
     // Reference profile = an external docs baseline (no local workspace code overlay). Its wording
     // differs: it indexes reference docs, not a working tree, and has no local overlay to (re)build.
@@ -773,6 +864,12 @@ fn write_summary_block(
     let lexical_line = match engine_state {
         SummaryEngineState::Busy => {
             "temporarily unavailable - a background operation holds the index; retry shortly."
+        }
+        // A terminal initialization failure is told apart from a build in flight here too: the
+        // summary is the first thing the agent reads, and "still building" beside a runtime
+        // status that says the initialization failed sends it to wait for nothing.
+        SummaryEngineState::Building if index_terminal => {
+            "unavailable - search index initialization failed; waiting will not publish it."
         }
         SummaryEngineState::Building => "index still building; not ready yet.",
         SummaryEngineState::Ready if is_reference => {
@@ -835,6 +932,15 @@ fn write_summary_block(
             "building (indexing local diffs against the baseline)...".to_owned()
         } else {
             match overlay_warmup {
+                // `Pending` is the permanent initial value on a failed initialization, not an
+                // in-progress sync: nothing is indexing local diffs when nothing published a
+                // local index. Wording it as "building" told the reader to wait for a pass that
+                // is not running.
+                OverlayWarmupState::Pending if index_terminal => {
+                    "not built (search index initialization failed; no overlay pass is running, \
+                     and waiting will not rebuild it)."
+                        .to_owned()
+                }
                 OverlayWarmupState::Pending => {
                     "building (indexing local diffs against the baseline)...".to_owned()
                 }
@@ -945,7 +1051,10 @@ mod workspace_changes_tests {
 #[cfg(test)]
 mod tests {
     use super::super::test_support::unreachable_workspace_service;
-    use super::{baseline_warming_not_ready, search_status, search_status_with_cap};
+    use super::{
+        baseline_warming_not_ready, index_initialization, search_status, search_status_with_cap,
+        EmptyIndex,
+    };
     use crate::baseline::{
         ConfiguredBaselineStatus, ExternalBaselineState, ExternalBaselineStatus,
     };
@@ -971,7 +1080,17 @@ mod tests {
             max_request_bytes: Some(128),
         };
         let runtime = Arc::new(Mutex::new(SemanticRuntimeStatus::EmbeddingFailed(main_failure)));
+        // The empty-slot verdict follows the runtime this profile owns, as production derives it:
+        // the rendering below is what the test is about, and it must be driven the same way.
         let run = |profile, overlay| {
+            let initialization = {
+                let runtime = runtime.lock().unwrap();
+                if runtime.is_failed() || matches!(*runtime, SemanticRuntimeStatus::Stopped) {
+                    EmptyIndex::Failed
+                } else {
+                    EmptyIndex::Idle
+                }
+            };
             search_status_with_cap(
                 profile,
                 &engine,
@@ -982,6 +1101,7 @@ mod tests {
                 None,
                 None,
                 false,
+                initialization,
                 Duration::ZERO,
             )
             .unwrap()
@@ -1068,6 +1188,7 @@ mod tests {
             None,
             None,
             false,
+            EmptyIndex::Idle,
         )
         .unwrap_err();
 
@@ -1097,6 +1218,7 @@ mod tests {
             None,
             None,
             false,
+            EmptyIndex::Idle,
         )
         .unwrap();
 
@@ -1145,6 +1267,7 @@ mod tests {
             None,
             None,
             false,
+            EmptyIndex::Idle,
         )
         .unwrap();
         let text = result.content[0].as_text().expect("expected text content").text.as_str();
@@ -1174,6 +1297,7 @@ mod tests {
             None,
             None,
             false,
+            EmptyIndex::Idle,
         )
         .unwrap();
         let building = building.content[0].as_text().expect("text").text.clone();
@@ -1189,6 +1313,7 @@ mod tests {
             None,
             None,
             false,
+            EmptyIndex::Idle,
         )
         .unwrap();
         let reference = reference.content[0].as_text().expect("text").text.clone();
@@ -1226,6 +1351,7 @@ mod tests {
             None,
             None,
             false,
+            EmptyIndex::Idle,
             Duration::from_millis(40),
         )
         .unwrap();
@@ -1236,7 +1362,8 @@ mod tests {
 
         // A terminal initialization failure leaves the slot empty for the rest of the process.
         // "Still building" there is not merely imprecise — it tells the reader to wait for
-        // something that will never happen.
+        // something that will never happen. The verdict is the profile's own: for the workspace
+        // this runtime, with the boot's thread gone, is exactly what declares it.
         let failed = search_status(
             crate::McpProfile::Workspace,
             &engine,
@@ -1249,6 +1376,7 @@ mod tests {
             None,
             None,
             false,
+            EmptyIndex::Failed,
         )
         .unwrap();
         let failed = failed.content[0].as_text().expect("text").text.clone();
@@ -1256,6 +1384,276 @@ mod tests {
         assert!(
             !failed.contains("not published yet"),
             "a failed init is not a build in progress: {failed}",
+        );
+        // And neither is the terminal read allowed to keep ANY "building" wording: the root
+        // table is not the only surface that reported a build in flight.
+        assert!(!failed.contains("building") && !failed.contains("Building"), "{failed}");
+        assert!(failed.contains("Search index: unavailable"), "{failed}");
+        assert!(failed.contains("Indexing failed"), "{failed}");
+        assert!(
+            !failed.contains("Indexing pending: initializing"),
+            "no pass is pending on a terminal failure: {failed}",
+        );
+    }
+
+    /// The terminal reading of an empty slot: initialization failed and the boot's own init
+    /// thread has gone, so nothing will ever publish the index in this process. Every surface
+    /// that would otherwise say a build is in flight must say so instead — for both profiles
+    /// (the reference profile has no source-roots section to carry the refusal) and both
+    /// workspace modes (the overlay line is only rendered in the Postgres one) — while the
+    /// structured state keeps naming the failure.
+    #[test]
+    fn a_terminal_initialization_failure_is_never_worded_as_a_build() {
+        let engine: crate::state::SharedSearchEngine = crate::state::shared_engine(None);
+        for profile in [crate::McpProfile::Workspace, crate::McpProfile::Reference] {
+            for mode in
+                [WorkspaceSearchMode::SqliteLocal, WorkspaceSearchMode::PostgresRemoteOverlay]
+            {
+                let result = search_status(
+                    profile,
+                    &engine,
+                    &Arc::new(IndexProgress::default()),
+                    &Arc::new(Mutex::new(SemanticRuntimeStatus::Failed(
+                        "workspace search engine initialization failed".to_owned(),
+                    ))),
+                    mode.clone(),
+                    // What a failed initialization leaves the overlay warmup at.
+                    OverlayWarmupState::Pending,
+                    None,
+                    None,
+                    false,
+                    // What the profile's own source declares here: the boot thread is gone and
+                    // the runtime it owns reports the failure, so nothing will publish the slot.
+                    EmptyIndex::Failed,
+                )
+                .unwrap();
+                let body = result.structured_content.clone().unwrap();
+                assert_eq!(body["state"], "failed", "{profile:?}/{mode:?}");
+                let text = result.content[0].as_text().expect("text").text.clone();
+                assert!(
+                    !text.contains("building") && !text.contains("Building"),
+                    "{profile:?}/{mode:?} still words a terminal failure as a build: {text}",
+                );
+                assert!(
+                    text.contains("initialization failed"),
+                    "{profile:?}/{mode:?} does not name the failure: {text}",
+                );
+                assert!(
+                    text.contains("unavailable"),
+                    "{profile:?}/{mode:?} does not say the index is unavailable: {text}",
+                );
+            }
+        }
+    }
+
+    /// The other side of the same line: the boot's initialization is STILL RUNNING, and the
+    /// runtime hands out a failure it recorded before the engine is published (a refused token
+    /// profile does exactly that). The slot is empty and looks terminal — but a build is coming,
+    /// so every "building"/"pending" line has to stay.
+    #[test]
+    fn a_failure_during_initialization_is_still_a_build() {
+        use bsl_search::{EmbeddingFailure, EmbeddingFailureCode};
+        let failure = EmbeddingFailure::new(EmbeddingFailureCode::EmbeddingTimeout);
+        let engine: crate::state::SharedSearchEngine = crate::state::shared_engine(None);
+        for profile in [crate::McpProfile::Workspace, crate::McpProfile::Reference] {
+            for mode in
+                [WorkspaceSearchMode::SqliteLocal, WorkspaceSearchMode::PostgresRemoteOverlay]
+            {
+                let result = search_status(
+                    profile,
+                    &engine,
+                    &Arc::new(IndexProgress::default()),
+                    &Arc::new(Mutex::new(SemanticRuntimeStatus::EmbeddingFailed(failure))),
+                    mode.clone(),
+                    OverlayWarmupState::Pending,
+                    None,
+                    None,
+                    false,
+                    // The boot is still building: nothing here is terminal.
+                    EmptyIndex::Initializing,
+                )
+                .unwrap();
+                let text = result.content[0].as_text().expect("text").text.clone();
+                // The structure must agree with the prose: a build in flight is `loading`, never
+                // `failed`, however terminal the runtime status already looks.
+                assert_eq!(
+                    result.structured_content.clone().unwrap()["state"],
+                    "loading",
+                    "{profile:?}/{mode:?}",
+                );
+                assert!(
+                    text.contains("building"),
+                    "{profile:?}/{mode:?} stopped reporting the build in flight: {text}",
+                );
+                assert!(
+                    text.contains("Indexing pending: initializing"),
+                    "{profile:?}/{mode:?} stopped reporting the pending pass: {text}",
+                );
+                assert!(
+                    !text.contains("unavailable"),
+                    "{profile:?}/{mode:?} calls a build in flight unavailable: {text}",
+                );
+                assert!(
+                    !text.contains("waiting will not publish"),
+                    "{profile:?}/{mode:?} tells the reader to stop waiting during the build: {text}",
+                );
+            }
+        }
+    }
+
+    /// A reference index whose initialization was refused outright (an unreadable project config)
+    /// leaves the engine slot empty for the life of the process, with an `Disabled` runtime that
+    /// says nothing about the refusal. Only the reference's own lifecycle knows, so the verdict is
+    /// read from there — and the status must not word a slot nothing will fill as a build.
+    #[test]
+    fn a_reference_initialization_refusal_is_terminal_in_the_status() {
+        let dir = tempdir().unwrap();
+        // A malformed project config is refused at construction, before any runtime status exists.
+        fs::write(dir.path().join("bsl-analyzer.toml"), "this is not = toml [").unwrap();
+        let state = crate::state::SharedState::reference(Some(dir.path().to_path_buf()));
+
+        let initialization = index_initialization(&state, crate::McpProfile::Reference);
+        assert_eq!(
+            initialization,
+            EmptyIndex::Failed,
+            "the reference lifecycle is the only place this refusal is recorded",
+        );
+        assert!(
+            !state.semantic_runtime().lock().unwrap().is_failed(),
+            "the runtime this profile owns carries no failure at all",
+        );
+
+        for mode in [WorkspaceSearchMode::SqliteLocal, WorkspaceSearchMode::PostgresRemoteOverlay] {
+            let result = search_status(
+                crate::McpProfile::Reference,
+                state.search_engine(),
+                &Arc::new(IndexProgress::default()),
+                &state.semantic_runtime(),
+                mode.clone(),
+                OverlayWarmupState::Pending,
+                None,
+                None,
+                false,
+                initialization,
+            )
+            .unwrap();
+            let body = result.structured_content.clone().unwrap();
+            assert_eq!(body["state"], "failed", "{mode:?}");
+            let text = result.content[0].as_text().expect("text").text.clone();
+            assert!(
+                text.contains("unavailable") && text.contains("initialization failed"),
+                "{mode:?} does not name the refusal: {text}",
+            );
+            assert!(
+                !text.contains("building") && !text.contains("Building"),
+                "{mode:?} words a refused initialization as a build: {text}",
+            );
+        }
+    }
+
+    /// The workspace's own terminal source. A runtime that stopped with the daemon is terminal by
+    /// its own contract, so an empty slot it left behind will never be filled — while the runtime
+    /// states that merely describe work in progress leave the slot idle, and a failed runtime is
+    /// terminal only once the boot's thread has gone.
+    #[test]
+    fn the_workspaces_initialization_verdict_comes_from_its_own_runtime() {
+        let state = crate::state::SharedState::shared();
+        let verdict = |runtime: SemanticRuntimeStatus| {
+            *state.semantic_runtime().lock().unwrap() = runtime;
+            index_initialization(&state, crate::McpProfile::Workspace)
+        };
+        assert_eq!(
+            verdict(SemanticRuntimeStatus::Stopped),
+            EmptyIndex::Failed,
+            "a runtime stopped with the daemon will not fill the slot",
+        );
+        assert_eq!(verdict(SemanticRuntimeStatus::Indexing), EmptyIndex::Idle);
+        assert_eq!(verdict(SemanticRuntimeStatus::Disabled), EmptyIndex::Idle);
+        assert_eq!(
+            verdict(SemanticRuntimeStatus::Failed("engine refused".to_owned())),
+            EmptyIndex::Failed,
+        );
+
+        // And the rendering follows that verdict: the stopped runtime's terminal wording, with no
+        // "building" anywhere, for both profiles' shared surfaces.
+        *state.semantic_runtime().lock().unwrap() = SemanticRuntimeStatus::Stopped;
+        let result = search_status(
+            crate::McpProfile::Workspace,
+            state.search_engine(),
+            &Arc::new(IndexProgress::default()),
+            &state.semantic_runtime(),
+            WorkspaceSearchMode::SqliteLocal,
+            OverlayWarmupState::Pending,
+            None,
+            None,
+            false,
+            EmptyIndex::Failed,
+        )
+        .unwrap();
+        assert_eq!(result.structured_content.clone().unwrap()["state"], "failed");
+        let text = result.content[0].as_text().expect("text").text.clone();
+        assert!(text.contains("initialization failed"), "{text}");
+        assert!(!text.contains("building"), "{text}");
+    }
+
+    /// The boot's own window, on a workspace-shaped state: the engine slot is empty, the runtime
+    /// already carries a failure (a refused token profile is recorded before the engine is
+    /// published) — and the boot's thread is STILL RUNNING, so nothing here is terminal. The
+    /// verdict must come from that flag, not from the runtime.
+    ///
+    /// The window is real but not constructible: the flag is raised by the boot's constructor and
+    /// lowered by the init thread's own guard as it leaves, so a test that built a state and read
+    /// the flag would be racing that thread (and the constructor always starts it). The test
+    /// therefore stands in the window through the field's test seam — with the derivation itself
+    /// pinned below, so the flag cannot be dropped from the verdict unnoticed.
+    #[test]
+    fn a_building_workspace_with_a_failed_runtime_is_not_terminal() {
+        let state = crate::state::SharedState::shared();
+        *state.semantic_runtime().lock().unwrap() =
+            SemanticRuntimeStatus::Failed("engine refused".to_owned());
+        assert!(!state.search_initializing(), "no boot thread runs in this fixture");
+
+        // Control: with no boot thread, the same empty slot and the same runtime ARE terminal.
+        assert_eq!(
+            index_initialization(&state, crate::McpProfile::Workspace),
+            EmptyIndex::Failed,
+            "a gone boot thread plus a failed runtime is what terminal means here",
+        );
+
+        state.hold_search_initialization_for_test();
+        let initialization = index_initialization(&state, crate::McpProfile::Workspace);
+        assert_eq!(
+            initialization,
+            EmptyIndex::Initializing,
+            "the boot's thread is what makes a failed-looking empty slot a build in flight",
+        );
+
+        let result = search_status(
+            crate::McpProfile::Workspace,
+            state.search_engine(),
+            &Arc::new(IndexProgress::default()),
+            &state.semantic_runtime(),
+            WorkspaceSearchMode::SqliteLocal,
+            OverlayWarmupState::Pending,
+            None,
+            None,
+            false,
+            initialization,
+        )
+        .unwrap();
+        assert_eq!(
+            result.structured_content.clone().unwrap()["state"],
+            "loading",
+            "a build in flight is not a terminal state, however the runtime reads",
+        );
+        let text = result.content[0].as_text().expect("text").text.clone();
+        assert!(
+            text.contains("building") && text.contains("not published yet"),
+            "the window still reads as a build: {text}",
+        );
+        assert!(
+            !text.contains("unavailable") && !text.contains("waiting will not publish"),
+            "and never as a terminal failure: {text}",
         );
     }
 
@@ -1286,6 +1684,7 @@ mod tests {
             }),
             None,
             false,
+            EmptyIndex::Idle,
         )
         .unwrap();
         let text = result.content[0].as_text().expect("expected text content").text.as_str();
@@ -1332,6 +1731,7 @@ mod tests {
             }),
             Some(source),
             false,
+            EmptyIndex::Idle,
         )
         .unwrap();
         let text = result.content[0].as_text().expect("expected text content").text.as_str();
@@ -1366,6 +1766,7 @@ mod tests {
             }),
             Some(source),
             false,
+            EmptyIndex::Idle,
         )
         .unwrap();
         assert!(started.elapsed() < Duration::from_millis(500));
@@ -1387,6 +1788,7 @@ mod tests {
             None,
             None,
             true,
+            EmptyIndex::Idle,
         )
         .unwrap();
         let text = result.content[0].as_text().expect("expected text content").text.as_str();
@@ -1428,6 +1830,7 @@ mod tests {
             }),
             None,
             false,
+            EmptyIndex::Idle,
         )
         .unwrap();
         let text = result.content[0].as_text().expect("expected text content").text.as_str();
@@ -1465,6 +1868,7 @@ mod tests {
             }),
             None,
             false,
+            EmptyIndex::Idle,
         )
         .unwrap();
         let text = result.content[0].as_text().expect("expected text content").text.as_str();
@@ -1495,6 +1899,7 @@ mod tests {
                 postgres_baseline(),
                 None,
                 false,
+                EmptyIndex::Idle,
             )
             .unwrap()
             .content[0]
@@ -1557,12 +1962,17 @@ mod tests {
             None,
             None,
             false,
+            EmptyIndex::Idle,
         )
         .unwrap();
         let text = result.content[0].as_text().expect("text").text.as_str();
         assert!(text.contains("building"));
         assert!(text.contains("Indexing pending: initializing"));
         assert!(!text.contains("Indexing in progress"));
+        // The cold-build control for the terminal wording: an empty slot with a healthy runtime
+        // and no initialization flag must NOT read as a failed initialization.
+        assert!(!text.contains("initialization failed"), "{text}");
+        assert!(!text.contains("waiting will not publish"), "{text}");
     }
 
     #[test]
@@ -1598,6 +2008,7 @@ mod tests {
             }),
             None,
             false,
+            EmptyIndex::Idle,
             Duration::from_millis(40),
         )
         .unwrap();
