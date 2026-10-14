@@ -4038,7 +4038,7 @@ mod tests {
         );
 
         assert!(matches!(refused, Err(crate::graph_db::PatchError::Busy)));
-        assert!(started.elapsed() < crate::change_hub::test_support::STATE_CEILING);
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
         other.execute_batch("ROLLBACK").unwrap();
         assert_eq!(stored_revision(&fixture.db), 1);
     }

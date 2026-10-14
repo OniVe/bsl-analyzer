@@ -262,6 +262,7 @@ pub(super) mod tests {
         fs::write(&file, "Процедура Новая()\nКонецПроцедуры").unwrap();
         shared.lock().unwrap().as_ref().unwrap().mark_workspace_path_dirty(&file).unwrap();
         let held_lease = lease.hold_file_lock_for_test();
+        let started = std::time::Instant::now();
         let fences = lease.disk_checks_on_this_thread();
 
         let lexical = lexical_code_hits(
@@ -290,6 +291,7 @@ pub(super) mod tests {
             fences,
             "the lexical search consulted the lease it was denied, so it would wait on it"
         );
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
         drop(held_lease);
         let hybrid = hybrid_code(
             &shared,

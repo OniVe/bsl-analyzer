@@ -2356,6 +2356,7 @@ mod tests {
             .map(|_| transient.snapshot().expect("prepared descriptor"))
             .collect();
         let held_lock = transient_lease.hold_file_lock_for_test();
+        let started = Instant::now();
         let fences = transient_lease.disk_checks_on_this_thread();
         assert!(transient.snapshot().is_none(), "the fifth request gets an immediate miss");
         assert_eq!(
@@ -2363,6 +2364,7 @@ mod tests {
             fences,
             "a request miss consulted the lease, so it would wait on a lock it does not need"
         );
+        assert!(started.elapsed() < Duration::from_millis(100), "a request miss waited");
         drop(held_lock);
         drop(occupied);
     }
@@ -2473,6 +2475,7 @@ mod tests {
 
         let (_dir, graph, lease) = ready_graph();
         let held_lock = lease.hold_file_lock_for_test();
+        let started = Instant::now();
         let fences = lease.disk_checks_on_this_thread();
         assert!(matches!(graph.snapshot_blocking(), LeaseOperationOutcome::Applied(Some(_))));
         assert_eq!(
@@ -2480,6 +2483,7 @@ mod tests {
             fences,
             "pool checkout ran the preflight, which takes the lease lock it was just denied"
         );
+        assert!(started.elapsed() < Duration::from_millis(100), "pool checkout skips preflight");
         drop(held_lock);
 
         let _occupied = occupy(&graph);

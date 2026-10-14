@@ -6639,7 +6639,9 @@ mod tests {
 
         // The answer is the failure itself: a wait that had run out its thirty seconds would say
         // NotYet, so no clock is read to tell the two apart.
+        let asked = Instant::now();
         assert_eq!(hub.watch_readiness(Duration::from_secs(30)), WatchReadiness::Failed);
+        assert!(asked.elapsed() < Duration::from_secs(5), "the failure is answered at once");
         assert_eq!(hub.health(), Health::Degraded(DegradeReason::WatcherSetup));
     }
 
@@ -9469,7 +9471,9 @@ mod tests {
         let owed = hub.materialize(cursor).rescan_required;
         // The hub's own record of an announcement still to come is settled too: left standing,
         // it would hold back the reconcile a newcomer is handed the next time a root goes blind.
-        let settled = eventually(|| !hub.inner.blind_poll.reconcile_pending.load(Ordering::SeqCst));
+        let settled = crate::change_hub::test_support::eventually_within(200, || {
+            !hub.inner.blind_poll.reconcile_pending.load(Ordering::SeqCst)
+        });
         hub.shutdown();
         assert!(owed, "the reconcile a blind root owed was forgotten when the root went away");
         assert!(settled, "an announcement nobody will make was left pending");
@@ -9485,8 +9489,13 @@ mod tests {
             vec![b],
             64,
         );
+        let started = Instant::now();
         hub.shutdown();
-        assert!(eventually(|| !hub.blind_poll_running()), "the blind poll outlived the hub",);
+        assert!(
+            eventually_within(500, || !hub.blind_poll_running()),
+            "the blind poll outlived the hub",
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     /// A hub whose blind root `b` holds two files, with `subscribers` cursors taken before its
@@ -9892,10 +9901,10 @@ mod tests {
 
         let started = Instant::now();
         hub.wait_for_change(hub.generation(), Duration::from_secs(60));
-        assert!(started.elapsed() < Duration::from_secs(30), "a later wait slept on");
+        assert!(started.elapsed() < Duration::from_secs(1), "a later wait slept on");
         let started = Instant::now();
         hub.watch_readiness(Duration::from_secs(60));
-        assert!(started.elapsed() < Duration::from_secs(30), "a readiness wait slept on");
+        assert!(started.elapsed() < Duration::from_secs(1), "a readiness wait slept on");
         hub.shutdown();
     }
 
@@ -10650,7 +10659,7 @@ mod tests {
             let _ = done_tx.send(());
         });
         assert!(
-            done_rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING).is_ok(),
+            done_rx.recv_timeout(STOP_BUDGET * 3).is_ok(),
             "the drop of a hub nobody can join must end on its own budget"
         );
         // Only now: the thread is free to run out, and the temporary directory to go.

@@ -855,7 +855,7 @@ mod tests {
         assert!(Instant::now() >= due);
         stop.stop();
         hub.interrupt_waiters();
-        assert!(eventually(|| stop.live() == 0));
+        assert!(crate::change_hub::test_support::eventually_within(100, || stop.live() == 0));
     }
 
     /// Work handed over inside the sampling window is not slept through.

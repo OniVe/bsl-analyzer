@@ -3238,7 +3238,6 @@ mod tests {
     /// loss was already acted on" would be asserting it against the state before the fact.
     #[test]
     fn a_quiet_delivery_is_listed_only_once_the_ledger_has_it() {
-        use crate::change_hub::test_support::eventually;
         let dir = tempfile::tempdir().unwrap();
         let graph = GraphState::for_workspace(dir.path().to_path_buf());
         let ledger = lock_recover(&graph.debt);
@@ -3255,7 +3254,9 @@ mod tests {
             .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
             .expect("the delivery never set out");
         let listed_while_the_ledger_was_busy =
-            eventually(|| !graph.quiet_loss_deliveries().is_empty());
+            crate::change_hub::test_support::eventually_within(200, || {
+                !graph.quiet_loss_deliveries().is_empty()
+            });
         drop(ledger);
         delivering.join().expect("the delivering thread");
 
@@ -3474,7 +3475,7 @@ mod tests {
         // Answered asynchronously now, so the statement is given time to become false before
         // it is believed: a spent budget must still be spent after every kick has run.
         assert!(
-            !crate::change_hub::test_support::eventually(|| !matches!(
+            !crate::change_hub::test_support::eventually_within(200, || !matches!(
                 lock_recover(&spent.inner).status,
                 GraphStatus::Failed(_)
             )),

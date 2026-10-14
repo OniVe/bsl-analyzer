@@ -5333,7 +5333,7 @@ mod tests {
             let _ = done_tx.send(());
         });
         assert!(
-            done_rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING).is_ok(),
+            done_rx.recv_timeout(std::time::Duration::from_secs(1)).is_ok(),
             "shutdown never returned while the loader was busy"
         );
         assert!(state.worker.lock().unwrap().is_none());

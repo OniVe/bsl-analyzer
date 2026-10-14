@@ -1595,8 +1595,11 @@ mod tests {
         let asked = Instant::now();
         state.shutdown();
 
-        assert!(eventually(|| !state.sweeper_running()), "the sweeper slept through the shutdown");
-        assert!(asked.elapsed() < SWEEP_INTERVAL / 2, "the sweeper slept out its interval");
+        assert!(
+            crate::change_hub::test_support::eventually_within(100, || !state.sweeper_running()),
+            "the sweeper slept through the shutdown"
+        );
+        assert!(asked.elapsed() < Duration::from_secs(1), "the sweeper slept out its interval");
     }
 
     /// One resident build is exactly ONE traversal: the file set and the drift

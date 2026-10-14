@@ -407,17 +407,13 @@ mod tests {
             "the cancelled call must answer as cancelled"
         );
 
-        // The control compares the same neighbour call on a resident nobody holds. Both sides are
-        // taken under the same load, so only the ratio says whether the stand's walk is long
-        // enough for a cancel to make a difference.
-        // Measured on a fresh resident: the subject's own resident has just walked, and its warm
-        // memos would make the idle call cheaper than the stand's real overhead.
-        let idle = neighbour(ready_state(dir.path())).await;
+        // The positive control: a neighbour behind a live walk must wait a real second, or the
+        // stand cannot show a cancel freeing the slot. Load only lengthens that wait, so the bound
+        // cannot fail on a busy machine; it can only expose a stand that is too small.
         assert!(
-            waited_behind_a_live_call > idle * 3,
-            "positive control is inert: the neighbour waited {waited_behind_a_live_call:?} behind \
-             a LIVE call against {idle:?} on an idle resident, so this stand cannot show a cancel \
-             freeing the slot"
+            waited_behind_a_live_call > Duration::from_secs(1),
+            "positive control is inert: the neighbour waited only {waited_behind_a_live_call:?} \
+             behind a LIVE call, so this stand cannot show a cancel freeing the slot"
         );
         assert!(
             waited_behind_a_cancelled_call * 3 < waited_behind_a_live_call,

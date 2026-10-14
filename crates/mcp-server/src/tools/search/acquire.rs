@@ -579,7 +579,7 @@ mod tests {
         );
 
         assert!(matches!(outcome, Err(AcquireFailure::Poisoned)));
-        assert!(started.elapsed() < Duration::from_secs(15), "poison must not block on the cap");
+        assert!(started.elapsed() < Duration::from_secs(1), "poison must not block on the cap");
     }
 
     /// A request cancelled while queued on a held lock stops waiting at once: it is the

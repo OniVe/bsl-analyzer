@@ -3190,7 +3190,7 @@ mod tests {
             super::WatchWaitPolicy::new(Duration::from_millis(50), Duration::from_secs(600))
         ));
         assert!(
-            started.elapsed() < Duration::from_secs(300),
+            started.elapsed() < Duration::from_secs(5),
             "a permanent failure is not something to spend a budget on"
         );
     }

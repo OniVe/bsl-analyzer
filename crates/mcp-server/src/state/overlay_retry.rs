@@ -1518,7 +1518,11 @@ mod tests {
                 "the driver published an overlay after its daemon stopped, order {order:?}"
             );
         }
-        assert!(asked.elapsed() < TICK, "the six exits took {:?}", asked.elapsed());
+        assert!(
+            asked.elapsed() < Duration::from_secs(2),
+            "the six exits took {:?}",
+            asked.elapsed()
+        );
     }
 
     /// A driver sitting out a publication backoff is waiting, not working: the flag the

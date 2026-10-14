@@ -1296,7 +1296,7 @@ mod tests {
         finish_tx.send(()).unwrap();
         owner.join().unwrap();
         done_rx
-            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+            .recv_timeout(std::time::Duration::from_secs(1))
             .expect("shutdown completes after owner exit");
         shutdown.join().unwrap();
         assert!(!lease.owns_caches(), "lease release follows the last owner exit");
@@ -1664,7 +1664,7 @@ mod background_lifetime_tests {
         state.shutdown();
 
         assert!(
-            eventually(|| state.owners.live() == 0),
+            crate::change_hub::test_support::eventually_within(100, || state.owners.live() == 0),
             "{} owner(s) still running a second after shutdown",
             state.owners.live()
         );
@@ -1696,7 +1696,8 @@ mod background_lifetime_tests {
             "no owner came for the engine, so the stop below would prove nothing"
         );
         state.shutdown();
-        let left = eventually(|| state.owners.live() == 0);
+        let left =
+            crate::change_hub::test_support::eventually_within(100, || state.owners.live() == 0);
         let live = state.owners.live();
         drop(hold);
         assert!(left, "{live} owner(s) still waiting for the engine a second after shutdown");
@@ -1736,7 +1737,9 @@ mod background_lifetime_tests {
         std::thread::sleep(PERIOD * 6);
         assert_eq!(hub.poll_count(), stopped, "the poll outlived the daemon that owned it");
         assert!(
-            eventually(|| !state.diagnostics.sweeper_running()),
+            crate::change_hub::test_support::eventually_within(100, || !state
+                .diagnostics
+                .sweeper_running()),
             "the daemon's shutdown left the diagnostics sweeper running"
         );
     }
@@ -1781,7 +1784,10 @@ mod background_lifetime_tests {
         let stopped = hub.poll_count();
         std::thread::sleep(PERIOD * 6);
         assert_eq!(hub.poll_count(), stopped, "the blind poll outlived its daemon");
-        assert!(eventually(|| !hub.blind_poll_running()), "the blind poller thread is still there");
+        assert!(
+            crate::change_hub::test_support::eventually_within(100, || !hub.blind_poll_running()),
+            "the blind poller thread is still there"
+        );
     }
 
     /// An owner asleep in a hub wait is released by the stop itself, not by the hub's own
@@ -1833,7 +1839,7 @@ mod background_lifetime_tests {
         stop.stop();
 
         assert!(
-            left.recv_timeout(crate::change_hub::test_support::STATE_CEILING).is_ok(),
+            left.recv_timeout(std::time::Duration::from_secs(1)).is_ok(),
             "the owner slept through its stop"
         );
         hub.shutdown();

@@ -2807,7 +2807,7 @@ mod tests {
         // gives up after its acknowledgement timeout: ten times that is far above the timeout
         // itself, and far below the resolve's own wait, which a regression would sit out.
         assert!(
-            shut_rx.recv_timeout(super::shutdown_ack_timeout() * 10).is_ok(),
+            shut_rx.recv_timeout(Duration::from_millis(200)).is_ok(),
             "shutdown waited for a resolve that was still blocked"
         );
         gate_tx.send(()).unwrap();
@@ -2929,7 +2929,9 @@ mod tests {
     fn status_probe_first_call_returns_pending_without_blocking() {
         let service = unreachable_workspace_service();
 
+        let started = std::time::Instant::now();
         let probe = service.probe_status_cached();
+        assert!(started.elapsed() < Duration::from_millis(500), "probe_status_cached blocked");
 
         // The cached call leaves the probing to the background thread it kicked, so it has
         // nothing to answer with but Pending. A call that waited for the probe would answer

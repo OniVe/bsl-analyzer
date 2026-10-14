@@ -873,7 +873,10 @@ mod tests {
     fn finish(handle: &OverlayBacklog, stop: &OwnerStop) {
         stop.stop();
         handle.stop();
-        assert!(eventually(|| stop.live() == 0), "the owner stayed");
+        assert!(
+            crate::change_hub::test_support::eventually_within(100, || stop.live() == 0),
+            "the owner stayed"
+        );
     }
 
     /// An owner that is stopped however the test leaves. A test that asserts in the middle of
@@ -1522,7 +1525,10 @@ mod tests {
         handle.fresh();
         assert!(eventually(|| backlog(&shared) == 0));
         assert!(seen.load(Ordering::SeqCst), "a batch in progress did not count as work");
-        assert!(eventually(|| !handle.is_active()), "the owner stayed busy");
+        assert!(
+            crate::change_hub::test_support::eventually_within(200, || !handle.is_active()),
+            "the owner stayed busy"
+        );
         finish(&handle, &stop);
     }
 
@@ -1538,7 +1544,7 @@ mod tests {
         handle.fresh();
         assert!(eventually(|| backlog(&shared) == 0));
         assert!(
-            eventually(|| !handle.is_active()),
+            crate::change_hub::test_support::eventually_within(200, || !handle.is_active()),
             "an owner waiting out its idle tick still counts as working"
         );
         finish(&handle, &stop);
@@ -1870,9 +1876,11 @@ mod tests {
         assert_eq!(handle.probe.captures.load(Ordering::SeqCst), 1, "the reading did not run");
         assert!(handle.probe.publishes.load(Ordering::SeqCst) >= 1);
         assert!(!found(&shared, "Держат"), "a refused commit published");
+        let asked = Instant::now();
         stop.stop();
         handle.stop();
-        assert!(eventually(|| stop.live() == 0));
+        assert!(crate::change_hub::test_support::eventually_within(100, || stop.live() == 0));
+        assert!(asked.elapsed() < Duration::from_secs(1));
         drop(held);
     }
 

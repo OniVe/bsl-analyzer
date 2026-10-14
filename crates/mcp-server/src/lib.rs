@@ -3602,9 +3602,9 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// Hang guard for a call that must answer while the lease lock is held by the test. It is
-    /// never a speed bound: the assertions say what the answer is, not how soon it came.
-    const HANG_GUARD: Duration = Duration::from_secs(60);
+    /// Bound on a status answer while the lease lock is held by the test: the call must answer
+    /// at once, not after the lock's own wait, so the bound is the latency contract itself.
+    const HANG_GUARD: Duration = Duration::from_millis(500);
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn all_status_requests_are_cached_under_held_lease() {
