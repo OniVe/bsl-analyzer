@@ -1342,20 +1342,33 @@ mod tests {
 
         stop.stop();
 
-        // The calls below run on this thread while the holder keeps the lock: an owner that
-        // waited for the lock would never return from them, and no clock is needed to see it.
-        assert!(matches!(
-            SharedState::apply_workspace_search(&shared, &stop, &lease, |_| Ok(())),
-            WorkspaceSearchApply::Stopping
-        ));
-        assert!(matches!(
-            SharedState::apply_workspace_search_checkpointed(&shared, &stop, &lease, |_, _| {
-                std::ops::ControlFlow::Continue(Ok(()))
-            }),
-            WorkspaceSearchApply::Stopping
-        ));
+        // The calls run off this thread while the holder keeps the lock, so a call that waited
+        // for the lock is bounded by the wait below and fails, instead of holding the test.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (shared_c, stop_c, lease_c) = (Arc::clone(&shared), stop.clone(), lease.clone());
+        std::thread::spawn(move || {
+            let first = matches!(
+                SharedState::apply_workspace_search(&shared_c, &stop_c, &lease_c, |_| Ok(())),
+                WorkspaceSearchApply::Stopping
+            );
+            let second = matches!(
+                SharedState::apply_workspace_search_checkpointed(
+                    &shared_c,
+                    &stop_c,
+                    &lease_c,
+                    |_, _| { std::ops::ControlFlow::Continue(Ok(())) }
+                ),
+                WorkspaceSearchApply::Stopping
+            );
+            let _ = done_tx.send(first && second);
+        });
+        let answered = done_rx.recv_timeout(std::time::Duration::from_secs(1));
         release_tx.send(()).unwrap();
         holder.join().unwrap();
+        assert!(
+            answered.is_ok_and(|stopping| stopping),
+            "the owner waited out someone else's hold instead of leaving"
+        );
     }
 
     #[test]

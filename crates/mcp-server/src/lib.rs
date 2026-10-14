@@ -5930,10 +5930,22 @@ mod search_cancellation_matrix {
         release_tx
     }
 
-    fn assert_cancelled(answer: Result<CallToolResult, McpError>, cell: &str) {
+    /// How long a cancelled call may take to come back. Well above one poll (25 ms) and well
+    /// below every wait it must not sit out (a 2 s held lock, a 12 s embed, a latched actor).
+    const BOUND: std::time::Duration = std::time::Duration::from_millis(500);
+
+    fn assert_cancelled(
+        answer: Result<CallToolResult, McpError>,
+        elapsed: std::time::Duration,
+        cell: &str,
+    ) {
         let error =
             answer.err().unwrap_or_else(|| panic!("{cell}: a cancelled call produced a body"));
         assert_eq!(error.message, "request cancelled", "{cell}: {error:?}");
+        assert!(
+            elapsed < BOUND,
+            "{cell}: answered only after {elapsed:?}, i.e. after the held lock"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5956,13 +5968,14 @@ mod search_cancellation_matrix {
             let held = hold_lock(engine);
             let params =
                 Parameters(serde_json::from_value::<WorkspaceSearchParams>(arguments).unwrap());
+            let started = std::time::Instant::now();
             let answer = tokio::time::timeout(
                 crate::change_hub::test_support::STATE_CEILING,
                 server.workspace_search(params, cancelled_token()),
             )
             .await
             .expect("a cancelled request answers while the lock is still held");
-            assert_cancelled(answer, cell);
+            assert_cancelled(answer, started.elapsed(), cell);
             drop(held);
         }
         server.shutdown();
@@ -5982,13 +5995,14 @@ mod search_cancellation_matrix {
                 )
                 .unwrap(),
             );
+            let started = std::time::Instant::now();
             let answer = tokio::time::timeout(
                 crate::change_hub::test_support::STATE_CEILING,
                 server.reference_search(params, cancelled_token()),
             )
             .await
             .expect("a cancelled request answers while the lock is still held");
-            assert_cancelled(answer, action);
+            assert_cancelled(answer, started.elapsed(), action);
             drop(held);
         }
         server.shutdown();
