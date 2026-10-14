@@ -26,12 +26,12 @@ fn isolated(test: &str) -> bool {
         .unwrap();
     // The two fixture watchdogs together fit the 180-second acceptance budget.
     let seconds = if test == "indexing_polling_smoke" { 150 } else { 30 };
-    let mut deadline = crate::change_hub::test_support::Patience::new(
-        std::time::Duration::from_secs(seconds),
-        std::time::Duration::from_millis(10),
-    );
+    // A wall-clock budget on purpose: this is the acceptance budget of the fixture, not a state
+    // wait, and the message names it in seconds.
+    let started = std::time::Instant::now();
+    let budget = Duration::from_secs(seconds);
     while child.try_wait().unwrap().is_none() {
-        if !deadline.allows() {
+        if started.elapsed() >= budget {
             child.kill().unwrap();
             child.wait().unwrap();
             panic!("isolated runtime fixture exceeded {seconds} seconds");

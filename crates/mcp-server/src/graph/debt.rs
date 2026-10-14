@@ -1598,6 +1598,12 @@ impl GraphDebt {
         }
     }
 
+    /// Whether a recovery walk is out, for a test to wait on before it reads the walk counter.
+    #[cfg(test)]
+    pub(super) fn walk_out(&self) -> bool {
+        self.probe_owner.is_some()
+    }
+
     /// Take the episode's one probe reservation, with the basis and the whole outstanding set
     /// to observe.
     ///
@@ -1605,12 +1611,6 @@ impl GraphDebt {
     /// leaves it alone, instead of opening the same tree beside it. The plan carries P, not
     /// the newest unread list — an obligation the latest enumeration did not mention still has
     /// to be looked at, or it would keep its memory and lose its observer.
-    /// Whether a recovery walk is out, for a test to wait on before it reads the walk counter.
-    #[cfg(test)]
-    pub(super) fn walk_out(&self) -> bool {
-        self.probe_owner.is_some()
-    }
-
     pub(super) fn reserve_probe(&mut self) -> Option<ProbePlan> {
         if self.probe_owner.is_some() {
             // A walk is out. Not "a walk of this episode": the consumer holding it is still
