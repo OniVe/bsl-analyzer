@@ -36,7 +36,7 @@ use crate::{McpProfile, McpServer};
 /// Consumers should require an exact major and a minimum minor. Bump this by hand in the
 /// same commit that changes the surface; the snapshot test over [`document`] puts the
 /// version field next to the change in the diff.
-pub const CONTRACT_VERSION: &str = "3.4";
+pub const CONTRACT_VERSION: &str = "3.5";
 
 /// URI of the MCP resource carrying [`document`].
 pub const CONTRACT_URI: &str = "bsl-analyzer://contract";
@@ -541,7 +541,7 @@ mod tests {
     #[test]
     fn indexing_discovery_contract() {
         use crate::indexing::{Indexing, Kind, State, Target};
-        assert_eq!(CONTRACT_VERSION, "3.4");
+        assert_eq!(CONTRACT_VERSION, "3.5");
         let indexing = serde_json::to_value(Indexing::single(Target::new(
             Kind::Reference,
             State::Ready,
@@ -927,7 +927,7 @@ mod tests {
         doc.insert("mcp".into(), mcp_surface());
         expect![[r#"
             {
-              "contract_version": "3.4",
+              "contract_version": "3.5",
               "mcp": {
                 "profiles": {
                   "reference": {
@@ -1051,7 +1051,7 @@ mod tests {
                         "actions": [],
                         "name": "references",
                         "note": "one of `symbol` or `path` with `line` and/or `line_content` is required; opt-in — a launch has to name it with `--enable-tool references`",
-                        "output_schema_fingerprint": "blake3:859cbcac6a3e708b603de266d134c2a0782de818e4a220144fa6fc4bedd1519a",
+                        "output_schema_fingerprint": "blake3:2ee4fa6ea2bec6f9acd52f43f1aa20ed950fc9db1c30a48f45de299dbf772a4a",
                         "output_schema_version": "1",
                         "params": [
                           {
@@ -1772,7 +1772,7 @@ mod tests {
                         "actions": [],
                         "name": "symbol_info",
                         "note": "one of `symbol` or `path`+`line` is required",
-                        "output_schema_fingerprint": "blake3:117d545855a5f8370e8835fb9ec1903166654396c7fd3e74282439f3c1dff9cf",
+                        "output_schema_fingerprint": "blake3:e32381f657fb0794a3f919d6efb66d7d8e0ac941e6c12a1fffd7b0fd1da0c48e",
                         "output_schema_version": "1",
                         "params": [
                           {

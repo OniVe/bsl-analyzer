@@ -544,15 +544,23 @@ config reload.
 результатом. Конверт машиночитаемый у всех: в `structuredContent` лежит `status` —
 `"loading"` у `metadata`, `symbol_info`, `diagnostics`, `graph` и `references`,
 `"not_ready"` у `search`.
-Читающие резидент (`metadata`, `symbol_info`, `diagnostics`, `references`) добавляют `detail`, `state`,
-`generation` и `elapsed_ms`; `graph` — `detail`; `search` — `retry_after_ms` и `progress`. Проверять
+У резидентных инструментов (`metadata`, `symbol_info`, `diagnostics`, `references`) у
+`status` есть и второе значение — `"failed"`: резидент не собрался, и повторить запрос
+надо по расписанию, а не сразу. Вместе с ним те же инструменты публикуют `error`
+(причина отказа), `retry_after_ms` (сколько ждать до следующей попытки; `0` — она уже
+разрешена), `attempts` (сколько попыток подряд не удалось) и `failed_age_ms` (сколько
+прошло с отказа). Если сборка не удалась и повтор не разрешён, те же инструменты отвечают
+RPC-ошибкой, у которой `error.data` — `{state, reason, generation, attempts,
+retry_after_ms, failed_age_ms}`: причина там называется `reason`, и она повторяет
+человеческую строку ответа. `graph` — `detail`; `search` — `retry_after_ms` и `progress`. Проверять
 нужно именно поле: у `metadata` рядом с конвертом остаётся человекочитаемая фраза
 «Метаданные загружаются…», и распознавание по ней ненадёжно — та же фраза может встретиться
 в теле модуля и попасть в вывод инструмента как настоящий результат.
 
 Готовность резидента опрашивается без построения ответа: `metadata action=status` и
 `diagnostics action=status` возвращают один и тот же снимок жизненного цикла
-(`state`/`generation`/`reload`, плюс `files`/`elapsed_ms`/`error`/`watch` где применимо),
+(`state`/`generation`/`reload`, плюс `files`/`elapsed_ms`/`error`/`watch` и, при отказе,
+`retry_after_ms`/`attempts`/`failed_age_ms`),
 `graph action=status` — свой (`state`, и при `ready` — `files`/`revision`/`stale`/`reload`).
 
 ## Карточка символа: структурная выдача `symbol_info`

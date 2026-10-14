@@ -104,6 +104,11 @@ impl DiagnosticsState {
         *lock_recover(&self.pre_force_probe) = Some(Box::new(f));
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_failure_probe(&self, f: impl FnOnce() + Send + 'static) {
+        *lock_recover(&self.failure_probe) = Some(Box::new(f));
+    }
+
     pub(super) fn poll_drift(&self) {
         let Some(root) = self.workspace_root.clone() else {
             return;
@@ -1094,6 +1099,30 @@ impl DiagnosticsState {
     #[cfg(test)]
     pub(super) fn fire_pre_force_probe(&self) {
         let probe = lock_recover(&self.pre_force_probe).take();
+        if let Some(probe) = probe {
+            probe();
+        }
+    }
+
+    /// Fire the failure snapshot's one-shot seam, if a test armed one — see
+    /// [`Inner::failure_probe`].
+    #[cfg(test)]
+    pub(super) fn fire_failure_probe(&self) {
+        let probe = lock_recover(&self.failure_probe).take();
+        if let Some(probe) = probe {
+            probe();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_load_start_probe(&self, f: impl FnOnce() + Send + 'static) {
+        *lock_recover(&self.load_start_probe) = Some(Box::new(f));
+    }
+
+    /// Fire the loader's start seam, if a test armed one — see [`Inner::load_start_probe`].
+    #[cfg(test)]
+    pub(super) fn fire_load_start_probe(&self) {
+        let probe = lock_recover(&self.load_start_probe).take();
         if let Some(probe) = probe {
             probe();
         }

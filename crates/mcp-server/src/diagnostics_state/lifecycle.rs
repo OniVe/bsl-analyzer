@@ -24,6 +24,169 @@ const IDLE_EVICTION: Duration = Duration::from_secs(600);
 /// How often the idle sweeper wakes to check the last-access time.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
+/// The pause after the FIRST failed build before another attempt is allowed, doubled per
+/// consecutive failure and capped by [`RETRY_CAP`]. A failure is retryable, but a tree
+/// that cannot be read will not start reading by being asked again in a tight loop.
+pub(super) const RETRY_BASE: Duration = Duration::from_secs(5);
+
+/// The ceiling of the failed-build retry backoff: a build that keeps failing is retried
+/// at most this often.
+pub(super) const RETRY_CAP: Duration = Duration::from_secs(60);
+
+/// How long a `Loading` build may run before the sweeper publishes it as `Failed`.
+///
+/// Without this a build that hangs pins every reader on `loading` for ever: the loader
+/// thread's own completion is what would clear `loading_since`, and a stuck thread never
+/// reaches it. The default is generous on purpose — a cold resident build over a large
+/// configuration takes minutes, and a deadline that fires into a working build turns a
+/// slow answer into a spurious failure. It is a backstop for a hung thread, not a budget.
+pub(super) const BUILD_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The floor of the retry base. Nothing may pace a retry faster than this, whatever the
+/// environment says: a base of a second turns every transient read failure into a build
+/// storm, and the deadline below would publish each attempt as `Failed` before it could
+/// finish — a schedule that manufactures the very failures it is pacing.
+pub(super) const MIN_RETRY_BASE: Duration = RETRY_BASE;
+
+/// The floor of the build deadline: a deadline shorter than this fails working builds on a
+/// large configuration, which is a spurious failure, not a backstop.
+pub(super) const MIN_BUILD_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The retry base this process runs with: `BSL_MCP_DIAG_RETRY_BASE_SECS`, floored at
+/// [`MIN_RETRY_BASE`]. Unset and zero both mean the default, like `BSL_MCP_RECONCILE_SECS`.
+fn clamp_retry_base(secs: Option<u64>) -> Duration {
+    secs.filter(|secs| *secs > 0)
+        .map_or(RETRY_BASE, |secs| Duration::from_secs(secs).max(MIN_RETRY_BASE))
+}
+
+/// The retry ceiling this process runs with: `BSL_MCP_DIAG_RETRY_CAP_SECS`, never below the
+/// base it caps (a ceiling under the floor is not a ceiling — it is the floor wearing the
+/// other name, and the caller that set it believes the schedule is longer than it is).
+fn clamp_retry_cap(secs: Option<u64>, base: Duration) -> Duration {
+    secs.filter(|secs| *secs > 0)
+        .map_or(RETRY_CAP.max(base), |secs| Duration::from_secs(secs).max(base))
+}
+
+/// The build deadline this process runs with: `BSL_MCP_DIAG_BUILD_TIMEOUT_SECS`, floored at
+/// [`MIN_BUILD_TIMEOUT`].
+fn clamp_build_timeout(secs: Option<u64>) -> Duration {
+    secs.filter(|secs| *secs > 0)
+        .map_or(BUILD_TIMEOUT, |secs| Duration::from_secs(secs).max(MIN_BUILD_TIMEOUT))
+}
+
+fn env_secs(name: &str) -> Option<u64> {
+    std::env::var(name).ok().and_then(|s| s.parse::<u64>().ok())
+}
+
+/// The pacing this process runs with, read once at construction: the failed-build retry
+/// `(base, cap)` and the build deadline, each clamped to its floor. Overridable from the
+/// environment because the schedule is a deployment property — a CI box can afford a faster
+/// retry than a laptop — and clamped because a schedule below the floors is not a schedule,
+/// it is a source of spurious failures.
+fn pacing_from_env() -> Pacing {
+    let base = clamp_retry_base(env_secs("BSL_MCP_DIAG_RETRY_BASE_SECS"));
+    let cap = clamp_retry_cap(env_secs("BSL_MCP_DIAG_RETRY_CAP_SECS"), base);
+    let build_timeout = clamp_build_timeout(env_secs("BSL_MCP_DIAG_BUILD_TIMEOUT_SECS"));
+    Pacing { base, cap, build_timeout }
+}
+
+/// The three pacing values the resident lifecycle is run with. Held TOGETHER in the state the
+/// mutex guards, never on the handle: a handle is cloned freely (every request takes one) and
+/// a pacing that lived on the clone would be read by whichever clone happened to ask while the
+/// others — the loader, the sweeper, the daemon's own handle — kept the old one.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Pacing {
+    /// Pause after the first failed build; doubles per consecutive failure (see [`retry_delay`]).
+    pub(super) base: Duration,
+    /// Ceiling of that backoff.
+    pub(super) cap: Duration,
+    /// How long a `Loading` build may run before the sweeper publishes it as `Failed`.
+    pub(super) build_timeout: Duration,
+}
+
+/// The pause before the attempt that follows `attempts` consecutive failures: `base`
+/// doubled per failure, capped. Pure, so the schedule is provable apart from the clock —
+/// the same shape `state::overlay_retry::retry_delay` publishes for its own owner.
+pub(super) fn retry_delay(base: Duration, cap: Duration, attempts: u32) -> Duration {
+    if attempts == 0 {
+        return Duration::ZERO;
+    }
+    // The EXPONENT is clamped, not the product: `base * 2^40` overflows the multiplication
+    // long before the cap could bite, and a saturating multiply is not the schedule.
+    let exponent = attempts.saturating_sub(1).min(20);
+    base.saturating_mul(1u32 << exponent).min(cap)
+}
+
+/// Milliseconds of `span`, saturated at `u64::MAX`: a duration that long is not a number any
+/// caller acts on, and wrapping it into a small one would read as "no wait owed".
+fn millis(span: Duration) -> u64 {
+    u64::try_from(span.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The pause a failed build still owes at `now`: `None` when the retry is due. `None` too
+/// for a failure nobody stamped here (a state written from outside): waiting would be
+/// waiting on a clock that was never set, so the attempt is allowed at once.
+fn retry_wait(inner: &Inner, now: Instant) -> Option<Duration> {
+    let failed_at = inner.failed_at?;
+    let delay = retry_delay(inner.pacing.base, inner.pacing.cap, inner.failed_attempts);
+    let Some(due) = failed_at.checked_add(delay) else {
+        // A clock far enough out that the deadline cannot be represented: the pause is not
+        // "already over", so the retry waits out the ceiling instead of firing at once.
+        return Some(inner.pacing.cap);
+    };
+    (due > now).then(|| due - now)
+}
+
+/// Publish a build failure on `inner`: the reason, its clock and the attempt count behind
+/// it. Shared by `run_load`'s error arm and the sweeper's build deadline, so a build that
+/// failed and one that never finished leave the SAME state — a cause the caller can see
+/// and a retry paced from the same schedule.
+fn publish_build_failure(inner: &mut Inner, message: String) {
+    inner.loading_since = None;
+    inner.failed_attempts = inner.failed_attempts.saturating_add(1);
+    inner.failed_at = Some(Instant::now());
+    inner.failed_message = Some(message.clone());
+    inner.status = DiagnosticsStatus::Failed(message);
+}
+
+/// What a caller still needs after [`publish_build_success`] moved the built resident into
+/// the state: the scan roots the hub is re-armed on, and the two identity values that re-arm
+/// is guarded by.
+struct PublishTail {
+    files: usize,
+    scan_roots: Vec<PathBuf>,
+    physical_topology: u64,
+    declaration_epoch: u64,
+}
+
+/// Publish a built resident on `inner`: the swap-in EVERY successful (re)build performs, in
+/// one place so a first build and a reload cannot publish different states. A reload that
+/// forgot to clear the failure bookkeeping, say, would leave a `Ready` resident still
+/// reporting the cause it answered.
+fn publish_build_success(inner: &mut Inner, built: ResidentBuild) -> PublishTail {
+    let files = built.resident.file_count();
+    inner.resident = Some(built.resident);
+    inner.stats = built.stats;
+    inner.baseline_epoch += 1;
+    inner.config_fp = built.config_fp;
+    inner.topology = built.topology;
+    inner.generation += 1;
+    inner.reload = ReloadState::Idle;
+    inner.loading_since = None;
+    // A build that succeeded answers both the failure it retried and the schedule that
+    // failure was being retried on: the next failure starts again from the base pause.
+    inner.failed_message = None;
+    inner.failed_at = None;
+    inner.failed_attempts = 0;
+    inner.status = DiagnosticsStatus::Ready { files };
+    PublishTail {
+        files,
+        scan_roots: built.scan_roots,
+        physical_topology: built.physical_topology,
+        declaration_epoch: built.declaration_epoch,
+    }
+}
+
 /// One resident build's output: the resident itself, the drift baseline and the
 /// config identity (all derived from the SAME project snapshot), plus that
 /// snapshot's scan roots for the post-publish hub re-arm.
@@ -72,8 +235,42 @@ pub(super) struct Inner {
     pub(super) baseline_epoch: u64,
     pub(super) reload: ReloadState,
     /// When the current `Loading` build started, for the `status`/`loading` envelope's
-    /// `elapsed_ms`. Set on `Idle → Loading`, cleared when the resident becomes `Ready`.
+    /// `elapsed_ms`. Set on `Idle → Loading` (and on `Failed → Loading`), cleared when the
+    /// build publishes an outcome.
     pub(super) loading_since: Option<Instant>,
+    /// The message of the last published build failure. Kept while a retry of that failure
+    /// runs — a `Loading` that erased the cause would leave a caller unable to tell a retry
+    /// from a first attempt — and cleared when a build finally succeeds.
+    pub(super) failed_message: Option<String>,
+    /// When that failure was published: the clock the retry backoff is measured from (the
+    /// observable form of it is `failed_age_ms`). Cleared on success.
+    pub(super) failed_at: Option<Instant>,
+    /// Consecutive failed build attempts since the last successful one. Indexes the retry
+    /// schedule: the attempt after the n-th failure waits `retry_delay(n)`.
+    pub(super) failed_attempts: u32,
+    /// The retry pacing and the build deadline (see [`Pacing`]). Bound to the STATE, not to a
+    /// handle: clones are handed to every request, the loader and the sweeper, and pacing read
+    /// off a clone would be that clone's pacing alone.
+    pub(super) pacing: Pacing,
+    /// The build attempt in flight, and the token that tells a live one from a retired one.
+    ///
+    /// Bumped when an attempt is STARTED (`ensure_loading`) and when a live one is RETIRED
+    /// (the deadline giving up on it). `run_load` captures its token and publishes its outcome
+    /// only while the state still holds it: a build the deadline already gave up on may finish
+    /// minutes later, and publishing it unconditionally is how a stale success replaces a
+    /// newer resident — or a stale failure takes one down, refusing every reader, stopping
+    /// eviction and pinning the hub cursor — under a state that is already serving.
+    pub(super) build_attempt: u64,
+    /// One-shot test gate every loader waits in before publishing, so a test can HOLD one
+    /// attempt while another runs and observe which of the two the state accepts. Unarmed in
+    /// production, where it is not read at all.
+    #[cfg(test)]
+    pub(super) build_gate: Option<Arc<BuildGate>>,
+    /// How many loaders found their token retired and published nothing. The only way a test
+    /// can see a REFUSAL: the state a refused attempt leaves behind is exactly the state it
+    /// found, which is indistinguishable from an attempt that never ran.
+    #[cfg(test)]
+    pub(super) stale_build_publications: Arc<AtomicUsize>,
 }
 
 /// Handle to the workspace diagnostics database. Cheap to clone (shared `Arc`s).
@@ -178,11 +375,94 @@ pub(crate) struct DiagnosticsState {
     /// it is read, rather than earlier and hope it survives.
     #[cfg(test)]
     pub(super) pre_force_probe: ReconcileProbe,
+    /// One-shot test seam fired INSIDE the failure snapshot, between the read that came back
+    /// failed and the lifecycle sample that words it. That window is the only one in which the
+    /// state can move on under an answer already decided to be a failure, and the seam is what
+    /// makes the race a schedule instead of a hope.
+    #[cfg(test)]
+    pub(super) failure_probe: ReconcileProbe,
+    /// One-shot test seam fired at the very start of a loader, before it reads or touches
+    /// anything — the only moment at which an attempt can be retired before it takes a cursor,
+    /// and therefore the only place the "retired attempts touch nothing" rule can be observed.
+    #[cfg(test)]
+    pub(super) load_start_probe: ReconcileProbe,
 }
 
 /// A one-shot callback the reconciler fires between its first drain and its scan.
 #[cfg(test)]
 pub(super) type ReconcileProbe = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
+/// The gate a test holds a loader in before it publishes.
+///
+/// The subject of the build-attempt token is a race between two attempts, and a race a test
+/// cannot schedule is one it cannot observe: without a hold, the first attempt publishes
+/// before the second is even started, and the test proves nothing but that builds finish.
+/// So the loader's publish step is gated — the test arms the gate, waits until the attempts
+/// it wants are inside it, and releases them together, which is the one arrangement in which
+/// "both are live and only one may publish" is a fact rather than a hope.
+#[cfg(test)]
+pub(crate) struct BuildGate {
+    shared: Arc<(Mutex<GateState>, std::sync::Condvar)>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct GateState {
+    held: usize,
+    released: bool,
+}
+
+#[cfg(test)]
+impl BuildGate {
+    /// The loader's side: raise the count, then wait for the release. Bounded twice over, so a
+    /// test that panics while holding the gate — or simply forgets it — cannot leave a build
+    /// thread parked for the life of the process: each wait times out, and the whole hold ends
+    /// after [`BuildGate::HOLD_BUDGET`], after which the loader publishes as if unarmed.
+    fn hold(&self) {
+        let started = Instant::now();
+        let (lock, wake) = &*self.shared;
+        let mut state = lock_recover(lock);
+        state.held += 1;
+        wake.notify_all();
+        while !state.released && started.elapsed() < Self::HOLD_BUDGET {
+            let (next, _) = wake
+                .wait_timeout(state, Duration::from_secs(1))
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+        }
+    }
+
+    /// How long a loader may be held before it gives up on the gate. Far longer than any gate
+    /// in this file holds one (they hold for milliseconds), and far shorter than the harness
+    /// itself.
+    const HOLD_BUDGET: Duration = Duration::from_secs(20);
+
+    /// How many loaders are parked in the gate right now.
+    fn held(&self) -> usize {
+        lock_recover(&self.shared.0).held
+    }
+
+    /// The test's side: what the subject is, so it is a gate and not a sleep.
+    #[cfg(test)]
+    pub(crate) fn wait_until_held(&self, count: usize, what: &str) {
+        let started = Instant::now();
+        while self.held() < count {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "{what}: only {} of {count} loaders reached the gate",
+                self.held(),
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Let every parked loader publish. One-way: a gate is used once.
+    pub(crate) fn release(&self) {
+        let (lock, wake) = &*self.shared;
+        lock_recover(lock).released = true;
+        wake.notify_all();
+    }
+}
 
 impl DiagnosticsState {
     /// A disabled handle (reference / shared profiles).
@@ -213,8 +493,42 @@ impl DiagnosticsState {
     #[cfg(test)]
     pub(crate) fn fail_for_test(&self, message: &str) {
         let mut inner = lock_recover(&self.inner);
-        inner.loading_since = None;
-        inner.status = DiagnosticsStatus::Failed(message.to_owned());
+        publish_build_failure(&mut inner, message.to_owned());
+    }
+
+    /// State the retry schedule this handle runs with, for a test whose subject is the
+    /// pacing rather than the number it starts from. The pacing lives in the STATE, so this
+    /// reaches the loader, the sweeper and every clone — a handle-level setting would be
+    /// invisible to all three, and the gate built on it would be measuring the defaults.
+    #[cfg(test)]
+    pub(crate) fn with_retry_pacing_for_test(&self, base: Duration, cap: Duration) {
+        let mut inner = lock_recover(&self.inner);
+        inner.pacing.base = base;
+        inner.pacing.cap = cap;
+    }
+
+    /// State the build deadline this handle runs with, for a test whose subject is the
+    /// sweeper's deadline (see [`Self::expire_stuck_build`]).
+    #[cfg(test)]
+    pub(crate) fn with_build_timeout_for_test(&self, timeout: Duration) {
+        lock_recover(&self.inner).pacing.build_timeout = timeout;
+    }
+
+    /// Arm the loader gate every build waits in before publishing, and hand back the handle a
+    /// test releases it with. Disarmed by never arming it, which is what production does.
+    #[cfg(test)]
+    pub(crate) fn arm_build_gate_for_test(&self) -> Arc<BuildGate> {
+        let gate = Arc::new(BuildGate {
+            shared: Arc::new((Mutex::new(GateState::default()), std::sync::Condvar::new())),
+        });
+        lock_recover(&self.inner).build_gate = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// How many loaders found their token retired and published nothing.
+    #[cfg(test)]
+    pub(crate) fn stale_build_publications(&self) -> usize {
+        lock_recover(&self.inner).stale_build_publications.load(Ordering::SeqCst)
     }
 
     pub(crate) fn for_workspace(workspace_root: PathBuf) -> Self {
@@ -240,6 +554,15 @@ impl DiagnosticsState {
                 baseline_epoch: 0,
                 reload: ReloadState::Idle,
                 loading_since: None,
+                failed_message: None,
+                failed_at: None,
+                failed_attempts: 0,
+                pacing: pacing_from_env(),
+                build_attempt: 0,
+                #[cfg(test)]
+                build_gate: None,
+                #[cfg(test)]
+                stale_build_publications: Arc::new(AtomicUsize::new(0)),
             })),
             scan: Arc::new(Mutex::new(None)),
             last_access: Arc::new(Mutex::new(Instant::now())),
@@ -276,6 +599,10 @@ impl DiagnosticsState {
             pre_drain_probe: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             pre_force_probe: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            failure_probe: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            load_start_probe: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -302,6 +629,21 @@ impl DiagnosticsState {
         };
         let error = match &inner.status {
             DiagnosticsStatus::Failed(msg) => Some(msg.clone()),
+            // A retry keeps the cause of the failure it answers: without it the caller sees
+            // a `loading` it cannot tell from a first attempt, and the reason it is being
+            // made at all would be known only to the log.
+            DiagnosticsStatus::Loading => inner.failed_message.clone(),
+            _ => None,
+        };
+        let now = Instant::now();
+        // Owed only while FAILED: a build in flight has already been started, so there is
+        // nothing to wait for and `elapsed_ms` speaks for it instead. `Some(0)` means the
+        // next attempt is due now — a different fact from `None` ("no wait is owed because
+        // nothing is being retried").
+        let retry_after_ms = match &inner.status {
+            DiagnosticsStatus::Failed(_) => {
+                inner.failed_at.map(|_| retry_wait(&inner, now).map_or(0, millis))
+            }
             _ => None,
         };
         let watch = self.change_hub.as_ref().map(|hub| {
@@ -323,7 +665,10 @@ impl DiagnosticsState {
             unread_files: inner.resident.as_ref().map(|r| r.unread_count()),
             reload: inner.reload.label(),
             error,
-            elapsed_ms: inner.loading_since.map(|t| t.elapsed().as_millis() as u64),
+            elapsed_ms: inner.loading_since.map(|t| millis(t.elapsed())),
+            failed_age_ms: inner.failed_at.map(|at| millis(now.saturating_duration_since(at))),
+            attempts: inner.failed_attempts,
+            retry_after_ms,
             watch,
         }
     }
@@ -349,21 +694,47 @@ impl DiagnosticsState {
         wake.notify_all();
     }
 
-    /// Trigger the background build if this is the first call (or the db was evicted).
-    /// Transitions `Idle → Loading` and spawns exactly one loader thread; later calls
-    /// return immediately. No-op for disabled / loading / ready / failed states.
+    /// Trigger the background build if this is the first call (or the db was evicted, or a
+    /// failed build's backoff has elapsed). Transitions `Idle → Loading` and spawns exactly
+    /// one loader thread; later calls return immediately. No-op for disabled / loading /
+    /// ready, and for a failure that is not yet due for another attempt.
+    ///
+    /// A FAILED build is retryable, on a backoff (see [`RETRY_BASE`]/[`RETRY_CAP`]): the
+    /// attempt that follows the n-th failure waits `retry_delay(n)` from the moment that
+    /// failure was published. A caller arriving inside the pause is refused here and reads
+    /// the remaining wait off the status — asking again never spends an attempt, so a poller
+    /// cannot turn its own polling into a build storm. The retry runs the same path a first
+    /// load does, so a resident left behind by the failed attempt (a hub cursor, say) is
+    /// re-derived from scratch rather than half-reused.
+    ///
+    /// EXACTLY ONE attempt holds the right to PUBLISH an outcome, and that right is the
+    /// [`Inner::build_attempt`] token handed to the loader here: the transition to `Loading`
+    /// happens under the lock and stamps the attempt, so an attempt the deadline later retires
+    /// can neither take a cursor nor publish its ending. The retired attempt's THREAD may well
+    /// live on (a build that is merely slow finishes its walk) — what it loses is the right to
+    /// say anything: its outcome is discarded, and the state keeps what the attempt that
+    /// replaced it published.
     pub(crate) fn ensure_loading(&self) {
         if self.workspace_root.is_none() {
             return;
         }
-        {
+        let attempt = {
             let mut inner = lock_recover(&self.inner);
-            if inner.status != DiagnosticsStatus::Idle {
-                return;
+            match inner.status {
+                DiagnosticsStatus::Idle => {}
+                DiagnosticsStatus::Failed(_) => {
+                    let now = Instant::now();
+                    if retry_wait(&inner, now).is_some() {
+                        return;
+                    }
+                }
+                _ => return,
             }
+            inner.build_attempt = inner.build_attempt.wrapping_add(1);
             inner.status = DiagnosticsStatus::Loading;
             inner.loading_since = Some(Instant::now());
-        }
+            inner.build_attempt
+        };
         // Spawn the single idle sweeper on first use (it outlives evict→rebuild cycles).
         if !self.sweeper_started.swap(true, Ordering::SeqCst) {
             self.spawn_sweeper();
@@ -371,11 +742,14 @@ impl DiagnosticsState {
         let state = self.clone();
         let spawned = std::thread::Builder::new()
             .name("bsl-diag-init".to_owned())
-            .spawn(move || state.run_load());
+            .spawn(move || state.run_load(attempt));
         if let Err(e) = spawned {
             let mut inner = lock_recover(&self.inner);
-            inner.loading_since = None;
-            inner.status = DiagnosticsStatus::Failed(format!("could not spawn loader: {e}"));
+            // The loader never started, so this attempt is over: its failure is published by
+            // the caller that started it, under the token it was given.
+            if inner.build_attempt == attempt {
+                publish_build_failure(&mut inner, format!("could not spawn loader: {e}"));
+            }
         }
     }
 
@@ -580,57 +954,106 @@ impl DiagnosticsState {
 
     /// The initial resident build: load every `.bsl` text into a fresh database with
     /// the LSP-equivalent inputs, index path→FileId, record the drift baseline, and
-    /// publish `Ready`. On success spawns the idle sweeper.
-    fn run_load(&self) {
+    /// publish `Ready`.
+    ///
+    /// `attempt` is the token `ensure_loading` handed out for this loader. The outcome — a
+    /// resident or a failure — is published ONLY while the state still holds that token: a
+    /// build the sweeper's deadline has given up on keeps running in its thread, and both of
+    /// its endings are wrong by the time it reaches them. Its success would swap in a
+    /// resident built from a baseline older than the one the replacing attempt is publishing;
+    /// its failure would take a `Ready` resident down — every reading tool refusing over a
+    /// database that is right there, eviction unable to drop it and the hub cursor never
+    /// released. A retired attempt publishes NOTHING and says so in the log.
+    fn run_load(&self, attempt: u64) {
         let Some(root) = self.workspace_root.clone() else {
             return;
         };
+        #[cfg(test)]
+        self.fire_load_start_probe();
+        // The attempt can be retired before it has done anything at all: the deadline gives up
+        // on a build still in its startup, and the retry that replaces it takes a cursor of its
+        // own. The cursor slot belongs to the STATE, not to this thread — re-subscribing here
+        // would drop the subscription the LIVE attempt is building under, leaving the resident
+        // that arrives to be served under a window nobody opened for it. So a retired attempt
+        // touches nothing, cursor included.
+        let retired_before_start = lock_recover(&self.inner).build_attempt != attempt;
+        if retired_before_start {
+            self.discard_stale_attempt(attempt, "start");
+            return;
+        }
         // Snapshot the hub cursor at build start: the build's baseline scan captures the
         // disk as of now, so only events landing after this point need replaying onto the
         // published resident.
         //
-        // `run_load` spawns only from `Idle`, with the cursor slot empty, so `resubscribe_cursor`
-        // takes the `hub.subscribe()` branch and `carried` is always `None` here. Taking it and
-        // settling below is defensiveness for a future reuse of this path, not the carried-debt
-        // story `run_reload` tells.
+        // `run_load` spawns from `Idle` (cursor slot empty: the slot is dropped on eviction
+        // and never filled before a first build) and from a failed attempt whose backoff has
+        // elapsed. The failed attempt's own `resubscribe_cursor` left its subscription in the
+        // slot, so a retry takes the `hub.resubscribe` branch and may carry a debt forward —
+        // the same story `run_reload` tells, and the reason the carry is settled below rather
+        // than dropped. Whoever holds the slot, the subscription is replaced here so the
+        // retry's baseline scan covers exactly the window its own events land after.
         let carried = self.resubscribe_cursor();
-        tracing::info!(?root, "diagnostics resident db build started");
+        tracing::info!(?root, attempt, "diagnostics resident db build started");
         match Self::catch_build(|| Self::build_resident(&root, &self.excluded)) {
             Ok(built) => {
-                let files = built.resident.file_count();
-                {
-                    let mut inner = lock_recover(&self.inner);
-                    inner.resident = Some(built.resident);
-                    inner.stats = built.stats;
-                    inner.baseline_epoch += 1;
-                    inner.config_fp = built.config_fp;
-                    inner.topology = built.topology;
-                    inner.generation += 1;
-                    inner.reload = ReloadState::Idle;
-                    inner.loading_since = None;
-                    inner.status = DiagnosticsStatus::Ready { files };
+                self.hold_at_build_gate();
+                let mut inner = lock_recover(&self.inner);
+                if inner.build_attempt != attempt {
+                    drop(inner);
+                    self.discard_stale_attempt(attempt, "success");
+                    return;
                 }
+                let tail = publish_build_success(&mut inner, built);
+                drop(inner);
                 *lock_recover(&self.scan) = None;
                 // The build read the tree whole, so the reconcile its fresh cursor carried
                 // is answered. Settled BEFORE the hub re-arm below: that re-arm can raise a
                 // window of its own, and that one is nobody's to pay here.
                 self.settle_rebuild_debt(carried);
-                tracing::info!(files, "diagnostics resident db ready");
+                tracing::info!(files = tail.files, "diagnostics resident db ready");
                 self.ensure_hub_roots(
-                    &built.scan_roots,
-                    built.physical_topology,
-                    built.declaration_epoch,
+                    &tail.scan_roots,
+                    tail.physical_topology,
+                    tail.declaration_epoch,
                 );
                 self.recheck_config_identity_after_publish();
             }
             Err(msg) => {
-                tracing::warn!("diagnostics resident db build failed: {msg}");
+                self.hold_at_build_gate();
                 let mut inner = lock_recover(&self.inner);
-                inner.loading_since = None;
-                inner.status = DiagnosticsStatus::Failed(msg);
+                if inner.build_attempt != attempt {
+                    drop(inner);
+                    self.discard_stale_attempt(attempt, "failure");
+                    return;
+                }
+                tracing::warn!("diagnostics resident db build failed: {msg}");
+                publish_build_failure(&mut inner, msg);
             }
         }
     }
+
+    /// Drop the outcome of an attempt whose token has been retired, saying so in the log: an
+    /// attempt that publishes nothing is otherwise invisible — its effect on the state is
+    /// exactly nothing, which is indistinguishable from never having run.
+    fn discard_stale_attempt(&self, attempt: u64, outcome: &str) {
+        let current = lock_recover(&self.inner).build_attempt;
+        #[cfg(test)]
+        lock_recover(&self.inner).stale_build_publications.fetch_add(1, Ordering::SeqCst);
+        tracing::warn!(attempt, current, outcome, "discarding a superseded resident build attempt",);
+    }
+
+    /// Park at the armed test gate, if any. Production never arms one: the whole function is
+    /// `#[cfg(test)]`, so a release build has no gate at all rather than a disabled one.
+    #[cfg(test)]
+    fn hold_at_build_gate(&self) {
+        let gate = lock_recover(&self.inner).build_gate.clone();
+        if let Some(gate) = gate {
+            gate.hold();
+        }
+    }
+
+    #[cfg(not(test))]
+    fn hold_at_build_gate(&self) {}
 
     /// A config/topology edit landing while a resident build ran is invisible to the
     /// published baseline — baseline and resident deliberately derive from the build's
@@ -690,27 +1113,19 @@ impl DiagnosticsState {
                     self.force_scan.store(true, Ordering::SeqCst);
                     return;
                 }
-                let files = built.resident.file_count();
                 let mut inner = lock_recover(&self.inner);
-                inner.resident = Some(built.resident);
-                inner.stats = built.stats;
-                inner.baseline_epoch += 1;
-                inner.config_fp = built.config_fp;
-                inner.topology = built.topology;
-                inner.generation += 1;
-                inner.reload = ReloadState::Idle;
-                inner.status = DiagnosticsStatus::Ready { files };
+                let tail = publish_build_success(&mut inner, built);
                 drop(inner);
                 *lock_recover(&self.scan) = None;
                 // The swap states this build read the tree whole, so the reconcile its
                 // fresh cursor carried is answered here — before the hub re-arm below,
                 // whose window would be a new debt and nobody's to settle.
                 self.settle_rebuild_debt(carried);
-                tracing::info!(files, "diagnostics resident db reloaded");
+                tracing::info!(files = tail.files, "diagnostics resident db reloaded");
                 self.ensure_hub_roots(
-                    &built.scan_roots,
-                    built.physical_topology,
-                    built.declaration_epoch,
+                    &tail.scan_roots,
+                    tail.physical_topology,
+                    tail.declaration_epoch,
                 );
                 self.recheck_config_identity_after_publish();
             }
@@ -738,7 +1153,10 @@ impl DiagnosticsState {
     /// NOT leave the status pinned at `Loading` forever (the agent would see "still
     /// building" with no recovery, and the idle sweeper only evicts from `Ready`). Folding
     /// both an `Err` and a panic into `Err(String)` lets the caller publish `Failed`, which
-    /// is visible and retryable. Generic over the closure so the fold itself is testable.
+    /// is visible AND retryable: a published failure is retried on the backoff [`RETRY_BASE`]
+    /// schedules (see [`DiagnosticsState::ensure_loading`]), and a build that hangs rather
+    /// than failing is published as `Failed` by the sweeper's deadline. Generic over the
+    /// closure so the fold itself is testable.
     pub(super) fn catch_build<T>(build: impl FnOnce() -> anyhow::Result<T>) -> Result<T, String> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(build)) {
             Ok(Ok(value)) => Ok(value),
@@ -955,9 +1373,10 @@ impl DiagnosticsState {
     /// by concurrent callers. Returns a borrowed view valid until the next scan.
     /// The single idle sweeper, spawned once per handle and living until shutdown. Each
     /// tick it drops the resident db (→ `Idle`) when it has been `Ready` and untouched
-    /// for `eviction_after`; otherwise it sleeps on. It does NOT exit after evicting, so
-    /// a later rebuild (via `ensure_loading`/`run_reload`) is monitored again without
-    /// needing a replacement sweeper.
+    /// for `eviction_after`, publishes an overrun `Loading` build as `Failed` (see
+    /// [`Self::expire_stuck_build`]), and otherwise sleeps on. It does NOT exit after
+    /// evicting, so a later rebuild (via `ensure_loading`/`run_reload`) is monitored again
+    /// without needing a replacement sweeper.
     fn spawn_sweeper(&self) {
         let state = self.clone();
         #[cfg(test)]
@@ -992,6 +1411,11 @@ impl DiagnosticsState {
                     *lock_recover(&state.last_reconcile) = Instant::now();
                     state.reconcile_tick();
                 }
+
+                // A build that overran its deadline is a failure like any other — and the
+                // only thing that can end it: the loader thread's own completion is what
+                // would clear `loading_since`, and a stuck thread never reaches it.
+                state.expire_stuck_build();
 
                 state.evict_if_idle();
             }
@@ -1033,6 +1457,45 @@ impl DiagnosticsState {
         drop(inner);
         *lock_recover(&self.scan) = None;
         tracing::info!("diagnostics resident db evicted after idle period");
+        true
+    }
+
+    /// Publish a `Loading` build that overran its deadline as `Failed`, so a build that
+    /// never finishes takes the same route as one that failed outright: the reason is
+    /// visible, and the retry schedule (`pacing`) applies to it. Returns whether it fired.
+    ///
+    /// The LIVE attempt is retired here as well (`build_attempt` is bumped), because the
+    /// thread it names is still running: publishing `Failed` without retiring it would leave
+    /// two attempts entitled to publish, and the one that is merely slow could finish minutes
+    /// later and overwrite the retry's outcome — or, failing, take down the resident the retry
+    /// published.
+    ///
+    /// Only `Loading` is watched. `Ready` serves a resident and is nobody's to fail here,
+    /// and an in-flight RELOAD keeps serving the resident it has — its failure has its own
+    /// channel (`reload`) and its own repair, and turning it into a build failure would
+    /// retire the answer the reload was protecting.
+    ///
+    /// The sweeper is the clock above this step and the decision and the act live here, on
+    /// the same split as [`Self::evict_if_idle`]: a test whose subject is the deadline calls
+    /// this directly and does not depend on when the clock gets round to it.
+    pub(super) fn expire_stuck_build(&self) -> bool {
+        let mut inner = lock_recover(&self.inner);
+        if !matches!(inner.status, DiagnosticsStatus::Loading) {
+            return false;
+        }
+        let Some(since) = inner.loading_since else {
+            return false;
+        };
+        if since.elapsed() < inner.pacing.build_timeout {
+            return false;
+        }
+        let message = format!(
+            "diagnostics resident build did not finish within {:?}",
+            inner.pacing.build_timeout
+        );
+        inner.build_attempt = inner.build_attempt.wrapping_add(1);
+        tracing::warn!("{message}");
+        publish_build_failure(&mut inner, message);
         true
     }
 
@@ -1081,7 +1544,9 @@ pub(crate) fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diagnostics_state::test_support::sample_workspace;
+    use crate::diagnostics_state::test_support::{
+        sample_workspace, state_with_hub, wait_ready, wait_until,
+    };
 
     /// The sweeper parks between ticks, and the shutdown wakes it out of that park rather
     /// than leaving it to time out. The tick is half a minute: slept out, a daemon told to
@@ -1249,5 +1714,494 @@ mod tests {
             Some(std::fs::canonicalize(outside.path().join("two")).unwrap()),
             "resolved to the target the link leads to now",
         );
+    }
+
+    /// The schedule itself: no pause for a first attempt, the base for the retry after the
+    /// first failure, doubling per failure behind it, and a hard cap — apart from the clock.
+    #[test]
+    fn the_retry_delay_grows_exponentially_to_a_cap() {
+        let base = Duration::from_secs(5);
+        let cap = Duration::from_secs(60);
+
+        assert_eq!(retry_delay(base, cap, 0), Duration::ZERO, "a first attempt waits for nothing");
+        assert_eq!(retry_delay(base, cap, 1), base);
+        assert_eq!(retry_delay(base, cap, 2), Duration::from_secs(10));
+        assert_eq!(retry_delay(base, cap, 3), Duration::from_secs(20));
+        assert_eq!(retry_delay(base, cap, 4), Duration::from_secs(40));
+        assert_eq!(retry_delay(base, cap, 5), cap, "the cap bites one step later");
+        assert_eq!(retry_delay(base, cap, u32::MAX), cap, "and stays: the exponent is clamped");
+    }
+
+    /// A failure is not terminal: once its backoff has elapsed, the next call starts another
+    /// attempt exactly as a first one would, the build walks the tree, and a success clears
+    /// everything the failure left behind.
+    #[test]
+    fn a_failed_build_is_retried_after_its_backoff_and_then_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+
+        let state = DiagnosticsState::for_workspace(root.to_path_buf());
+        state.with_retry_pacing_for_test(Duration::from_millis(60), Duration::from_secs(1));
+        state.fail_for_test("synthetic first failure");
+
+        let failed = state.status_report();
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.error.as_deref(), Some("synthetic first failure"));
+        assert_eq!(failed.attempts, 1, "one failure is behind this state");
+        assert!(
+            failed.retry_after_ms.is_some_and(|owed| owed > 0),
+            "a failure is retryable, and the caller is told when: {:?}",
+            failed.retry_after_ms,
+        );
+        assert!(failed.failed_age_ms.is_some(), "the cause has an age: {:?}", failed.failed_age_ms);
+        assert!(failed.elapsed_ms.is_none(), "nothing is building");
+
+        std::thread::sleep(Duration::from_millis(80));
+        state.ensure_loading();
+        wait_ready(&state);
+
+        let ready = state.status_report();
+        assert_eq!(ready.state, "ready");
+        assert!(ready.generation >= 1, "the retry actually built something");
+        assert!(ready.error.is_none(), "a success clears the cause it answered");
+        assert_eq!(
+            ready.attempts, 0,
+            "and the schedule with it: retry_after_ms is {:?}",
+            ready.retry_after_ms,
+        );
+        assert!(ready.failed_age_ms.is_none());
+        assert!(ready.retry_after_ms.is_none());
+        state.shutdown();
+    }
+
+    /// Inside the pause, asking again is refused: no build is started, no attempt is spent,
+    /// and the refusal names the wait that is still owed — a poller cannot turn its own
+    /// polling into a build storm, and it does not have to guess the schedule.
+    #[test]
+    fn a_retry_before_its_backoff_starts_no_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+
+        let state = DiagnosticsState::for_workspace(root.to_path_buf());
+        state.with_retry_pacing_for_test(Duration::from_secs(3600), Duration::from_secs(3600));
+        state.fail_for_test("synthetic failure");
+
+        for _ in 0..5 {
+            state.ensure_loading();
+        }
+
+        let report = state.status_report();
+        assert_eq!(report.state, "failed", "the pause has not elapsed");
+        assert_eq!(report.attempts, 1, "asking again is not an attempt");
+        assert_eq!(report.generation, 0, "nothing was built");
+        assert!(report.elapsed_ms.is_none(), "and nothing is building");
+        assert!(
+            report.retry_after_ms.is_some_and(|owed| owed > 0),
+            "the refusal names the remaining wait rather than leaving the caller to guess: {:?}",
+            report.retry_after_ms,
+        );
+        assert!(!state.sweeper_running(), "a refused call starts no sweeper clock either");
+    }
+
+    /// What the REPORT says while a retry runs: the cause it answers is still there, the
+    /// failures behind it are still counted, and no wait is owed — a build is in flight.
+    #[test]
+    fn a_running_retry_still_names_the_cause_it_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = DiagnosticsState::for_workspace(dir.path().to_path_buf());
+        state.fail_for_test("synthetic first failure");
+
+        // The retry's window, stated directly: a loader thread would leave it on its own
+        // schedule, and the property under test is what the report says WHILE one runs, not
+        // how long a build takes.
+        {
+            let mut inner = lock_recover(&state.inner);
+            inner.status = DiagnosticsStatus::Loading;
+            inner.loading_since = Some(Instant::now());
+        }
+
+        let report = state.status_report();
+        assert_eq!(report.state, "loading");
+        assert_eq!(
+            report.error.as_deref(),
+            Some("synthetic first failure"),
+            "a retry that erased its cause would be a first attempt to the caller",
+        );
+        assert_eq!(report.attempts, 1);
+        assert!(report.elapsed_ms.is_some(), "the new attempt is what the age measures");
+        assert!(report.retry_after_ms.is_none(), "a build in flight owes no wait");
+    }
+
+    /// A build that overran its deadline is published as a failure — visibly, with its own
+    /// reason and the same retry schedule — instead of pinning every reader on `loading` for
+    /// ever. A ready resident and an in-flight reload are not the deadline's business.
+    #[test]
+    fn a_loading_build_that_overruns_its_deadline_is_published_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+
+        let state = DiagnosticsState::for_workspace(root.to_path_buf());
+        state.with_build_timeout_for_test(Duration::from_millis(1));
+        {
+            let mut inner = lock_recover(&state.inner);
+            inner.status = DiagnosticsStatus::Loading;
+            inner.loading_since = Some(Instant::now());
+        }
+        std::thread::sleep(Duration::from_millis(8));
+
+        assert!(state.expire_stuck_build(), "an overrun build is published as failed");
+        let report = state.status_report();
+        assert_eq!(report.state, "failed");
+        assert!(
+            report.error.as_deref().is_some_and(|msg| msg.contains("did not finish within")),
+            "the deadline names itself as the cause: {:?}",
+            report.error,
+        );
+        assert!(report.elapsed_ms.is_none(), "loading_since is cleared, as on any failure");
+        assert_eq!(report.attempts, 1);
+        assert!(
+            report.retry_after_ms.is_some_and(|owed| owed > 0),
+            "and the retry schedule applies to it: {:?}",
+            report.retry_after_ms,
+        );
+        assert!(!state.expire_stuck_build(), "the deadline fires once: the state is not loading");
+
+        // Control: a resident that IS ready is never an overrun build, whatever the deadline.
+        let ready = DiagnosticsState::for_workspace(root.to_path_buf());
+        ready.ensure_loading();
+        wait_ready(&ready);
+        ready.with_build_timeout_for_test(Duration::from_secs(0));
+        lock_recover(&ready.inner).reload = ReloadState::Running;
+        assert!(!ready.expire_stuck_build(), "a serving resident is not a build that hung");
+        let report = ready.status_report();
+        assert_eq!(report.state, "ready", "and the deadline left it serving: {:?}", report.reload);
+        assert_eq!(report.reload, "running", "with its reload still in flight");
+        state.shutdown();
+        ready.shutdown();
+    }
+
+    /// The same deadline, driven by the clock it actually runs on: the sweeper's tick is the
+    /// tightest of its cadences, so a shortened one makes the wait observable instead of
+    /// half a minute long.
+    #[test]
+    fn the_idle_sweeper_publishes_a_build_that_overran_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+
+        let mut state = DiagnosticsState::for_workspace(root.to_path_buf());
+        state.with_build_timeout_for_test(Duration::from_millis(50));
+        state.eviction_after = Duration::from_millis(50);
+        state.reconcile_interval = Duration::from_millis(50);
+        {
+            let mut inner = lock_recover(&state.inner);
+            inner.status = DiagnosticsStatus::Loading;
+            inner.loading_since = Some(Instant::now());
+        }
+
+        state.spawn_sweeper_for_test();
+        wait_until("the sweeper publishes the overrun build as failed", || match state.status() {
+            DiagnosticsStatus::Failed(msg) if msg.contains("did not finish within") => Ok(()),
+            other => Err(other),
+        });
+        state.shutdown();
+    }
+
+    /// A retry re-subscribes the hub cursor its failed attempt left behind: the new
+    /// subscription is the one the arriving resident will be served under, and the watch is
+    /// armed for it — the same ownership a reload re-establishes, on the first-build path.
+    ///
+    /// What this test states is exactly that and no more: the cursor WAS re-subscribed (a new
+    /// id where the failed attempt's had been). Whether the window the old cursor owed was
+    /// CARRIED onto it — the half that distinguishes re-subscribing from dropping and taking a
+    /// fresh subscription — is pinned by
+    /// [`a_retry_carries_the_hubs_window_across_a_failed_attempt_and_settles_it`], which drives
+    /// a real debt through a failed retry.
+    #[test]
+    fn a_retry_after_a_failure_resubscribes_the_hub_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+
+        let (state, hub) = state_with_hub(root);
+        state.with_retry_pacing_for_test(Duration::ZERO, Duration::ZERO);
+        state.ensure_loading();
+        wait_ready(&state);
+        let first = lock_recover(&state.hub_cursor).expect("the first build subscribed a cursor");
+        assert!(
+            hub.is_watching(),
+            "the stand's watch must be armed for this test to mean anything"
+        );
+        assert!(state.hub_armed.load(Ordering::SeqCst), "a build under an armed watch is armed");
+
+        state.fail_for_test("synthetic failure");
+        state.ensure_loading();
+        wait_ready(&state);
+
+        let second = lock_recover(&state.hub_cursor).expect("the retry holds a cursor too");
+        assert_ne!(
+            second, first,
+            "the retry re-subscribed: keeping the failed attempt's cursor would leave the \
+             resident served under a subscription nothing advanced",
+        );
+        assert!(state.hub_armed.load(Ordering::SeqCst), "and the retry re-armed the watch");
+        state.shutdown();
+    }
+
+    /// The pacing floors: no environment value may shorten the retry pause below its base or
+    /// the build deadline below a minute, and the ceiling never falls under the floor it caps.
+    /// The failures these prevent are not hypothetical — a one-second deadline publishes
+    /// working builds as failed, and then retries them on a schedule that guarantees the same.
+    #[test]
+    fn the_pacing_env_is_clamped_to_its_floors() {
+        assert_eq!(clamp_retry_base(None), RETRY_BASE, "unset is the default");
+        assert_eq!(clamp_retry_base(Some(0)), RETRY_BASE, "zero means unset");
+        assert_eq!(clamp_retry_base(Some(1)), MIN_RETRY_BASE, "one second is a build storm");
+        assert_eq!(clamp_retry_base(Some(30)), Duration::from_secs(30));
+
+        assert_eq!(clamp_build_timeout(None), BUILD_TIMEOUT);
+        assert_eq!(clamp_build_timeout(Some(0)), BUILD_TIMEOUT);
+        assert_eq!(clamp_build_timeout(Some(1)), MIN_BUILD_TIMEOUT, "a minute is the floor");
+        assert_eq!(clamp_build_timeout(Some(3600)), Duration::from_secs(3600));
+
+        let base = clamp_retry_base(Some(600));
+        assert_eq!(base, Duration::from_secs(600));
+        assert_eq!(
+            clamp_retry_cap(Some(10), base),
+            base,
+            "a ceiling under the floor is not a ceiling: it must rise to the base it caps",
+        );
+        assert_eq!(clamp_retry_cap(Some(1200), base), Duration::from_secs(1200));
+        assert_eq!(clamp_retry_cap(None, base), RETRY_CAP.max(base));
+    }
+
+    /// A clock that cannot hold the deadline is not a reason to retry NOW: the wait saturates
+    /// at the ceiling, and the millisecond fields saturate rather than wrapping to something
+    /// small enough to read as "no wait owed".
+    #[test]
+    fn a_deadline_the_clock_cannot_hold_saturates_instead_of_retrying_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = DiagnosticsState::for_workspace(dir.path().to_path_buf());
+        state.fail_for_test("synthetic failure");
+        {
+            let mut inner = lock_recover(&state.inner);
+            inner.pacing.base = Duration::MAX;
+            inner.pacing.cap = Duration::MAX;
+        }
+
+        let report = state.status_report();
+        assert_eq!(report.state, "failed");
+        assert_eq!(
+            report.retry_after_ms,
+            Some(u64::MAX),
+            "the wait must saturate at the ceiling, not read as due",
+        );
+        state.ensure_loading();
+        assert_eq!(
+            state.status_report().state,
+            "failed",
+            "a saturation is still a wait: nothing may be retried before it elapses",
+        );
+        assert!(!state.sweeper_running(), "and no loader was started");
+    }
+
+    /// The wait counts DOWN: a poller reading `retry_after_ms` twice sees the remaining pause
+    /// shrink, which is the difference between a schedule and a number that never moves.
+    #[test]
+    fn the_retry_wait_counts_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = DiagnosticsState::for_workspace(dir.path().to_path_buf());
+        state.with_retry_pacing_for_test(Duration::from_secs(5), Duration::from_secs(60));
+        state.fail_for_test("synthetic failure");
+
+        let first = state.status_report().retry_after_ms.expect("a failure owes a wait");
+        std::thread::sleep(Duration::from_millis(80));
+        let second = state.status_report().retry_after_ms.expect("still owed");
+        assert!(second > 0, "the pause is not over in 80 ms of a five-second base");
+        assert!(second < first, "the remaining wait must shrink: {first} ms then {second} ms",);
+        assert!(
+            first - second >= 40,
+            "and shrink by the time that passed, not by a rounding: {first} → {second}",
+        );
+    }
+
+    /// The build-attempt token, positive half: an attempt the deadline gave up on publishes
+    /// NOTHING. Its success would otherwise replace the resident the retry published with one
+    /// built from a baseline the retry's own build already superseded.
+    #[test]
+    fn a_success_from_a_retired_attempt_is_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+
+        let state = DiagnosticsState::for_workspace(root.to_path_buf());
+        state.with_retry_pacing_for_test(Duration::ZERO, Duration::ZERO);
+        state.with_build_timeout_for_test(Duration::from_millis(1));
+        let gate = state.arm_build_gate_for_test();
+
+        state.ensure_loading();
+        gate.wait_until_held(1, "the first build reaches the gate");
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(state.expire_stuck_build(), "the deadline gives up on the held build");
+
+        state.ensure_loading();
+        gate.wait_until_held(2, "the retry reaches the gate");
+        gate.release();
+        wait_until("the retired attempt is discarded", || match state.stale_build_publications() {
+            discarded if discarded >= 1 => Ok(()),
+            discarded => Err(format!("{discarded} attempts discarded so far")),
+        });
+        wait_ready(&state);
+
+        assert_eq!(state.stale_build_publications(), 1, "the retired attempt must publish nothing");
+        let report = state.status_report();
+        assert_eq!(report.state, "ready");
+        assert_eq!(report.generation, 1, "only the retry published: the resident is its own");
+        assert!(report.error.is_none(), "and the failure that retired the first attempt is gone");
+        assert!(report.retry_after_ms.is_none());
+        state.shutdown();
+    }
+
+    /// The same token, the direction that costs a live resident: a retired attempt's FAILURE
+    /// must not be published over the resident its replacement already built — every reader
+    /// would refuse, eviction would stop and the hub cursor would never be released.
+    #[test]
+    fn a_failure_from_a_retired_attempt_cannot_take_the_resident_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        // The first attempt's build fails on disk; the disk is repaired before the retry.
+        std::fs::write(root.join("bsl-analyzer.toml"), "not = = toml").unwrap();
+
+        let state = DiagnosticsState::for_workspace(root.to_path_buf());
+        state.with_retry_pacing_for_test(Duration::ZERO, Duration::ZERO);
+        state.with_build_timeout_for_test(Duration::from_millis(1));
+        let gate = state.arm_build_gate_for_test();
+
+        state.ensure_loading();
+        gate.wait_until_held(1, "the failing build reaches the gate");
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(state.expire_stuck_build(), "the deadline gives up on the held build");
+
+        std::fs::remove_file(root.join("bsl-analyzer.toml")).unwrap();
+        state.ensure_loading();
+        gate.wait_until_held(2, "the retry reaches the gate");
+        gate.release();
+        wait_until("the retired attempt is discarded", || match state.stale_build_publications() {
+            discarded if discarded >= 1 => Ok(()),
+            discarded => Err(format!("{discarded} attempts discarded so far")),
+        });
+        wait_ready(&state);
+
+        assert_eq!(state.stale_build_publications(), 1, "the retired failure must be discarded");
+        let report = state.status_report();
+        assert_eq!(report.state, "ready");
+        assert!(report.error.is_none(), "a stale failure left its reason behind: {report:?}");
+        assert_eq!(report.attempts, 0);
+        assert!(
+            matches!(state.read(|_, _| ()), ResidentOutcome::Ready(..)),
+            "the resident the retry published must still answer",
+        );
+        state.shutdown();
+    }
+
+    /// The window a degraded hub opened is a debt SOMEONE owes, and a retry has to pick it up    /// rather than leave it unowned: dropping the cursor before the retry closes the window
+    /// silently (nobody owes it any more) and the reconcile is never paid. This test states
+    /// both halves — the debt survives a retry that FAILS, and is settled by one that succeeds.
+    #[test]
+    fn a_retry_carries_the_hubs_window_across_a_failed_attempt_and_settles_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+
+        let (state, hub) = state_with_hub(root);
+        state.with_retry_pacing_for_test(Duration::ZERO, Duration::ZERO);
+        state.ensure_loading();
+        wait_ready(&state);
+
+        let cursor_of = || lock_recover(&state.hub_cursor).expect("the state holds a hub cursor");
+        hub.degrade_external();
+        let first = cursor_of();
+        assert!(
+            matches!(hub.health_for(Some(first)), Health::Degraded(_)),
+            "the stand needs a reconcile debt on the state's own cursor",
+        );
+
+        // A retry whose build fails: the rebuild did NOT read the tree, so the debt stands.
+        std::fs::write(root.join("bsl-analyzer.toml"), "not = = toml").unwrap();
+        state.fail_for_test("synthetic failure");
+        state.ensure_loading();
+        wait_until("the failed retry settles back into Failed", || match state.status() {
+            DiagnosticsStatus::Failed(_) => Ok(()),
+            other => Err(other),
+        });
+        let second = cursor_of();
+        assert_ne!(second, first, "the retry re-subscribed the cursor");
+        assert!(
+            matches!(hub.health_for(Some(second)), Health::Degraded(_)),
+            "a retry that FAILED must not settle the window: the debt is carried onto its own \
+             cursor, and dropping that cursor instead would close the window unowned",
+        );
+
+        // And the retry that succeeds answers it.
+        std::fs::remove_file(root.join("bsl-analyzer.toml")).unwrap();
+        state.fail_for_test("synthetic failure again");
+        state.ensure_loading();
+        wait_ready(&state);
+        let third = cursor_of();
+        assert!(
+            matches!(hub.health_for(Some(third)), Health::Healthy),
+            "the successful rebuild's baseline scan settled the window it carried",
+        );
+        state.shutdown();
+    }
+
+    /// An attempt retired BEFORE it starts touches nothing — the cursor slot included. This is
+    /// the case the token exists for on the way IN: the deadline gives up on a build still in
+    /// its startup, and the retry that replaces it takes a cursor of its own; a re-subscribe
+    /// from the retired thread would drop the subscription the live attempt is building under,
+    /// leaving the resident it publishes to be served under a window nobody opened for it.
+    ///
+    /// The retirement happens from the loader's own start seam, which is the one moment where
+    /// "retired before it did anything" is a fact rather than a race.
+    #[test]
+    fn an_attempt_retired_before_it_starts_does_not_touch_the_hub_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+
+        let (state, hub) = state_with_hub(root);
+        state.with_retry_pacing_for_test(Duration::from_secs(3600), Duration::from_secs(3600));
+        // The deadline is already over when the loader starts, so the seam below is a real
+        // deadline verdict on a build that never got going.
+        state.with_build_timeout_for_test(Duration::ZERO);
+        assert!(lock_recover(&state.hub_cursor).is_none(), "the stand starts with no cursor");
+
+        let retire = state.clone();
+        state.set_load_start_probe(move || {
+            assert!(retire.expire_stuck_build(), "the deadline must retire the starting attempt");
+        });
+
+        state.ensure_loading();
+        wait_until("the retired attempt gives up", || match state.stale_build_publications() {
+            discarded if discarded >= 1 => Ok(()),
+            discarded => Err(format!("{discarded} attempts discarded so far")),
+        });
+
+        assert!(
+            lock_recover(&state.hub_cursor).is_none(),
+            "the retired attempt subscribed a cursor: nobody will ever drain it, eviction only \
+             runs from Ready, and the live attempt's subscription is gone",
+        );
+        assert_eq!(
+            state.status_report().state,
+            "failed",
+            "the deadline's verdict is what stands: the retired attempt published nothing",
+        );
+        assert!(hub.is_watching(), "the stand's watch was armed all along");
+        state.shutdown();
     }
 }
