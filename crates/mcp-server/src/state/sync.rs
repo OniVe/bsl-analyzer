@@ -2017,7 +2017,7 @@ mod tests {
     /// "newer" than that — the one thing that must not count.
     #[test]
     fn a_dormant_sink_waits_for_a_batch_newer_than_the_budget_it_spent() {
-        use crate::change_hub::{test_support::eventually, WorkspaceChangeHub};
+        use crate::change_hub::{test_support::eventually_within, WorkspaceChangeHub};
         use std::time::Duration;
 
         let dir = tempdir().unwrap();
@@ -2030,8 +2030,10 @@ mod tests {
         // reach the watcher as several events, so wait for the hub to go quiet: the test is
         // about a generation the sink was already told about, not about a write still landing.
         fs::write(workspace.join("Early.bsl"), "Процедура Ранняя() КонецПроцедуры\n").unwrap();
+        // Each probe sleeps 200 ms, so the attempt count is the budget: 100 of them is about
+        // 20 s. Counting attempts alone would stretch a failure to the hang guard instead.
         let mut last = hub.generation();
-        assert!(eventually(|| {
+        assert!(eventually_within(100, || {
             std::thread::sleep(Duration::from_millis(200));
             let now = hub.generation();
             let quiet = now > 0 && now == last;

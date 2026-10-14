@@ -243,8 +243,17 @@ impl OwnerStop {
 
     /// Wait for every admitted owner to leave before releasing shared derived files.
     pub(crate) fn wait_empty(&self, timeout: std::time::Duration) -> bool {
-        // A budget too large to place on the clock waits in hour-long slices instead: it is
-        // bounded by the owners leaving, which is the point of the wait.
+        self.wait_empty_in_slices(timeout, std::time::Duration::from_secs(60 * 60))
+    }
+
+    /// [`Self::wait_empty`] with the slice a budget too large for the clock waits in.
+    fn wait_empty_in_slices(
+        &self,
+        timeout: std::time::Duration,
+        slice: std::time::Duration,
+    ) -> bool {
+        // A budget too large to place on the clock waits in slices instead: it is bounded by
+        // the owners leaving, which is the point of the wait.
         let deadline = std::time::Instant::now().checked_add(timeout);
         let mut stopped = self.0.stopped.lock().unwrap_or_else(|poison| poison.into_inner());
         while self.0.live.load(Ordering::SeqCst) != 0 {
@@ -257,7 +266,7 @@ impl OwnerStop {
                     };
                     remaining
                 }
-                None => std::time::Duration::from_secs(60 * 60),
+                None => slice,
             };
             let (guard, result) = self
                 .0
@@ -265,7 +274,7 @@ impl OwnerStop {
                 .wait_timeout(stopped, remaining)
                 .unwrap_or_else(|poison| poison.into_inner());
             stopped = guard;
-            if result.timed_out() && self.0.live.load(Ordering::SeqCst) != 0 {
+            if deadline.is_some() && result.timed_out() && self.0.live.load(Ordering::SeqCst) != 0 {
                 return false;
             }
         }
@@ -1275,6 +1284,21 @@ mod tests {
         done_rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING).unwrap();
         owner.join().unwrap();
         assert!(owners.wait_empty(Duration::ZERO));
+    }
+
+    #[test]
+    fn an_unplaceable_budget_waits_for_the_owners_past_its_first_slice() {
+        let owners = super::OwnerStop::default();
+        let live = owners.enter();
+        let leaving = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(live);
+        });
+        assert!(
+            owners.wait_empty_in_slices(Duration::MAX, Duration::from_millis(10)),
+            "a budget off the clock ends when the owners leave, not at its first slice"
+        );
+        leaving.join().unwrap();
     }
 
     #[test]
