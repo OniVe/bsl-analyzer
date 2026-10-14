@@ -12,6 +12,10 @@ use rmcp::service::{PeerRequestOptions, RunningService};
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::{json, Map, Value};
 
+// Shared helpers for the gates in this binary; not every binary uses every one.
+#[allow(dead_code)]
+mod common;
+
 type Client = RunningService<RoleClient, ()>;
 
 fn write(root: &Path, relative: &str, contents: &str) {
@@ -47,18 +51,25 @@ async fn client(root: &Path) -> Client {
     ().serve(client_io).await.expect("session initialized")
 }
 
-/// A workspace answer that has caught up with the watcher: polls until the tree is
-/// reported stale, or gives back the last answer for the assertion to fail on.
+/// A workspace answer that has caught up with the unreadable file: polls until the tree is
+/// stale and the unreadable file is a hole in the baseline, or gives back the last answer for
+/// the assertion to fail on.
+///
+/// Staleness alone is not that fact. The edit that precedes the permission change is seen as
+/// drift first, and the answer is stale with the baseline still `full` until the read failure
+/// is observed as a hole; a hole, once it exists, keeps the answer `partial` until it heals.
 ///
 /// Gated like its only caller: the unreadable-file case it serves needs a permission bit
 /// Windows does not have, and an ungated helper is dead code there — which the mirror's
 /// Windows job, unlike ours, builds with warnings denied and so reports as an error.
 #[cfg(unix)]
-async fn workspace_until_stale(client: &Client) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+async fn workspace_until_partial_stale(client: &Client) -> Value {
+    let mut deadline =
+        common::Patience::new(common::STATE_CEILING, std::time::Duration::from_millis(20));
     loop {
         let body = diagnostics(client, args("workspace")).await;
-        if body["stale"] == true || tokio::time::Instant::now() >= deadline {
+        let settled = body["stale"] == true && body["result"]["baseline"]["state"] == "partial";
+        if settled || !deadline.allows() {
             return body;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -66,7 +77,8 @@ async fn workspace_until_stale(client: &Client) -> Value {
 }
 
 async fn diagnostics(client: &Client, arguments: Map<String, Value>) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut deadline =
+        common::Patience::new(common::STATE_CEILING, std::time::Duration::from_millis(20));
     loop {
         let result = client
             .call_tool(CallToolRequestParams::new("diagnostics").with_arguments(arguments.clone()))
@@ -76,7 +88,20 @@ async fn diagnostics(client: &Client, arguments: Map<String, Value>) -> Value {
         if body["status"] != "loading" {
             return body;
         }
-        assert!(tokio::time::Instant::now() < deadline, "resident did not become ready");
+        assert!(deadline.allows(), "resident did not become ready");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Asks the workspace until it counts both modules of the stand.
+async fn workspace_until_both_modules(client: &Client) {
+    let mut patience = common::Patience::new(common::STATE_CEILING, Duration::from_millis(20));
+    loop {
+        let body = diagnostics(client, args("workspace")).await;
+        if body["result"]["files_total"] == 2 {
+            return;
+        }
+        assert!(patience.allows(), "the workspace never counted both modules: {body}");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -136,6 +161,10 @@ async fn baseline_parity_partial_stale_error_recovery_and_cancellation() {
         initial["result"]["findings"].as_array().unwrap().len()
     );
 
+    // `partial` is the answer for a sweep cut short by the file cap, which needs a second file
+    // to cut. The resident can report ready before it has counted both modules, so the cap is
+    // applied only once the workspace has said it sees both.
+    workspace_until_both_modules(&client).await;
     let mut workspace_args = args("workspace");
     workspace_args.insert("min_severity".to_owned(), json!("hint"));
     workspace_args.insert("max_files".to_owned(), json!(1));
@@ -161,12 +190,12 @@ async fn baseline_parity_partial_stale_error_recovery_and_cancellation() {
             // instead of racing it — once the unreadable file IS observed it becomes a
             // hole, and a hole keeps the answer stale until it heals, so this settles in
             // one direction only.
-            let stale = workspace_until_stale(&client).await;
+            let stale = workspace_until_partial_stale(&client).await;
             assert_eq!(
                 stale["stale"], true,
                 "the unreadable file has to make the answer stale: {stale}"
             );
-            assert_eq!(stale["result"]["baseline"]["state"], "partial");
+            assert_eq!(stale["result"]["baseline"]["state"], "partial", "{stale}");
             assert_eq!(stale["result"]["baseline"]["resolved"], 0);
         } else {
             eprintln!("skipping the unreadable-file leg: mode 0o000 is not an obstacle here");

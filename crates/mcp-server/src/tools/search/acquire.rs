@@ -470,7 +470,7 @@ mod tests {
             }));
             // Each is waiting — queued, or inside the raw lock — before the next one starts.
             let waiting = index + 1;
-            assert!(crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
+            assert!(crate::change_hub::test_support::eventually(|| {
                 engine.queued() + engine.raw_waiting() >= waiting
             }));
         }
@@ -496,16 +496,12 @@ mod tests {
             let cancel = cancel.clone();
             std::thread::spawn(move || try_acquire_engine(&engine, &cancel).is_err())
         };
-        assert!(crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
-            engine.queued() == 1
-        }));
+        assert!(crate::change_hub::test_support::eventually(|| { engine.queued() == 1 }));
         let follower = {
             let engine = Arc::clone(&engine);
             std::thread::spawn(move || drop(engine.lock().unwrap()))
         };
-        assert!(crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
-            engine.queued() == 2
-        }));
+        assert!(crate::change_hub::test_support::eventually(|| { engine.queued() == 2 }));
         cancel.cancel();
         assert!(quitter.join().unwrap(), "the cancelled request acquired the engine");
         drop(held);

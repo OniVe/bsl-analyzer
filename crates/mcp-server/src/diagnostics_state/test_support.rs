@@ -179,33 +179,41 @@ fn wait_budget() -> Duration {
         .map_or(Duration::from_secs(30), Duration::from_secs)
 }
 
-/// Ждать наступления события до срока, а не заданное число раз.
+/// Ждать наступления события, отсчитывая опросы, а не часы.
 ///
-/// Число итераций сроком не является: под нагрузкой сон переполняется, и «300 раз
-/// по 10 мс» — это не три секунды, а сколько придётся. Проба поэтому возвращает
-/// либо результат, либо наблюдение, объясняющее, почему ещё не время; исчерпав
-/// срок, помощник называет предмет ожидания, последнее наблюдение и потраченное
-/// время. Немое «не дождался» — ровно тот отчёт, по которому причину падения
-/// приходится расследовать с нуля.
+/// Бюджет задан числом опросов с шагом 10 мс: под нагрузкой каждый опрос растягивается,
+/// и то же число опросов покрывает ту же работу, а не выходит из срока раньше времени.
+/// Проба возвращает либо результат, либо наблюдение, объясняющее, почему ещё рано; исчерпав
+/// бюджет, помощник называет предмет ожидания, последнее наблюдение и потраченное время.
 pub(crate) fn wait_until<T, S: std::fmt::Debug>(
     what: &str,
     mut probe: impl FnMut() -> Result<T, S>,
 ) -> T {
     let started = std::time::Instant::now();
-    let budget = wait_budget();
-    loop {
-        let observation = match probe() {
-            Ok(value) => return value,
-            Err(observation) => observation,
-        };
-        if started.elapsed() >= budget {
+    let polls = wait_budget().as_millis() / 10;
+    let mut observation = match probe() {
+        Ok(value) => return value,
+        Err(observation) => observation,
+    };
+    let mut spent = 0;
+    for _ in 0..polls {
+        if started.elapsed() > Duration::from_secs(20 * 60) {
             panic!(
-                "{what}: not satisfied in {:?}, last observation {observation:?}",
+                "{what}: not satisfied in {:?}, past the wall-clock backstop; last observation {observation:?}",
                 started.elapsed()
             );
         }
         std::thread::sleep(Duration::from_millis(10));
+        spent += 1;
+        observation = match probe() {
+            Ok(value) => return value,
+            Err(observation) => observation,
+        };
     }
+    panic!(
+        "{what}: not satisfied after {spent} polls in {:?}, last observation {observation:?}",
+        started.elapsed()
+    );
 }
 
 pub(crate) fn wait_ready(state: &DiagnosticsState) {
@@ -272,7 +280,7 @@ pub(super) fn module_is_server(state: &DiagnosticsState, module: &Path) -> Optio
 
 pub(super) fn state_with_hub(root: &Path) -> (DiagnosticsState, WorkspaceChangeHub) {
     let hub = WorkspaceChangeHub::start(vec![root.to_path_buf()]);
-    assert!(hub.wait_until_watching(Duration::from_secs(5)), "the hub must arm");
+    assert!(hub.wait_until_watching(), "the hub must arm");
     let mut state =
         DiagnosticsState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
     state.drift_interval = Duration::from_millis(0);

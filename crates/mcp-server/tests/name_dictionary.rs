@@ -17,6 +17,10 @@ use rmcp::{RoleClient, ServiceExt};
 use serde_json::{Map, Value};
 use tempfile::TempDir;
 
+// Shared helpers for the gates in this binary; not every binary uses every one.
+#[allow(dead_code)]
+mod common;
+
 type Client = RunningService<RoleClient, ()>;
 
 /// Copy the checked-in metadata fixture into a scratch dir, so derived caches
@@ -95,31 +99,31 @@ async fn resolve(client: &Client, query: &str) -> Value {
 }
 
 async fn wait_until_resident_is_ready(client: &Client) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    let mut deadline = common::Patience::new(
+        std::time::Duration::from_secs(180),
+        std::time::Duration::from_millis(100),
+    );
     loop {
         let status = call(client, "diagnostics", args(&[("action", Value::from("status"))])).await;
         if status["state"] == "ready" {
             return;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the resident never became ready, last status {status}",
-        );
+        assert!(deadline.allows(), "the resident never became ready, last status {status}",);
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
 async fn wait_until_graph_is_ready(client: &Client) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    let mut deadline = common::Patience::new(
+        std::time::Duration::from_secs(180),
+        std::time::Duration::from_millis(100),
+    );
     loop {
         let status = call(client, "graph", args(&[("action", Value::from("status"))])).await;
         if status["state"] == "ready" {
             return;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the graph never became ready, last status {status}",
-        );
+        assert!(deadline.allows(), "the graph never became ready, last status {status}",);
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }

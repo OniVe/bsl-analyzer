@@ -1902,7 +1902,7 @@ mod tests {
             let root = dir.path();
             crate::graph::test_support::sample_workspace(root);
             let hub = crate::graph::test_support::workspace_hub(root);
-            assert!(hub.wait_until_watching(std::time::Duration::from_secs(5)));
+            assert!(hub.wait_until_watching());
             let before = hub.active_cursor_count();
             let graph = Arc::new(
                 crate::graph::state::GraphState::for_workspace(root.to_path_buf())
@@ -1979,7 +1979,7 @@ mod tests {
         let root = dir.path();
         crate::graph::test_support::sample_workspace(root);
         let hub = crate::graph::test_support::workspace_hub(root);
-        assert!(hub.wait_until_watching(std::time::Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let before = hub.active_cursor_count();
 
         let graph = crate::graph::state::GraphState::for_workspace(root.to_path_buf())
@@ -2357,8 +2357,14 @@ mod tests {
             .collect();
         let held_lock = transient_lease.hold_file_lock_for_test();
         let started = Instant::now();
+        let fences = transient_lease.disk_checks_on_this_thread();
         assert!(transient.snapshot().is_none(), "the fifth request gets an immediate miss");
-        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(
+            transient_lease.disk_checks_on_this_thread(),
+            fences,
+            "a request miss consulted the lease, so it would wait on a lock it does not need"
+        );
+        assert!(started.elapsed() < Duration::from_millis(100), "a request miss waited");
         drop(held_lock);
         drop(occupied);
     }
@@ -2470,7 +2476,13 @@ mod tests {
         let (_dir, graph, lease) = ready_graph();
         let held_lock = lease.hold_file_lock_for_test();
         let started = Instant::now();
+        let fences = lease.disk_checks_on_this_thread();
         assert!(matches!(graph.snapshot_blocking(), LeaseOperationOutcome::Applied(Some(_))));
+        assert_eq!(
+            lease.disk_checks_on_this_thread(),
+            fences,
+            "pool checkout ran the preflight, which takes the lease lock it was just denied"
+        );
         assert!(started.elapsed() < Duration::from_millis(100), "pool checkout skips preflight");
         drop(held_lock);
 
@@ -2577,7 +2589,7 @@ mod tests {
         sample_workspace(root);
 
         let hub = crate::graph::test_support::workspace_hub(root);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let mut graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
         graph.drift_interval = Duration::from_secs(120);
         graph.ensure_loading();
@@ -2595,9 +2607,12 @@ mod tests {
         );
         // Waits on the hub's delivery queue, not on graph state: a graph-state summary
         // would say nothing about whether inotify delivered.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(10),
+        );
         let mut delivered = false;
-        while Instant::now() < deadline {
+        while deadline.allows() {
             let batch = hub.drain(observer);
             observer = batch.cursor;
             if batch.entries.iter().any(|e| e.raw.to_string_lossy().contains("Module.bsl")) {
@@ -2666,7 +2681,7 @@ mod tests {
         write(ext, "Configuration.xml", "<Configuration/>");
 
         let hub = crate::graph::test_support::workspace_hub(root);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let mut graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
         graph.drift_interval = Duration::ZERO;
         graph.ensure_loading();
@@ -2708,10 +2723,13 @@ mod tests {
         let delivered = ext.canonicalize().expect("the extension root exists").join("Новый.bsl");
         // Waits on the hub's delivery queue, not on graph state: a graph-state summary
         // would say nothing about whether inotify delivered.
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(50),
+        );
         let mut cursor = cursor;
         let mut seen = false;
-        while Instant::now() < deadline {
+        while deadline.allows() {
             std::fs::write(&file, "Процедура П()\nКонецПроцедуры").unwrap();
             std::thread::sleep(Duration::from_millis(50));
             let batch = hub.drain(cursor);
@@ -2735,7 +2753,7 @@ mod tests {
         sample_workspace(root);
 
         let hub = crate::graph::test_support::workspace_hub(root);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let mut graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
         // Without this the throttled scan cache answers before the health question is ever
         // asked, and this test would pass no matter what the answer would have been.
@@ -2809,7 +2827,7 @@ mod tests {
         write_extension_workspace(root, false);
 
         let hub = crate::graph::test_support::workspace_hub(root);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let mut graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
         graph.drift_interval = Duration::from_secs(120);
         graph.ensure_loading();
@@ -2824,9 +2842,12 @@ mod tests {
         // can lag well past a single write's event window.
         // Waits on the hub's delivery queue, not on graph state: a graph-state summary
         // would say nothing about whether inotify delivered.
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(20),
+        );
         let mut delivered = false;
-        while Instant::now() < deadline {
+        while deadline.allows() {
             write_extension_config(root, true);
             std::thread::sleep(Duration::from_millis(20));
             let batch = hub.drain(observer);
@@ -2856,7 +2877,7 @@ mod tests {
         sample_workspace(root);
 
         let hub = crate::graph::test_support::workspace_hub(root);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let mut graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
         graph.drift_interval = Duration::from_secs(120);
         graph.ensure_loading();
@@ -2871,9 +2892,12 @@ mod tests {
         write(root, "CommonModules/Сервер/Ext/Module.bsl.tmp", "editor swap file");
         // Waits on the hub's delivery queue, not on graph state: a graph-state summary
         // would say nothing about whether inotify delivered.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(10),
+        );
         let mut delivered = false;
-        while Instant::now() < deadline {
+        while deadline.allows() {
             let batch = hub.drain(observer);
             observer = batch.cursor;
             if batch.entries.iter().any(|e| e.raw.to_string_lossy().contains(".tmp")) {

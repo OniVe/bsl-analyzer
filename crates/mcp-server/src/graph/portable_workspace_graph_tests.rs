@@ -286,17 +286,17 @@ fn semantic_engine(cache: &WorkspaceCacheLayout, server: &str) -> bsl_search::Se
 }
 
 fn wait_for_search_initialization(state: &crate::state::SharedState) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut deadline = crate::change_hub::test_support::Patience::new(
+        crate::change_hub::test_support::STATE_CEILING,
+        std::time::Duration::from_millis(10),
+    );
     loop {
         let engine_ready =
             state.search_engine().lock().map(|engine| engine.is_some()).unwrap_or(false);
         if !state.search_initializing() && engine_ready {
             return;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "workspace search initialization did not finish"
-        );
+        assert!(deadline.allows(), "workspace search initialization did not finish");
         std::thread::sleep(Duration::from_millis(10));
     }
 }

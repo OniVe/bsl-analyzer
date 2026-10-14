@@ -2633,14 +2633,17 @@ impl WorkspaceChangeHub {
 
     /// Run one poll now and wait for it to finish.
     #[cfg(test)]
-    pub(crate) fn poll_now(&self, timeout: Duration) -> bool {
+    pub(crate) fn poll_now(&self) -> bool {
         let polls = || self.inner.poll_state.lock().unwrap_or_else(PoisonError::into_inner).polls;
         let before = polls();
         if self.control().send(HubMsg::Tick).is_err() {
             return false;
         }
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
+        let mut patience = test_support::Patience::new(
+            test_support::STATE_CEILING,
+            std::time::Duration::from_millis(5),
+        );
+        while patience.allows() {
             if polls() > before {
                 return true;
             }
@@ -2654,7 +2657,7 @@ impl WorkspaceChangeHub {
     #[cfg(all(test, unix))]
     pub(crate) fn wait_until_blindness_announced(&self) {
         assert!(
-            test_support::eventually(Duration::from_secs(10), || {
+            test_support::eventually(|| {
                 !self.inner.blind_poll.reconcile_pending.load(Ordering::SeqCst)
             }),
             "the reconcile announcing the blind root never came",
@@ -2883,12 +2886,13 @@ impl WorkspaceChangeHub {
         }
     }
 
-    /// Whether the watch armed within `timeout`. Kept alongside the three-state form
-    /// because it is what every test asks: a test drives a hub that arms in milliseconds
-    /// and has nothing to decide between "not yet" and "never".
+    /// Whether the watch armed. Kept alongside the three-state form because it is what every
+    /// test asks: a test drives a hub that arms in milliseconds and has nothing to decide
+    /// between "not yet" and "never". The wait is on a condition variable, so it wakes when the
+    /// watch arms; the ceiling only bounds a watch that never does.
     #[cfg(test)]
-    pub(crate) fn wait_until_watching(&self, timeout: Duration) -> bool {
-        self.watch_readiness(timeout) == WatchReadiness::Armed
+    pub(crate) fn wait_until_watching(&self) -> bool {
+        self.watch_readiness(test_support::STATE_CEILING) == WatchReadiness::Armed
     }
 
     /// The accumulator's generation right now.
@@ -3027,13 +3031,16 @@ impl WorkspaceChangeHub {
     /// Run one coverage tick and wait for it to finish, without waiting out the
     /// period. Returns false if the hub thread is gone.
     #[cfg(test)]
-    pub(crate) fn tick_now(&self, timeout: Duration) -> bool {
+    pub(crate) fn tick_now(&self) -> bool {
         let before = self.tick_count();
         if self.control().send(HubMsg::Tick).is_err() {
             return false;
         }
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
+        let mut patience = test_support::Patience::new(
+            test_support::STATE_CEILING,
+            std::time::Duration::from_millis(5),
+        );
+        while patience.allows() {
             if self.tick_count() > before {
                 return true;
             }
@@ -4001,19 +4008,27 @@ pub(crate) struct PollGate {
 
 #[cfg(test)]
 impl PollGate {
-    const BOUND: Duration = Duration::from_secs(10);
-
     fn arrive(&self, stop: &StopFlag) {
         let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
         counts.1 += 1;
         self.moved.notify_all();
-        let deadline = Instant::now() + Self::BOUND;
-        while counts.0 == 0 && Instant::now() < deadline && !stop.is_raised() {
-            counts = self
-                .moved
-                .wait_timeout(counts, Duration::from_millis(20))
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
+        let mut patience = test_support::Patience::new(
+            test_support::STATE_CEILING,
+            std::time::Duration::from_millis(20),
+        );
+        let mut wakes = 0;
+        while counts.0 == 0 && !stop.is_raised() {
+            let (next, go) = test_support::wait_step(
+                &self.moved,
+                counts,
+                Duration::from_millis(20),
+                &mut patience,
+                &mut wakes,
+            );
+            counts = next;
+            if !go {
+                break;
+            }
         }
         counts.0 = counts.0.saturating_sub(1);
     }
@@ -4022,13 +4037,23 @@ impl PollGate {
     #[cfg(unix)]
     pub(crate) fn wait_arrivals(&self, arrivals: usize) {
         let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
-        let deadline = Instant::now() + Self::BOUND;
-        while counts.1 < arrivals && Instant::now() < deadline {
-            counts = self
-                .moved
-                .wait_timeout(counts, Duration::from_millis(20))
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
+        let mut patience = test_support::Patience::new(
+            test_support::STATE_CEILING,
+            std::time::Duration::from_millis(20),
+        );
+        let mut wakes = 0;
+        while counts.1 < arrivals {
+            let (next, go) = test_support::wait_step(
+                &self.moved,
+                counts,
+                Duration::from_millis(20),
+                &mut patience,
+                &mut wakes,
+            );
+            counts = next;
+            if !go {
+                break;
+            }
         }
         assert!(counts.1 >= arrivals, "the blind poll never reached its gate {arrivals} times");
     }
@@ -4076,8 +4101,6 @@ pub(crate) struct AnnounceBarrier {
 
 #[cfg(test)]
 impl AnnounceBarrier {
-    const BOUND: Duration = Duration::from_secs(10);
-
     #[cfg(unix)]
     pub(crate) fn arm(&self, point: AnnouncePoint) {
         *self.state.lock().unwrap_or_else(PoisonError::into_inner) = (Some(point), false, false);
@@ -4091,13 +4114,23 @@ impl AnnounceBarrier {
         state.0 = None;
         state.1 = true;
         self.moved.notify_all();
-        let deadline = Instant::now() + Self::BOUND;
-        while !state.2 && Instant::now() < deadline && !stop.is_raised() {
-            state = self
-                .moved
-                .wait_timeout(state, Duration::from_millis(20))
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
+        let mut patience = test_support::Patience::new(
+            test_support::STATE_CEILING,
+            std::time::Duration::from_millis(20),
+        );
+        let mut wakes = 0;
+        while !state.2 && !stop.is_raised() {
+            let (next, go) = test_support::wait_step(
+                &self.moved,
+                state,
+                Duration::from_millis(20),
+                &mut patience,
+                &mut wakes,
+            );
+            state = next;
+            if !go {
+                break;
+            }
         }
         state.1 = false;
         self.moved.notify_all();
@@ -4106,13 +4139,23 @@ impl AnnounceBarrier {
     #[cfg(unix)]
     pub(crate) fn wait_parked(&self) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let deadline = Instant::now() + Self::BOUND;
-        while !state.1 && Instant::now() < deadline {
-            state = self
-                .moved
-                .wait_timeout(state, Duration::from_millis(20))
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
+        let mut patience = test_support::Patience::new(
+            test_support::STATE_CEILING,
+            std::time::Duration::from_millis(20),
+        );
+        let mut wakes = 0;
+        while !state.1 {
+            let (next, go) = test_support::wait_step(
+                &self.moved,
+                state,
+                Duration::from_millis(20),
+                &mut patience,
+                &mut wakes,
+            );
+            state = next;
+            if !go {
+                break;
+            }
         }
         assert!(state.1, "the announcement never reached its barrier");
     }
@@ -5746,20 +5789,91 @@ pub(crate) mod test_support {
     use super::{ChangeKind, WorkspaceChangeHub};
     #[cfg(unix)]
     use super::{RefusedWatches, WatchTarget};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     #[cfg(unix)]
     use std::{path::PathBuf, sync::Arc};
 
-    pub(crate) fn eventually(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
+    /// Attempts a state wait makes before it gives up. The bound is a count of polls, not a
+    /// span of time: a loaded machine stretches every poll, so a state that is merely late
+    /// still arrives inside the bound, and only a state that never comes exhausts it. It
+    /// guards against a hang and is never the thing a test is asserting about.
+    const STATE_ATTEMPTS: u32 = 6_000;
+
+    /// The ceiling every hand-written state wait is counted against: [`STATE_ATTEMPTS`] polls
+    /// at the ordinary ten-millisecond step.
+    pub(crate) const STATE_CEILING: Duration = Duration::from_secs(60);
+
+    pub(crate) fn eventually(f: impl FnMut() -> bool) -> bool {
+        eventually_within(STATE_ATTEMPTS, f)
+    }
+
+    /// The polls a hand-written wait may spend: a ceiling read as "this many polls at one per
+    /// `step`", counted rather than timed. Each [`Patience::allows`] spends one poll, so a wait
+    /// that loops on it gives up after the same number of polls whatever the machine's speed.
+    pub(crate) struct Patience {
+        left: u64,
+    }
+
+    /// Wakes a condition-variable wait may take before it gives up. A cap against a notify storm
+    /// that would keep the wait alive forever; ordinary runs take a handful.
+    const WAKE_CAP: u32 = 100_000;
+
+    /// One step of a bounded condition-variable wait. Waits up to `step` for a wake and spends a
+    /// poll only when the step runs out unwoken, so the budget counts time spent waiting rather
+    /// than wakeups. Returns the guard and whether the wait may go on.
+    pub(crate) fn wait_step<'a, T>(
+        moved: &std::sync::Condvar,
+        guard: std::sync::MutexGuard<'a, T>,
+        step: Duration,
+        patience: &mut Patience,
+        wakes: &mut u32,
+    ) -> (std::sync::MutexGuard<'a, T>, bool) {
+        let (guard, outcome) =
+            moved.wait_timeout(guard, step).unwrap_or_else(std::sync::PoisonError::into_inner);
+        if outcome.timed_out() {
+            let go = patience.allows();
+            return (guard, go);
+        }
+        *wakes += 1;
+        (guard, *wakes <= WAKE_CAP)
+    }
+
+    impl Patience {
+        pub(crate) fn new(ceiling: Duration, step: Duration) -> Self {
+            let polls = ceiling.as_nanos() / step.as_nanos().max(1);
+            Self { left: u64::try_from(polls).unwrap_or(u64::MAX) }
+        }
+
+        /// Spends one poll; `false` once the allowance is gone.
+        pub(crate) fn allows(&mut self) -> bool {
+            if self.left == 0 {
+                return false;
+            }
+            self.left -= 1;
+            true
+        }
+    }
+
+    /// [`eventually`] with a bound of its own, for a wait whose event is scheduled by a
+    /// production retry rather than by the work the test drives.
+    pub(crate) fn eventually_within(attempts: u32, mut f: impl FnMut() -> bool) -> bool {
+        let started = std::time::Instant::now();
+        for _ in 0..attempts {
             if f() {
                 return true;
+            }
+            if started.elapsed() > HANG_GUARD {
+                break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
         f()
     }
+
+    /// Wall-clock backstop for the poll budgets. A poll that is itself slow would stretch the
+    /// budget far past its nominal length; this bounds the failing path to minutes, and no wait
+    /// that succeeds comes near it.
+    const HANG_GUARD: Duration = Duration::from_secs(20 * 60);
 
     /// One live root and one the watch refuses to take, so the hub is standing degraded for
     /// a reason no drain clears. The period is an hour, so every tick is one the test asked
@@ -5783,7 +5897,7 @@ pub(crate) mod test_support {
             Duration::from_secs(3600),
             &refusals,
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)), "the live root still arms");
+        assert!(hub.wait_until_watching(), "the live root still arms");
         hub.wait_until_blindness_announced();
         (dir, a, b, hub, refusals)
     }
@@ -5865,7 +5979,7 @@ mod tests {
                 &self.workspace,
                 std::slice::from_ref(&self.scan_root),
             ));
-            assert!(hub.wait_until_watching(Duration::from_secs(5)));
+            assert!(hub.wait_until_watching());
             hub
         }
 
@@ -5931,7 +6045,7 @@ mod tests {
                 watch_targets_for(&self.workspace, std::slice::from_ref(&self.link)),
                 period,
             );
-            assert!(hub.wait_until_watching(Duration::from_secs(5)), "the hub must arm");
+            assert!(hub.wait_until_watching(), "the hub must arm");
             hub
         }
 
@@ -5957,13 +6071,13 @@ mod tests {
 
         project.retarget(&project.second);
         assert!(
-            eventually(Duration::from_secs(10), || hub.self_rearm_count() > 0),
+            eventually(|| hub.self_rearm_count() > 0),
             "an idle hub must notice a retarget nothing reports"
         );
 
         std::fs::write(project.second.join("Module.bsl"), "x").unwrap();
         assert!(
-            eventually(Duration::from_secs(10), || { !entry_names(&hub.drain(cursor)).is_empty() }),
+            eventually(|| { !entry_names(&hub.drain(cursor)).is_empty() }),
             "the new target must be delivered once coverage follows it"
         );
     }
@@ -5991,7 +6105,7 @@ mod tests {
         };
 
         project.retarget(&project.second);
-        let noticed = eventually(Duration::from_secs(10), || hub.self_rearm_count() > 0);
+        let noticed = eventually(|| hub.self_rearm_count() > 0);
         stop.store(true, Ordering::Relaxed);
         noise.join().unwrap();
         assert!(noticed, "a busy queue must not starve the coverage tick");
@@ -6004,17 +6118,12 @@ mod tests {
     fn the_tick_keeps_firing_after_the_first_one() {
         let project = linked_root();
         let hub = project.hub(Duration::from_millis(50));
-        assert!(
-            eventually(Duration::from_secs(10), || hub.tick_count() >= 1),
-            "the first tick must happen"
-        );
+        assert!(eventually(|| hub.tick_count() >= 1), "the first tick must happen");
         let after_first = hub.tick_count();
 
         project.retarget(&project.second);
         assert!(
-            eventually(Duration::from_secs(10), || {
-                hub.self_rearm_count() > 0 && hub.tick_count() > after_first
-            }),
+            eventually(|| { hub.self_rearm_count() > 0 && hub.tick_count() > after_first }),
             "a retarget after the first tick must still be noticed by a completed tick"
         );
     }
@@ -6037,12 +6146,12 @@ mod tests {
             ],
             Duration::from_millis(20),
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
         let _ = hub.drain(cursor);
         let rescans = hub.rescan_request_count();
 
-        assert!(eventually(Duration::from_secs(5), || hub.tick_count() >= 3), "ticks must run");
+        assert!(eventually(|| hub.tick_count() >= 3), "ticks must run");
         assert_eq!(hub.self_rearm_count(), 0, "a stable absence is not movement");
         assert_eq!(hub.rescan_request_count(), rescans, "and it must not cost a reconcile");
     }
@@ -6062,16 +6171,16 @@ mod tests {
             vec![WatchTarget::recursive(live), WatchTarget::recursive(doomed.clone())],
             Duration::from_secs(3600),
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         std::fs::remove_dir_all(&doomed).unwrap();
-        assert!(hub.tick_now(Duration::from_secs(5)));
+        assert!(hub.tick_now());
         assert_eq!(hub.self_rearm_count(), 1, "the removal itself is movement");
 
         let after = hub.self_rearm_count();
         let rescans = hub.rescan_request_count();
-        assert!(hub.tick_now(Duration::from_secs(5)));
-        assert!(hub.tick_now(Duration::from_secs(5)));
+        assert!(hub.tick_now());
+        assert!(hub.tick_now());
         assert_eq!(hub.self_rearm_count(), after, "the same absence is not movement again");
         assert_eq!(hub.rescan_request_count(), rescans);
     }
@@ -6088,12 +6197,12 @@ mod tests {
             watch_targets_for(&root, std::slice::from_ref(&root)),
             Duration::from_millis(20),
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
         let _ = hub.drain(cursor);
         let rescans = hub.rescan_request_count();
 
-        assert!(eventually(Duration::from_secs(5), || hub.tick_count() >= 5), "ticks must run");
+        assert!(eventually(|| hub.tick_count() >= 5), "ticks must run");
         assert_eq!(hub.self_rearm_count(), 0, "a still tree is not movement");
         assert_eq!(hub.rescan_request_count(), rescans);
     }
@@ -6106,7 +6215,7 @@ mod tests {
         assert_eq!(COVERAGE_TICK_PERIOD, Duration::from_secs(30));
         let dir = tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         assert_eq!(hub.inner.tick_period, Duration::from_secs(30));
     }
 
@@ -6133,7 +6242,7 @@ mod tests {
             COVERAGE_TICK_PERIOD,
             &refusals,
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         // Refusing `b` moves no fingerprint, so the re-arm has to come from elsewhere:
         // adding `c` is the ordinary reason a rebuild re-arms, and it carries `b` into the
@@ -6168,11 +6277,11 @@ mod tests {
         let _ = hub.drain(cursor);
 
         refusals.allow(&b);
-        assert!(hub.tick_now(Duration::from_secs(5)));
+        assert!(hub.tick_now());
 
         std::fs::write(b.join("Module.bsl"), "x").unwrap();
         assert!(
-            eventually(Duration::from_secs(10), || {
+            eventually(|| {
                 entry_names(&hub.drain(cursor)).iter().any(|n| n.ends_with("Module.bsl"))
             }),
             "the retry must arm the root, and changes under it must then arrive"
@@ -6243,7 +6352,7 @@ mod tests {
 
         refusals.allow(&b);
         std::fs::write(b.join("Module.bsl"), "x").unwrap();
-        assert!(hub.tick_now(Duration::from_secs(5)));
+        assert!(hub.tick_now());
         assert!(
             hub.drain(cursor).rescan_required,
             "a change made while the root was blind is only found by a reconcile"
@@ -6261,7 +6370,7 @@ mod tests {
         let _ = hub.drain(cursor);
 
         refusals.allow(&b);
-        assert!(hub.tick_now(Duration::from_secs(5)));
+        assert!(hub.tick_now());
         let _ = hub.drain(cursor);
         assert_eq!(hub.health(), Health::Healthy, "everything declared is watched again");
     }
@@ -6302,7 +6411,7 @@ mod tests {
             vec![WatchTarget::recursive(a.clone()), WatchTarget::recursive(loopy)],
             Duration::from_secs(3600),
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
         let _ = hub.drain(cursor);
         assert_eq!(
@@ -6313,10 +6422,7 @@ mod tests {
 
         assert!(hub.ensure_roots(&[WatchTarget::recursive(a.clone())]));
         let _ = hub.drain(cursor);
-        assert!(
-            eventually(Duration::from_secs(5), || hub.health() == Health::Healthy),
-            "nothing declared is unwatched"
-        );
+        assert!(eventually(|| hub.health() == Health::Healthy), "nothing declared is unwatched");
     }
 
     /// A root that could not be described and then turned out to be gone is not blind:
@@ -6339,13 +6445,13 @@ mod tests {
             vec![WatchTarget::recursive(a), WatchTarget::recursive(loopy.clone())],
             Duration::from_secs(3600),
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
         let _ = hub.drain(cursor);
         assert_eq!(hub.health(), Health::Degraded(DegradeReason::RewatchFailed));
 
         std::fs::remove_file(&loopy).unwrap();
-        assert!(hub.tick_now(Duration::from_secs(5)));
+        assert!(hub.tick_now());
         let _ = hub.drain(cursor);
         assert_eq!(
             hub.health(),
@@ -6377,7 +6483,7 @@ mod tests {
             COVERAGE_TICK_PERIOD,
             &refusals,
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
         let _ = hub.drain(cursor);
 
@@ -6422,7 +6528,7 @@ mod tests {
             Duration::from_secs(3600),
             &refusals,
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
         let _ = hub.drain(cursor);
 
@@ -6434,7 +6540,7 @@ mod tests {
         ]));
 
         refusals.allow(&b);
-        assert!(hub.tick_now(Duration::from_secs(5)));
+        assert!(hub.tick_now());
         let _ = hub.drain(cursor);
         assert_eq!(
             hub.health(),
@@ -6453,13 +6559,13 @@ mod tests {
         let cursor = hub.subscribe();
         let _ = hub.drain(cursor);
 
-        assert!(hub.tick_now(Duration::from_secs(5)), "this retry must fail");
+        assert!(hub.tick_now(), "this retry must fail");
         refusals.allow(&b);
-        assert!(hub.tick_now(Duration::from_secs(5)), "and this one must be attempted at all");
+        assert!(hub.tick_now(), "and this one must be attempted at all");
 
         std::fs::write(b.join("Module.bsl"), "x").unwrap();
         assert!(
-            eventually(Duration::from_secs(10), || {
+            eventually(|| {
                 entry_names(&hub.drain(cursor)).iter().any(|n| n.ends_with("Module.bsl"))
             }),
             "the second retry must arm the root"
@@ -6479,7 +6585,7 @@ mod tests {
         let rescans = hub.rescan_request_count();
 
         for _ in 0..3 {
-            assert!(hub.tick_now(Duration::from_secs(5)));
+            assert!(hub.tick_now());
         }
         assert_eq!(
             hub.rescan_request_count(),
@@ -6510,7 +6616,7 @@ mod tests {
             vec![WatchTarget::recursive(a), WatchTarget::recursive(loopy.clone())],
             Duration::from_secs(3600),
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)), "the live root still arms");
+        assert!(hub.wait_until_watching(), "the live root still arms");
         assert_eq!(
             hub.health(),
             Health::Degraded(DegradeReason::RewatchFailed),
@@ -6522,7 +6628,7 @@ mod tests {
         // a re-arm — can be what covers it.
         std::fs::remove_file(&loopy).unwrap();
         std::fs::create_dir(&loopy).unwrap();
-        assert!(hub.tick_now(Duration::from_secs(5)));
+        assert!(hub.tick_now());
         let cursor = hub.subscribe();
         let _ = hub.drain(cursor);
         assert_eq!(hub.health(), Health::Healthy, "and the retry must reach it too");
@@ -6540,12 +6646,11 @@ mod tests {
             dir.path().to_path_buf(),
         )]);
 
+        // The answer is the failure itself: a wait that had run out its thirty seconds would say
+        // NotYet, so no clock is read to tell the two apart.
         let asked = Instant::now();
         assert_eq!(hub.watch_readiness(Duration::from_secs(30)), WatchReadiness::Failed);
-        assert!(
-            asked.elapsed() < Duration::from_secs(5),
-            "the answer is the failure itself, not the wait expiring"
-        );
+        assert!(asked.elapsed() < Duration::from_secs(5), "the failure is answered at once");
         assert_eq!(hub.health(), Health::Degraded(DegradeReason::WatcherSetup));
     }
 
@@ -6586,7 +6691,7 @@ mod tests {
             vec![WatchTarget::recursive(first.clone()), WatchTarget::recursive(second.clone())],
             Duration::from_secs(3600),
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         // The winner of the collapse moves to `second` inside the declaration, then
         // `first` leaves it. Both sets cover the same canonical directory recursively.
@@ -6597,12 +6702,12 @@ mod tests {
         assert!(hub.ensure_roots(&[WatchTarget::recursive(second.clone())]));
         // A declaration is delivered asynchronously; the tick shares the channel, so its
         // acknowledgement proves both were applied.
-        assert!(hub.tick_now(Duration::from_secs(5)));
+        assert!(hub.tick_now());
 
         let cursor = hub.subscribe();
         std::fs::write(real.join("Module.bsl"), "x").unwrap();
         assert!(
-            eventually(Duration::from_secs(10), || !entry_names(&hub.drain(cursor)).is_empty()),
+            eventually(|| !entry_names(&hub.drain(cursor)).is_empty()),
             "a change under the only declared spelling must still be delivered"
         );
 
@@ -6614,7 +6719,7 @@ mod tests {
         // is owed unless the armed set is still named by the alias.
         let settled = hub.drain(hub.subscribe()).cursor;
         assert!(hub.ensure_roots(&[WatchTarget::recursive(second), WatchTarget::recursive(first),]));
-        assert!(hub.tick_now(Duration::from_secs(5)));
+        assert!(hub.tick_now());
         assert!(
             !hub.drain(settled).rescan_required,
             "a declaration whose cover is already in force must cost nothing",
@@ -6654,7 +6759,7 @@ mod tests {
         let layout = linked_root();
         let started = vec![WatchTarget::recursive(layout.link.clone())];
         let hub = WorkspaceChangeHub::start_targets(started.clone());
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         hub.shutdown();
 
         // Same coverage under a different spelling: the input that publishes a
@@ -7072,7 +7177,7 @@ mod tests {
             &root,
             std::slice::from_ref(&root),
         ));
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         let trap = root.join(project_model::CONFIG_FILE_NAMES[0]);
         std::fs::create_dir_all(&trap).unwrap();
@@ -7107,7 +7212,7 @@ mod tests {
             &workspace,
             std::slice::from_ref(&link),
         ));
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
 
         // Two DIFFERENT files, one fed by each spelling: feeding one file twice
@@ -7571,7 +7676,7 @@ mod tests {
     fn a_resubscribed_debt_keeps_its_identity() {
         let dir = tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
         hub.inner.lock_acc().enter_rescan(false, DegradeReason::RuntimeError);
         let before = hub.materialize(cursor);
@@ -7695,7 +7800,7 @@ mod tests {
     fn a_window_nobody_is_left_to_acknowledge_does_not_outlive_them() {
         let dir = tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         let lease = CursorLease::new(hub.clone());
         hub.degrade_external();
@@ -7719,7 +7824,7 @@ mod tests {
     fn a_consumer_taking_a_fresh_cursor_carries_its_debt_with_it() {
         let dir = tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         let sink = hub.subscribe();
         let diagnostics = hub.subscribe();
@@ -7742,7 +7847,7 @@ mod tests {
     fn settling_a_carried_debt_closes_it_without_swallowing_later_entries() {
         let dir = tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         let cursor = hub.subscribe();
         hub.degrade_external();
@@ -7772,7 +7877,7 @@ mod tests {
     fn a_debt_replaced_after_resubscribing_is_not_settled_by_the_old_token() {
         let dir = tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         let cursor = hub.subscribe();
         hub.degrade_external();
@@ -7811,7 +7916,7 @@ mod tests {
     fn resubscribing_captures_the_debt_it_carried_before_a_window_can_replace_it() {
         let dir = tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         let cursor = hub.subscribe();
         hub.degrade_external();
@@ -7832,7 +7937,8 @@ mod tests {
         drop(guard);
         // The carry is done the moment the old cursor leaves the map; raise the window then,
         // while the worker waits on `blind` just past `drop(acc)`.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut patience =
+            test_support::Patience::new(test_support::STATE_CEILING, Duration::from_micros(100));
         loop {
             let mut acc = hub.inner.lock_acc();
             if !acc.cursors.contains_key(&old_id) {
@@ -7840,8 +7946,8 @@ mod tests {
                 break;
             }
             drop(acc);
-            assert!(std::time::Instant::now() < deadline, "the carry never happened");
-            std::thread::yield_now();
+            assert!(patience.allows(), "the carry never happened");
+            std::thread::sleep(Duration::from_micros(100));
         }
         drop(blind);
         let (replaced, token) = worker.join().unwrap();
@@ -7859,7 +7965,7 @@ mod tests {
     fn resubscribing_captures_the_debt_it_carried() {
         let dir = tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         let cursor = hub.subscribe();
         hub.degrade_external();
@@ -7942,7 +8048,7 @@ mod tests {
             4,
             COVERAGE_TICK_PERIOD,
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         let cursor = hub.subscribe();
         hub.degrade_external();
@@ -7983,7 +8089,7 @@ mod tests {
     fn a_dropped_event_is_owed_by_cursors_present_and_future() {
         let dir = tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let present = hub.subscribe();
         let _ = hub.drain(present);
 
@@ -8031,7 +8137,7 @@ mod tests {
     fn health_flips_on_setup_error_for_invalid_root() {
         let hub =
             WorkspaceChangeHub::start(vec![PathBuf::from("/definitely/not/a/real/path/xyzzy")]);
-        assert!(!hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(!hub.wait_until_watching());
         assert_eq!(hub.health(), Health::Degraded(DegradeReason::WatcherSetup));
         assert!(!hub.is_watching());
     }
@@ -8042,7 +8148,7 @@ mod tests {
         // `start` returns immediately; the watch arms on the hub thread. Poll for it
         // rather than asserting synchronously.
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)), "setup settles to watching");
+        assert!(hub.wait_until_watching(), "setup settles to watching");
         assert!(hub.is_watching());
         assert_eq!(hub.health(), Health::Healthy);
     }
@@ -8051,7 +8157,7 @@ mod tests {
     fn health_flips_on_unknown_event_kind() {
         let dir = tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         assert_eq!(hub.health(), Health::Healthy);
         hub.ingest_for_test(change_event(EventKind::Other, dir.path().join("x")));
         assert_eq!(hub.health(), Health::Degraded(DegradeReason::UnknownEvent));
@@ -8061,7 +8167,7 @@ mod tests {
     fn runtime_error_flips_health() {
         let dir = tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         hub.ingest_for_test(Err(notify::Error::generic("boom")));
         assert_eq!(hub.health(), Health::Degraded(DegradeReason::RuntimeError));
     }
@@ -8070,7 +8176,7 @@ mod tests {
     fn rewatch_failure_degrades_and_recovers_through_rescan() {
         let dir = tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
 
         // A failure to extend the watch to a new subtree must not stay silent: it
@@ -8089,7 +8195,7 @@ mod tests {
         use notify::event::AccessKind;
         let dir = tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         hub.ingest_for_test(change_event(
             EventKind::Access(AccessKind::Read),
             dir.path().join("x.bsl"),
@@ -8104,7 +8210,7 @@ mod tests {
         std::fs::write(&toml, "[source]\nroot = \".\"\n").unwrap();
 
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
         hub.ingest_for_test(change_event(EventKind::Modify(ModifyKind::Any), toml.clone()));
 
@@ -8123,7 +8229,7 @@ mod tests {
         let cursor = hub.subscribe();
         hold.release();
         assert_eq!(hub.watch_readiness(Duration::from_secs(5)), WatchReadiness::Failed);
-        assert!(eventually(Duration::from_secs(5), || hub.is_polling() && hub.drain_peek(cursor)));
+        assert!(eventually(|| hub.is_polling() && hub.drain_peek(cursor)));
         (hub, cursor)
     }
 
@@ -8166,7 +8272,7 @@ mod tests {
         let first = hub.drain(cursor);
         assert!(first.rescan_required, "the facts before the picture are lost: one reconcile");
         for _ in 0..3 {
-            assert!(hub.poll_now(Duration::from_secs(5)));
+            assert!(hub.poll_now());
             let batch = hub.drain(first.cursor);
             assert!(!batch.rescan_required, "a poll cost another reconcile");
             assert!(batch.entries.is_empty(), "a quiet poll reported {:?}", batch.entries);
@@ -8175,7 +8281,7 @@ mod tests {
 
         std::fs::write(root.join("After.bsl"), "Процедура Н() КонецПроцедуры\n").unwrap();
         std::fs::remove_file(root.join("Before.bsl")).unwrap();
-        assert!(hub.poll_now(Duration::from_secs(5)));
+        assert!(hub.poll_now());
         let batch = hub.drain(first.cursor);
         assert!(!batch.rescan_required);
         let kinds: Vec<(String, ChangeKind)> = batch
@@ -8208,7 +8314,7 @@ mod tests {
 
         for _ in 0..3 {
             assert!(!hub.ensure_roots(&targets), "a polled hub covers nothing by watching");
-            assert!(hub.poll_now(Duration::from_secs(5)));
+            assert!(hub.poll_now());
             let batch = hub.drain(first.cursor);
             assert!(!batch.rescan_required, "a repeated declaration cost a reconcile");
             assert!(batch.entries.is_empty(), "a quiet poll reported {:?}", batch.entries);
@@ -8237,8 +8343,8 @@ mod tests {
             Duration::from_secs(3600),
             &refusals,
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
-        assert!(eventually(Duration::from_secs(5), || hub.is_partially_blind()));
+        assert!(hub.wait_until_watching());
+        assert!(eventually(|| hub.is_partially_blind()));
         hub.wait_until_blindness_announced();
         let cursor = hub.subscribe();
         // A cursor taken while a root is blind is handed that blindness at once; the question
@@ -8268,7 +8374,7 @@ mod tests {
         let elsewhere = tempdir().unwrap();
         let missing = elsewhere.path().join("нет-такого-каталога");
         let hub = WorkspaceChangeHub::start(vec![root.clone()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
         let targets =
             vec![WatchTarget::recursive(root.clone()), WatchTarget::recursive(missing.clone())];
@@ -8293,7 +8399,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let hub = WorkspaceChangeHub::start(vec![root.clone()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
         // Outside the first root on purpose: a directory nested under a recursive watch is
         // already covered, and declaring it moves nothing.
@@ -8332,10 +8438,10 @@ mod tests {
             &refusals,
             PollConfig { period: Duration::from_millis(20), verify_bytes: VERIFY_BYTES },
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
-        assert!(eventually(Duration::from_secs(5), || hub.is_partially_blind()));
+        assert!(hub.wait_until_watching());
+        assert!(eventually(|| hub.is_partially_blind()));
         assert!(
-            eventually(Duration::from_secs(5), || hub.poll_overdue()),
+            eventually(|| hub.poll_overdue()),
             "a poll that never ran must not read as an up-to-date observation"
         );
         hub.shutdown();
@@ -8357,7 +8463,7 @@ mod tests {
             hub.ensure_roots(&[WatchTarget::recursive(dir.path().to_path_buf())]),
             "the hub answered 'not covered' about roots it was arming"
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)), "control: it did arm them");
+        assert!(hub.wait_until_watching(), "control: it did arm them");
         hub.shutdown();
     }
 
@@ -8374,7 +8480,7 @@ mod tests {
         std::fs::create_dir_all(&first).unwrap();
         std::fs::create_dir_all(&second).unwrap();
         let hub = WorkspaceChangeHub::start(vec![first.clone(), second.clone()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
         let reconciles_before = hub.rescan_request_count();
 
@@ -8405,7 +8511,7 @@ mod tests {
         );
         hold.release();
         assert_eq!(hub.watch_readiness(Duration::from_secs(5)), WatchReadiness::Failed);
-        assert!(eventually(Duration::from_secs(5), || hub.poll_count() >= 2));
+        assert!(eventually(|| hub.poll_count() >= 2));
 
         hub.shutdown();
         let stopped = hub.poll_count();
@@ -8429,12 +8535,12 @@ mod tests {
 
         std::fs::write(&file, "Процедура Б() КонецПроцедуры\n").unwrap();
         std::fs::File::options().write(true).open(&file).unwrap().set_modified(mtime).unwrap();
-        assert!(hub.poll_now(Duration::from_secs(5)));
+        assert!(hub.poll_now());
         let batch = hub.drain(cursor);
         assert_eq!(batch.entries.len(), 1, "the content change went unnoticed");
         assert_eq!(batch.entries[0].kind, ChangeKind::MaybeChanged);
 
-        assert!(hub.poll_now(Duration::from_secs(5)));
+        assert!(hub.poll_now());
         assert!(hub.drain(batch.cursor).entries.is_empty(), "the same change was reported again");
         hub.shutdown();
     }
@@ -8518,7 +8624,7 @@ mod tests {
         std::fs::File::options().write(true).open(&b).unwrap().set_modified(mtime).unwrap();
         let mut reported = 0;
         for _ in 0..4 {
-            assert!(hub.poll_now(Duration::from_secs(5)));
+            assert!(hub.poll_now());
             let batch = hub.drain(cursor);
             reported += batch.entries.iter().filter(|e| e.raw.file_name() == b.file_name()).count();
             cursor = batch.cursor;
@@ -8542,7 +8648,7 @@ mod tests {
         let (hub, cursor) = polling_hub(root, VERIFY_BYTES);
         let cursor = hub.drain(cursor).cursor;
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let polled = hub.poll_now(Duration::from_secs(5));
+        let polled = hub.poll_now();
         let batch = hub.drain(cursor);
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(polled);
@@ -8571,7 +8677,7 @@ mod tests {
             &refusals,
             PollConfig { period: Duration::from_millis(50), verify_bytes: VERIFY_BYTES },
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         hub.wait_until_blindness_announced();
         let cursor = hub.subscribe();
         let first = hub.drain(cursor);
@@ -8580,7 +8686,7 @@ mod tests {
 
         std::fs::write(b.join("New.bsl"), "Процедура Н() КонецПроцедуры\n").unwrap();
         let mut cursor = first.cursor;
-        let delivered = eventually(Duration::from_secs(10), || {
+        let delivered = eventually(|| {
             let batch = hub.drain(cursor);
             cursor = batch.cursor;
             assert!(!batch.rescan_required, "a poll cost another reconcile");
@@ -8648,7 +8754,7 @@ mod tests {
             PollConfig::PRODUCTION,
             BlindPollSeam::default(),
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         refusals.store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(!hub.rearm(vec![flat], Duration::from_secs(10)), "a lost root must deny coverage");
@@ -8699,7 +8805,7 @@ mod tests {
             PollConfig::PRODUCTION,
             BlindPollSeam::default(),
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         refusals.store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(!hub.rearm(
@@ -8761,7 +8867,7 @@ mod tests {
             PollConfig::PRODUCTION,
             BlindPollSeam::default(),
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         assert!(
             !disarms.lock().unwrap_or_else(PoisonError::into_inner).contains(&b),
             "the stand starts with `b` watched, not unwatched",
@@ -8803,7 +8909,7 @@ mod tests {
         let a = first.path().canonicalize().unwrap();
         let c = second.path().canonicalize().unwrap();
         let hub = WorkspaceChangeHub::start_targets(vec![WatchTarget::recursive(a.clone())]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let only = |path: &PathBuf| vec![WatchTarget::recursive(path.clone())];
         assert!(hub.rearm_with_epoch(only(&a), 5, Duration::from_secs(10)));
 
@@ -8837,7 +8943,7 @@ mod tests {
         let a = first.path().canonicalize().unwrap();
         let b = second.path().canonicalize().unwrap();
         let hub = WorkspaceChangeHub::start_targets(vec![WatchTarget::recursive(a.clone())]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         // The newer composition declares both roots, at its own age.
         let both = vec![WatchTarget::recursive(a.clone()), WatchTarget::recursive(b.clone())];
@@ -8889,7 +8995,7 @@ mod tests {
         let a = first.path().canonicalize().unwrap();
         let b = second.path().canonicalize().unwrap();
         let hub = WorkspaceChangeHub::start_targets(vec![WatchTarget::recursive(a.clone())]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         // A declaration at age 5, then a silent repeat of the same set at age 9.
         assert!(hub.rearm_with_epoch(
@@ -9049,7 +9155,7 @@ mod tests {
             Arc::clone(&gate),
             announce,
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         gate.wait_arrivals(1);
         (hub, gate, refusals)
     }
@@ -9229,10 +9335,7 @@ mod tests {
             let state = hub.inner.blind_poll.state.lock().unwrap();
             state.poller.files.keys().filter(|key| key.starts_with(&c)).count()
         };
-        assert!(
-            eventually(Duration::from_secs(5), || joined() == 2),
-            "the stand needs the second root in the blind set"
-        );
+        assert!(eventually(|| joined() == 2), "the stand needs the second root in the blind set");
         // The declaration move has a reconcile of its own, and a consumer may take it at once.
         // What must follow the first reading of every blind file is a reconcile issued after it.
         let mut cursor = cursor;
@@ -9289,7 +9392,7 @@ mod tests {
             Duration::from_secs(10),
         );
         assert!(
-            eventually(Duration::from_secs(5), || unread_blind_files(&hub) > 0),
+            eventually(|| unread_blind_files(&hub) > 0),
             "the stand needs the large root in the blind set",
         );
         same_stat_edit(&b.join("Settled.bsl"), b's');
@@ -9369,15 +9472,15 @@ mod tests {
             "the stand needs the first reading still under way when the root goes",
         );
         std::fs::remove_dir_all(&b).unwrap();
-        assert!(hub.tick_now(Duration::from_secs(5)));
+        assert!(hub.tick_now());
         assert!(
-            eventually(Duration::from_secs(5), || !hub.is_partially_blind()),
+            eventually(|| !hub.is_partially_blind()),
             "the stand needs the gone root out of the blind set",
         );
         let owed = hub.materialize(cursor).rescan_required;
         // The hub's own record of an announcement still to come is settled too: left standing,
         // it would hold back the reconcile a newcomer is handed the next time a root goes blind.
-        let settled = eventually(Duration::from_secs(2), || {
+        let settled = crate::change_hub::test_support::eventually_within(200, || {
             !hub.inner.blind_poll.reconcile_pending.load(Ordering::SeqCst)
         });
         hub.shutdown();
@@ -9398,7 +9501,7 @@ mod tests {
         let started = Instant::now();
         hub.shutdown();
         assert!(
-            eventually(Duration::from_secs(5), || !hub.blind_poll_running()),
+            eventually_within(500, || !hub.blind_poll_running()),
             "the blind poll outlived the hub",
         );
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -9697,15 +9800,19 @@ mod tests {
                 )
             })
         };
-        asked.recv_timeout(Duration::from_secs(5)).expect("the declaration was never asked for");
-        let joined_at_the_barrier =
-            eventually(Duration::from_secs(2), || published_blind(&hub).contains(&c));
+        asked
+            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+            .expect("the declaration was never asked for");
+        // The reconcile is held at the barrier, so the join it would announce cannot come yet. A
+        // window can only hide such a join from this check, never invent one, so it is a window.
+        std::thread::sleep(Duration::from_secs(2));
+        let joined_at_the_barrier = published_blind(&hub).contains(&c);
 
         barrier.release();
         // The declaration is acknowledged as NOT wholly armed: `c` is refused on purpose, which
         // is what puts it in the blind set at all.
         let wholly_armed = declaring.join().expect("the declaring thread");
-        let joined = eventually(Duration::from_secs(5), || unread_blind_files(&hub) == 2);
+        let joined = eventually(|| unread_blind_files(&hub) == 2);
         let after_join = issued();
 
         let mut cursor = cursor;
@@ -9758,7 +9865,7 @@ mod tests {
             &refusals,
             PollConfig { period: Duration::from_millis(50), verify_bytes: VERIFY_BYTES },
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         hub.wait_until_blindness_announced();
         let cursor = hub.subscribe();
         let first = hub.drain(cursor);
@@ -9814,7 +9921,7 @@ mod tests {
     fn events_seen_counts_every_raw_event() {
         let dir = tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         assert_eq!(hub.events_seen(), 0);
         hub.ingest_for_test(change_event(
             EventKind::Create(CreateKind::Any),
@@ -9838,7 +9945,7 @@ mod tests {
             vec![WatchTarget::recursive(dir.path().to_path_buf())],
             vec![cache.clone()],
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
 
         for name in ["writer.lease", "writer.tmp.4242", "writer.lease.lock"] {
@@ -9873,7 +9980,7 @@ mod tests {
             vec![WatchTarget::recursive(link.clone())],
             layout.spellings().iter().map(|p| p.to_path_buf()).collect(),
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
 
         for root in [link.join(".build"), real.path().join(".build")] {
@@ -9898,7 +10005,7 @@ mod tests {
             vec![WatchTarget::recursive(dir.path().to_path_buf())],
             vec![dir.path().join(".build")],
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
 
         std::fs::create_dir_all(dir.path().join(".buildfoo")).unwrap();
@@ -9948,7 +10055,7 @@ mod tests {
             vec![WatchTarget::recursive(dir.path().to_path_buf())],
             layout.spellings().iter().map(|p| p.to_path_buf()).collect(),
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
 
         std::fs::create_dir_all(&cache).unwrap();
@@ -9978,7 +10085,7 @@ mod tests {
             vec![WatchTarget::recursive(dir.path().to_path_buf())],
             cache.exclusions(dir.path()),
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
 
         for path in [
@@ -10022,7 +10129,7 @@ mod tests {
             vec![WatchTarget::recursive(dir.path().to_path_buf())],
             vec![cache.clone()],
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
 
         // Before: the extension root is outside the scope, so its events are dropped.
@@ -10064,7 +10171,7 @@ mod tests {
             vec![WatchTarget::recursive(dir.path().to_path_buf())],
             vec![outside.path().to_path_buf()],
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
 
         hub.ingest_for_test(change_event(
@@ -10088,7 +10195,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let outside = tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         let before = hub.notifications();
         hub.ingest_for_test(change_event(
@@ -10119,7 +10226,7 @@ mod tests {
             vec![WatchTarget::recursive(ws.path().to_path_buf())],
             vec![cache.clone()],
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
 
         assert!(hub.rearm(
@@ -10167,7 +10274,7 @@ mod tests {
             vec![WatchTarget::recursive(dir.path().to_path_buf())],
             vec![cache.clone()],
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
         let generation = hub.wait_for_change(0, Duration::from_millis(1));
         let before = hub.notifications();
@@ -10191,7 +10298,7 @@ mod tests {
     fn wait_for_change_holds_until_the_generation_moves() {
         let dir = tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let generation = hub.wait_for_change(0, Duration::from_millis(1));
 
         let waker = hub.clone();
@@ -10220,7 +10327,7 @@ mod tests {
     fn nested_directory_creation_is_observed() {
         let dir = tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
 
         let nested = dir.path().join("deep").join("nested");
@@ -10229,9 +10336,12 @@ mod tests {
         std::fs::write(&file, "Процедура П()\nКонецПроцедуры").unwrap();
 
         let canonical = file.canonicalize().unwrap_or_else(|_| file.clone());
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut patience = test_support::Patience::new(
+            test_support::STATE_CEILING,
+            std::time::Duration::from_millis(50),
+        );
         let mut seen = false;
-        while Instant::now() < deadline {
+        while patience.allows() {
             let batch = hub.drain(cursor);
             if batch.entries.iter().any(|e| e.canonical == canonical || e.raw == file) {
                 seen = true;
@@ -10249,7 +10359,7 @@ mod tests {
         let (_a, a) = resolved_tempdir();
         let (_b, b) = resolved_tempdir();
         let hub = WorkspaceChangeHub::start(vec![a.clone(), b.clone()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
 
         std::thread::sleep(Duration::from_millis(100));
@@ -10257,9 +10367,12 @@ mod tests {
         let file = b.join("Ext.bsl");
         std::fs::write(&file, "Процедура П()\nКонецПроцедуры").unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut patience = test_support::Patience::new(
+            test_support::STATE_CEILING,
+            std::time::Duration::from_millis(50),
+        );
         let mut seen = false;
-        while Instant::now() < deadline {
+        while patience.allows() {
             let batch = hub.drain(cursor);
             if batch.entries.iter().any(|e| e.raw == file) {
                 seen = true;
@@ -10283,15 +10396,18 @@ mod tests {
         std::fs::write(&toml, "[source]\nroot = \"src/cf\"\n").unwrap();
 
         let hub = WorkspaceChangeHub::start_targets(watch_targets_for(root, &[source]));
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let mut cursor = hub.subscribe();
 
         std::thread::sleep(Duration::from_millis(100));
         std::fs::write(&toml, "[source]\nroot = \"src/cf\"\nextensions = []\n").unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut patience = test_support::Patience::new(
+            test_support::STATE_CEILING,
+            std::time::Duration::from_millis(50),
+        );
         let mut seen = false;
-        while Instant::now() < deadline {
+        while patience.allows() {
             let batch = hub.drain(cursor);
             cursor = batch.cursor;
             if batch.entries.iter().any(|e| e.raw == toml || e.canonical == toml) {
@@ -10315,20 +10431,23 @@ mod tests {
         std::fs::create_dir_all(&source).unwrap();
         // NO config file exists yet.
         let hub = WorkspaceChangeHub::start_targets(watch_targets_for(root, &[source]));
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let mut cursor = hub.subscribe();
         std::thread::sleep(Duration::from_millis(100));
 
         let toml = root.join("bsl-analyzer.toml");
         let expect_delivery = |cursor: &mut SinkCursor, what: &str| {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut patience = test_support::Patience::new(
+                test_support::STATE_CEILING,
+                std::time::Duration::from_millis(50),
+            );
             loop {
                 let batch = hub.drain(*cursor);
                 *cursor = batch.cursor;
                 if batch.entries.iter().any(|e| e.raw == toml || e.canonical == toml) {
                     break;
                 }
-                assert!(Instant::now() < deadline, "config {what} must be delivered");
+                assert!(patience.allows(), "config {what} must be delivered");
                 std::thread::sleep(Duration::from_millis(50));
             }
         };
@@ -10352,7 +10471,7 @@ mod tests {
         let (_a, a) = resolved_tempdir();
         let (_b, b) = resolved_tempdir();
         let hub = WorkspaceChangeHub::start(vec![a.clone()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
 
         assert!(
@@ -10371,9 +10490,12 @@ mod tests {
         let file = b.join("Новый.bsl");
         std::fs::write(&file, "Процедура П()\nКонецПроцедуры").unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut patience = test_support::Patience::new(
+            test_support::STATE_CEILING,
+            std::time::Duration::from_millis(50),
+        );
         let mut seen = false;
-        while Instant::now() < deadline {
+        while patience.allows() {
             let batch = hub.drain(cursor);
             if batch.entries.iter().any(|e| e.raw == file) {
                 seen = true;
@@ -10390,7 +10512,7 @@ mod tests {
     fn ensure_roots_is_a_no_op_for_the_same_set() {
         let a = tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![a.path().to_path_buf()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
 
         assert!(hub.ensure_roots(&[WatchTarget::recursive(a.path().to_path_buf())]));
@@ -10427,7 +10549,7 @@ mod tests {
             Duration::from_secs(3600),
             &refusals,
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         assert_eq!(refusals.arms_of(&root), 1, "the initial arm is the one being counted");
 
         refusals.forget_asks();
@@ -10454,7 +10576,7 @@ mod tests {
     fn rearm_onto_a_missing_root_degrades_but_still_acks() {
         let a = tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![a.path().to_path_buf()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
 
         // Disjoint from `a`: a missing path nested under a watched recursive root
@@ -10482,7 +10604,7 @@ mod tests {
     fn shutdown_joins_the_thread_and_freezes_the_stream() {
         let a = tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![a.path().to_path_buf()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         hub.shutdown();
         assert!(
@@ -10507,14 +10629,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let hub = WorkspaceChangeHub::start(vec![root.clone()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let survivor = hub.clone();
         let cursor = survivor.subscribe();
         drop(hub);
 
         std::fs::write(root.join("Module.bsl"), "x").unwrap();
         assert!(
-            eventually(Duration::from_secs(10), || {
+            eventually(|| {
                 entry_names(&survivor.drain(cursor)).iter().any(|n| n.ends_with("Module.bsl"))
             }),
             "the surviving clone still holds the hub, so its stream is still live"
@@ -10580,7 +10702,7 @@ mod tests {
     fn an_explicit_shutdown_before_the_last_drop_is_harmless() {
         let dir = tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         hub.shutdown();
         hub.shutdown();
@@ -10726,14 +10848,14 @@ mod tests {
             Duration::from_secs(3600),
             &refusals,
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         std::os::unix::fs::symlink(&shared, first.join("door")).unwrap();
         assert!(
-            eventually(Duration::from_secs(10), || refusals.arms_of(&shared) >= 1),
+            eventually(|| refusals.arms_of(&shared) >= 1),
             "the door out of the watched tree is armed",
         );
-        assert!(hub.tick_now(Duration::from_secs(10)), "the arm is in place");
+        assert!(hub.tick_now(), "the arm is in place");
         refusals.forget_asks();
         (shared_dir, dir, first, second, shared, hub, refusals)
     }
@@ -10824,19 +10946,19 @@ mod tests {
             PollConfig::PRODUCTION,
             BlindPollSeam::default(),
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         std::os::unix::fs::symlink(&shared, extension.join("door")).unwrap();
         assert!(
-            eventually(Duration::from_secs(10), || refusals.arms_of(&shared) >= 1),
+            eventually(|| refusals.arms_of(&shared) >= 1),
             "a door inside the carved-out root is armed",
         );
-        assert!(hub.tick_now(Duration::from_secs(10)), "the arm is in place");
+        assert!(hub.tick_now(), "the arm is in place");
         refusals.forget_asks();
 
         let cursor = hub.drain(hub.subscribe()).cursor;
         assert!(hub.ensure_roots(&[WatchTarget::recursive(workspace)]));
-        assert!(hub.tick_now(Duration::from_secs(10)), "the declaration is applied");
+        assert!(hub.tick_now(), "the declaration is applied");
 
         assert!(
             unwatched(&refusals, &shared),
@@ -10966,7 +11088,7 @@ mod tests {
             Duration::from_secs(3600),
             &refusals,
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         // The root moves to another tree while a second spelling takes over the first.
         std::fs::remove_file(&root).unwrap();
@@ -11004,11 +11126,11 @@ mod tests {
             Duration::from_secs(3600),
             &refusals,
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         refusals.forget_asks();
 
         assert!(hub.ensure_roots(&[WatchTarget::recursive(second)]));
-        assert!(hub.tick_now(Duration::from_secs(10)), "the declaration is applied");
+        assert!(hub.tick_now(), "the declaration is applied");
 
         let calls = refusals.calls();
         assert!(
@@ -11038,14 +11160,11 @@ mod tests {
             Duration::from_secs(3600),
             &refusals,
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         std::os::unix::fs::symlink(&slot, first.join("door")).unwrap();
-        assert!(
-            eventually(Duration::from_secs(10), || refusals.arms_of(&slot) >= 1),
-            "the door is armed",
-        );
-        assert!(hub.tick_now(Duration::from_secs(10)), "the arm is in place");
+        assert!(eventually(|| refusals.arms_of(&slot) >= 1), "the door is armed",);
+        assert!(hub.tick_now(), "the arm is in place");
 
         // A declaration arrives while the target is away, and the target comes back.
         std::fs::rename(&slot, shared.join("previous")).unwrap();
@@ -11124,12 +11243,12 @@ mod tests {
             Duration::from_secs(3600),
             &refusals,
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         refusals.forget_asks();
 
         std::fs::rename(&root, base.join("previous")).unwrap();
         std::fs::create_dir(&root).unwrap();
-        assert!(hub.tick_now(Duration::from_secs(10)), "the periodic check reads the root");
+        assert!(hub.tick_now(), "the periodic check reads the root");
 
         let calls = refusals.calls();
         assert!(
@@ -11150,12 +11269,12 @@ mod tests {
             vec![WatchTarget::recursive(root)],
             Duration::from_secs(3600),
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         hub.ingest_for_test(Err(notify::Error::generic("the stream is gone")));
         assert_eq!(hub.health(), Health::Degraded(DegradeReason::RuntimeError));
 
-        assert!(hub.tick_now(Duration::from_secs(10)), "the periodic check runs");
+        assert!(hub.tick_now(), "the periodic check runs");
         assert_eq!(
             hub.health(),
             Health::Degraded(DegradeReason::RuntimeError),
@@ -11182,21 +11301,21 @@ mod tests {
             Duration::from_secs(3600),
             &refusals,
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         std::os::unix::fs::symlink(&slot, root.join("outer")).unwrap();
         std::os::unix::fs::symlink(&inner_target, slot.join("inner")).unwrap();
         assert!(
-            eventually(Duration::from_secs(10), || refusals.arms_of(&inner_target) >= 1),
+            eventually(|| refusals.arms_of(&inner_target) >= 1),
             "the door behind the outer link is armed",
         );
-        assert!(hub.tick_now(Duration::from_secs(10)), "the arm is in place");
+        assert!(hub.tick_now(), "the arm is in place");
 
         // The way to it is shut for a moment and opened again. Nothing about the door itself
         // changed, so nothing will ever describe it again.
         let aside = root.join("aside");
         std::fs::rename(&slot, &aside).unwrap();
-        assert!(hub.tick_now(Duration::from_secs(10)), "a check lands while the way is shut");
+        assert!(hub.tick_now(), "a check lands while the way is shut");
         std::fs::rename(&aside, &slot).unwrap();
         refusals.forget_asks();
 
@@ -11204,7 +11323,7 @@ mod tests {
         let (_moved_dir, moved_to) = resolved_tempdir();
         std::fs::remove_file(slot.join("inner")).unwrap();
         std::os::unix::fs::symlink(&moved_to, slot.join("inner")).unwrap();
-        assert!(hub.tick_now(Duration::from_secs(10)), "the check reads the doors again");
+        assert!(hub.tick_now(), "the check reads the doors again");
         assert!(
             refusals.arms_of(&moved_to) >= 1,
             "the record was thrown away while the way to it was shut: {:?}",
@@ -11227,17 +11346,15 @@ mod tests {
             Duration::from_secs(3600),
             &refusals,
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         std::os::unix::fs::symlink(&shared, root.join("door")).unwrap();
         assert!(
-            eventually(Duration::from_secs(10), || {
-                hub.health() == Health::Degraded(DegradeReason::RewatchFailed)
-            }),
+            eventually(|| { hub.health() == Health::Degraded(DegradeReason::RewatchFailed) }),
             "the arm over the revealed subtree failed and was reported",
         );
 
-        assert!(hub.tick_now(Duration::from_secs(10)), "the periodic check runs");
+        assert!(hub.tick_now(), "the periodic check runs");
         assert_eq!(
             hub.health(),
             Health::Degraded(DegradeReason::RewatchFailed),
@@ -11258,7 +11375,7 @@ mod tests {
 
         std::fs::remove_file(&door).unwrap();
         std::os::unix::fs::symlink(shared.join("never-was"), &door).unwrap();
-        assert!(hub.tick_now(Duration::from_secs(10)), "the periodic check reads the doors");
+        assert!(hub.tick_now(), "the periodic check reads the doors");
 
         // Named by the DOOR: the link no longer resolves, so that is the only key the
         // watcher was given and the only one it is logged under.
@@ -11288,21 +11405,21 @@ mod tests {
             Duration::from_secs(3600),
             &refusals,
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         std::os::unix::fs::symlink(&slot, root.join("door")).unwrap();
         assert!(
-            eventually(Duration::from_secs(10), || refusals.arms_of(&slot) >= 1),
+            eventually(|| refusals.arms_of(&slot) >= 1),
             "the door is armed on the directory the slot holds now",
         );
-        assert!(hub.tick_now(Duration::from_secs(10)), "the arm is in place");
+        assert!(hub.tick_now(), "the arm is in place");
 
         // Same name, different directory — and the link is untouched, so nothing says so.
         std::fs::rename(&slot, shared.join("previous")).unwrap();
         std::fs::create_dir(&slot).unwrap();
         refusals.forget_asks();
 
-        assert!(hub.tick_now(Duration::from_secs(10)), "the periodic check reads the door");
+        assert!(hub.tick_now(), "the periodic check reads the door");
         assert!(
             refusals.arms_of(&slot) >= 1,
             "the registration stayed on the directory that is gone: {:?}",
@@ -11340,7 +11457,7 @@ mod tests {
         );
 
         refusals.allow(&b);
-        assert!(hub.tick_now(Duration::from_secs(10)), "the retry arms it");
+        assert!(hub.tick_now(), "the retry arms it");
 
         assert_eq!(hub.health(), Health::Healthy, "the obstacle is gone and so is the window");
         let newcomer = hub.subscribe();
@@ -11362,7 +11479,7 @@ mod tests {
         let door = first.join("door");
 
         std::fs::remove_file(&door).unwrap();
-        assert!(hub.tick_now(Duration::from_secs(10)), "the periodic check runs");
+        assert!(hub.tick_now(), "the periodic check runs");
 
         // Named by the DOOR, not by the tree it led to: the spelling no longer resolves, so
         // that is the only key the watcher was given and the only one it is logged under.
@@ -11402,21 +11519,21 @@ mod tests {
             Duration::from_secs(3600),
             &refusals,
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let mut cursor = hub.subscribe();
         refusals.forget_asks();
 
         std::fs::remove_file(&extension).unwrap();
         std::os::unix::fs::symlink(&new, &extension).unwrap();
         assert!(
-            eventually(Duration::from_secs(10), || {
+            eventually(|| {
                 let batch = hub.drain(cursor);
                 cursor = batch.cursor;
                 batch.entries.iter().any(|entry| entry.raw.to_string_lossy().contains("Moved"))
             }),
             "the hub saw the re-pointed root",
         );
-        assert!(hub.tick_now(Duration::from_secs(10)), "and handled the message carrying it");
+        assert!(hub.tick_now(), "and handled the message carrying it");
 
         // ONE unwatch over the whole window: the event left the spelling alone and the
         // check re-pointed it once. Two is the event branch having done half the work and
@@ -11459,7 +11576,7 @@ mod tests {
         // No tick as a barrier: the periodic check re-points a moved door itself, and its
         // own debt would stand in for the one this stand is about.
         assert!(
-            eventually(Duration::from_secs(10), || unwatched(&refusals, &inside)),
+            eventually(|| unwatched(&refusals, &inside)),
             "the door now leads inside the watched tree, and the watch it held on the tree \
              outside was left standing: {:?}",
             refusals.calls(),
@@ -11468,7 +11585,7 @@ mod tests {
         // a later question — here the answer is no, because the tree is already covered —
         // and the debt must not ride on it.
         assert!(
-            eventually(Duration::from_secs(10), || hub.materialize(cursor).rescan_required),
+            eventually(|| hub.materialize(cursor).rescan_required),
             "the unwatch restarted the stream and nobody was told",
         );
     }
@@ -11491,14 +11608,14 @@ mod tests {
         std::fs::remove_file(&door).unwrap();
         std::os::unix::fs::symlink(&moved_to, &door).unwrap();
         assert!(
-            eventually(Duration::from_secs(10), || refusals.arms_of(&moved_to) >= 1),
+            eventually(|| refusals.arms_of(&moved_to) >= 1),
             "the hub tried to arm the door where it leads now, and was refused",
         );
-        assert!(hub.tick_now(Duration::from_secs(10)), "the attempt is over");
+        assert!(hub.tick_now(), "the attempt is over");
 
         refusals.allow(&moved_to);
         refusals.forget_asks();
-        assert!(hub.tick_now(Duration::from_secs(10)), "the periodic check tries again");
+        assert!(hub.tick_now(), "the periodic check tries again");
 
         assert!(
             refusals.arms_of(&moved_to) >= 1,
@@ -11529,12 +11646,12 @@ mod tests {
             Duration::from_secs(3600),
             &refusals,
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         refusals.forget_asks();
 
         std::fs::remove_file(&root).unwrap();
         std::os::unix::fs::symlink(&new, &root).unwrap();
-        assert!(hub.tick_now(Duration::from_secs(10)), "the periodic check sees the retarget");
+        assert!(hub.tick_now(), "the periodic check sees the retarget");
 
         let calls = refusals.calls();
         let first_arm = calls.iter().position(|(kind, _)| *kind == WatchCallKind::Arm);
@@ -11581,14 +11698,14 @@ mod tests {
             PollConfig::PRODUCTION,
             BlindPollSeam::default(),
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         std::os::unix::fs::symlink(&shared, extension.join("door")).unwrap();
         assert!(
-            eventually(Duration::from_secs(10), || refusals.arms_of(&shared) >= 1),
+            eventually(|| refusals.arms_of(&shared) >= 1),
             "a door inside the carved-out root is armed",
         );
-        assert!(hub.tick_now(Duration::from_secs(10)), "the arm is in place");
+        assert!(hub.tick_now(), "the arm is in place");
 
         // The restore of the workspace root fails, so its record must not survive — and the
         // declaration that caused it is answered "not covered", not acknowledged.
@@ -11597,7 +11714,7 @@ mod tests {
             !hub.ensure_roots(&[WatchTarget::recursive(workspace.clone())]),
             "a declaration whose root was lost while restoring it is not covered",
         );
-        assert!(hub.tick_now(Duration::from_secs(10)), "the declaration is applied");
+        assert!(hub.tick_now(), "the declaration is applied");
         assert_eq!(
             hub.health(),
             Health::Degraded(DegradeReason::RewatchFailed),
@@ -11606,7 +11723,7 @@ mod tests {
 
         refusals.allow(&workspace);
         refusals.forget_asks();
-        assert!(hub.tick_now(Duration::from_secs(10)), "the periodic check retries it");
+        assert!(hub.tick_now(), "the periodic check retries it");
         assert!(
             refusals.arms_of(&workspace) >= 1,
             "the root was never tried again: {:?}",
@@ -11629,10 +11746,10 @@ mod tests {
         std::fs::remove_file(&door).unwrap();
         std::os::unix::fs::symlink(&moved_to, &door).unwrap();
         assert!(
-            eventually(Duration::from_secs(10), || refusals.arms_of(&moved_to) >= 1),
+            eventually(|| refusals.arms_of(&moved_to) >= 1),
             "the retargeted door is armed where it leads now",
         );
-        assert!(hub.tick_now(Duration::from_secs(10)), "the arm is in place");
+        assert!(hub.tick_now(), "the arm is in place");
 
         // Asserted on the ORDER, because the seam keys a call by where the path resolved
         // when it was made: by the time the old registration is dropped the link already
@@ -11664,10 +11781,10 @@ mod tests {
         std::fs::remove_file(&door).unwrap();
         std::os::unix::fs::symlink(&moved_to, &door).unwrap();
         assert!(
-            eventually(Duration::from_secs(10), || refusals.arms_of(&moved_to) >= 1),
+            eventually(|| refusals.arms_of(&moved_to) >= 1),
             "the retargeted door is armed where it leads now",
         );
-        assert!(hub.tick_now(Duration::from_secs(10)), "the arm is in place");
+        assert!(hub.tick_now(), "the arm is in place");
         refusals.forget_asks();
 
         assert!(hub.ensure_roots(&[WatchTarget::recursive(first), WatchTarget::recursive(second),]));
@@ -11691,7 +11808,7 @@ mod tests {
             vec![WatchTarget::recursive(root.clone())],
             Duration::from_secs(3600),
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         assert!(hub.ensure_roots(&[WatchTarget::recursive(root), WatchTarget::recursive(second),]));
 
@@ -11744,10 +11861,10 @@ mod tests {
 
         std::os::unix::fs::symlink(&shared, first.join("other-door")).unwrap();
         assert!(
-            eventually(Duration::from_secs(10), || refusals.arms_of(&shared) >= 1),
+            eventually(|| refusals.arms_of(&shared) >= 1),
             "the second door into the same tree is armed too",
         );
-        assert!(hub.tick_now(Duration::from_secs(10)), "the arm is in place");
+        assert!(hub.tick_now(), "the arm is in place");
         refusals.forget_asks();
 
         assert!(hub.ensure_roots(&[WatchTarget::recursive(second)]));
@@ -11878,14 +11995,14 @@ mod tests {
             vec![WatchTarget::recursive(root.clone())],
             Duration::from_secs(3600),
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.drain(hub.subscribe()).cursor;
         assert!(!hub.materialize(cursor).rescan_required, "the stand starts level");
 
         std::os::unix::fs::symlink(&shared, root.join("door")).unwrap();
 
         assert!(
-            eventually(Duration::from_secs(10), || hub.materialize(cursor).rescan_required),
+            eventually(|| hub.materialize(cursor).rescan_required),
             "the stream was restarted to reach the linked subtree, and the window that \
              cost is owed to every consumer",
         );

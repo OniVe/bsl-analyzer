@@ -17,6 +17,10 @@ use mcp_server::{serve_stream, McpProfile, McpServer, SharedState};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+// Shared helpers for the gates in this binary; not every binary uses every one.
+#[allow(dead_code)]
+mod common;
+
 /// Capabilities are profile-independent and the reference profile needs no workspace, so
 /// the handshake is answered without building anything.
 fn server() -> McpServer {
@@ -31,7 +35,7 @@ async fn negotiate(request: Value) -> Value {
     let mut read = BufReader::new(read_half);
     write.write_all(format!("{request}\n").as_bytes()).await.expect("frame written");
     let mut line = String::new();
-    tokio::time::timeout(std::time::Duration::from_secs(30), read.read_line(&mut line))
+    tokio::time::timeout(common::STATE_CEILING, read.read_line(&mut line))
         .await
         .expect("the server answers a handshake")
         .expect("frame read");

@@ -10,7 +10,7 @@
 //! interleaving instead of a cancellation.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const WALK_SPAN: &str = "find_references_in_file";
 
@@ -57,11 +57,14 @@ pub fn entered() -> usize {
 }
 
 /// Block until the walk has entered its first file, so a cancel lands mid-flight. A
-/// fixed sleep would race the build of whatever the walk reads first.
+/// fixed sleep would race the build of whatever the walk reads first. The bound counts
+/// polls, so a slow machine waits longer for the walk to start instead of failing on it.
 pub fn await_walk_start() {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while entered() == 0 {
-        assert!(Instant::now() < deadline, "the walk never started");
+    for _ in 0..60_000 {
+        if entered() > 0 {
+            return;
+        }
         std::thread::sleep(Duration::from_millis(1));
     }
+    panic!("the walk never started");
 }

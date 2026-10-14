@@ -1769,8 +1769,10 @@ mod tests {
             EmptyIndex::Idle,
         )
         .unwrap();
-        assert!(started.elapsed() < Duration::from_millis(500));
         let text = result.content[0].as_text().expect("expected text content").text.as_str();
+        // The answer must not wait for the probe it started: a text check alone would pass a
+        // status that waited, and a slow one whose text is unchanged.
+        assert!(started.elapsed() < Duration::from_millis(500), "status blocked on the probe");
         assert!(text.contains("probing the shared baseline in the background — retry shortly"));
         assert!(text.contains("first background status probe still running"));
         assert!(!text.contains("(published index)"));

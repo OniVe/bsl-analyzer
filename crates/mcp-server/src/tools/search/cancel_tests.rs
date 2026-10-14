@@ -153,7 +153,8 @@ fn a_search_waiting_for_the_engine_lock_returns_at_its_cancellation() {
         });
         std::thread::sleep(HOLD);
         drop(held);
-        let (out, waited) = outcome.recv_timeout(Duration::from_secs(30)).unwrap();
+        let (out, waited) =
+            outcome.recv_timeout(crate::change_hub::test_support::STATE_CEILING).unwrap();
         assert!(!matches!(out, Err(SearchFailure::Cancelled)), "{name}: control must be answered");
         assert!(waited >= HOLD / 2, "{name}: the control did not queue on the lock: {waited:?}");
     }
@@ -188,8 +189,9 @@ fn a_cancelled_search_waiting_on_the_actor_releases_the_engine_lock() {
     assert!(engine.try_lock().is_err(), "sanity: the first search holds the engine while it waits");
 
     cancel.cancel();
-    let (out, waited) =
-        first.recv_timeout(Duration::from_secs(5)).expect("the cancelled search returns");
+    let (out, waited) = first
+        .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+        .expect("the cancelled search returns");
     assert!(matches!(out, Err(SearchFailure::Cancelled)), "got {:?}", out.map(|_| ()));
     assert!(waited < CANCEL_BOUND, "waited {waited:?} past the cancellation");
 
@@ -235,8 +237,9 @@ fn a_cancelled_identity_gate_releases_the_engine_lock() {
     assert!(engine.try_lock().is_err(), "sanity: the identity gate runs under the guard");
 
     cancel.cancel();
-    let (out, waited) =
-        first.recv_timeout(Duration::from_secs(5)).expect("the cancelled search returns");
+    let (out, waited) = first
+        .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+        .expect("the cancelled search returns");
     assert!(matches!(out, Err(SearchFailure::Cancelled)), "got {:?}", out.map(|_| ()));
     assert!(waited < CANCEL_BOUND, "waited {waited:?} past the cancellation");
 
@@ -270,8 +273,9 @@ fn a_cancelled_docs_search_does_not_fall_back_to_the_corpus_view() {
     assert_eq!(latch.executed(), vec!["resolve_snapshot"], "the lexical query is the one latched");
 
     cancel.cancel();
-    let (out, waited) =
-        outcome.recv_timeout(Duration::from_secs(5)).expect("the cancelled search returns");
+    let (out, waited) = outcome
+        .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+        .expect("the cancelled search returns");
     assert!(matches!(out, Err(SearchFailure::Cancelled)), "got {:?}", out.map(|_| ()));
     assert!(waited < CANCEL_BOUND, "waited {waited:?} past the cancellation");
 
@@ -360,9 +364,12 @@ fn a_search_inside_the_query_embed_holds_no_lock_and_returns_at_its_cancellation
         });
 
         // Let the call reach the embed, then look at what it holds while it waits there.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(5),
+        );
         while embedder.accepted() == 0 {
-            assert!(Instant::now() < deadline, "{name}: the embed never reached the embedder");
+            assert!(deadline.allows(), "{name}: the embed never reached the embedder");
             std::thread::sleep(Duration::from_millis(5));
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -371,7 +378,7 @@ fn a_search_inside_the_query_embed_holds_no_lock_and_returns_at_its_cancellation
 
         cancel.cancel();
         let (out, waited) = outcome
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
             .unwrap_or_else(|_| panic!("{name}: the cancelled call never came back"));
         assert!(matches!(out, Err(SearchFailure::Cancelled)), "{name}: expected Cancelled");
         assert!(waited < CANCEL_BOUND, "{name}: waited {waited:?} past its cancellation");

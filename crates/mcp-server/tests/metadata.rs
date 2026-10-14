@@ -25,6 +25,10 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
+// Shared helpers for the gates in this binary; not every binary uses every one.
+#[allow(dead_code)]
+mod common;
+
 type Client = RunningService<RoleClient, ()>;
 
 /// A minimal but valid configuration in a scratch dir, so the resident's on-disk caches never
@@ -298,7 +302,8 @@ async fn source_and_auto_without_connection_keep_form_on_the_source_path() {
 async fn documented_source_object_example_returns_the_parsed_union_over_mcp() {
     let ws = stage_workspace_with_metadata_union();
     let client = workspace_client(ws.path()).await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut deadline =
+        common::Patience::new(common::STATE_CEILING, std::time::Duration::from_millis(100));
 
     loop {
         let result = call(
@@ -313,10 +318,7 @@ async fn documented_source_object_example_returns_the_parsed_union_over_mcp() {
         .await;
         let text = text_of(&result);
         if text.starts_with("Метаданные загружаются") {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the workspace resident never became ready"
-            );
+            assert!(deadline.allows(), "the workspace resident never became ready");
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         }
@@ -441,7 +443,8 @@ async fn a_cold_info_call_is_classifiable_by_status_alone() {
     let ws = stage_workspace();
     let client = workspace_client(ws.path()).await;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut deadline =
+        common::Patience::new(common::STATE_CEILING, std::time::Duration::from_millis(100));
     loop {
         let result = call(&client, &[("action", json!("info"))]).await;
         let loading =
@@ -465,7 +468,7 @@ async fn a_cold_info_call_is_classifiable_by_status_alone() {
             "the human sentence stays alongside the envelope: {}",
             text_of(&result),
         );
-        assert!(tokio::time::Instant::now() < deadline, "the resident never became ready: {body}",);
+        assert!(deadline.allows(), "the resident never became ready: {body}",);
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }

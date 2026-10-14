@@ -635,6 +635,17 @@ impl WorkspaceLease {
         lock_recover(&self.inner.disk_check_threads).clone()
     }
 
+    /// How many disk checks the calling thread has made on this lease. Background owners fence on
+    /// threads of their own, so counting by the caller's name isolates the caller's own work.
+    #[cfg(test)]
+    pub(crate) fn disk_checks_on_this_thread(&self) -> usize {
+        let me = std::thread::current().name().unwrap_or("<unnamed>").to_owned();
+        lock_recover(&self.inner.disk_check_threads)
+            .iter()
+            .filter(|name| name.as_str() == me)
+            .count()
+    }
+
     #[cfg(test)]
     fn note_disk_check(&self) {
         lock_recover(&self.inner.disk_check_threads)
@@ -1013,14 +1024,25 @@ impl WorkspaceLease {
         self.inner.released.load(Ordering::SeqCst)
     }
 
+    /// Takes the lease file lock for the caller, and keeps it until the guard drops.
+    ///
+    /// A background owner may still hold the file for a publication it is finishing, so the
+    /// lock is taken when that owner lets go rather than assumed free at the instant it is
+    /// asked for. The attempts are a hang guard: a holder that never lets go is the failure.
     #[cfg(test)]
     pub(crate) fn hold_file_lock_for_test(&self) -> impl Send {
         let path = self.inner.path.as_deref().expect("test lease is managed");
-        LockGuard::acquire(
-            &path.parent().expect("lease path has a parent").join(LEASE_LOCK_FILE),
-            LOCK_WAIT,
-        )
-        .expect("test acquires lease file lock")
+        let lock_path = path.parent().expect("lease path has a parent").join(LEASE_LOCK_FILE);
+        for _ in 0..6_000 {
+            match LockGuard::try_acquire(&lock_path) {
+                Ok(guard) => return guard,
+                Err(error) if is_lock_contention(&error) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("test acquires lease file lock: {error}"),
+            }
+        }
+        panic!("the lease file lock was never released by its other holders")
     }
 
     #[cfg(test)]
@@ -1523,10 +1545,13 @@ mod tests {
             let lease = lease.clone();
             std::thread::spawn(move || lease.owns_caches_now())
         };
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(10),
+        );
         while !lease.lifecycle_is_busy() {
-            assert!(Instant::now() < deadline, "the check never reached the lifecycle lock");
-            std::thread::yield_now();
+            assert!(deadline.allows(), "the check never reached the lifecycle lock");
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
         let asking = Instant::now();

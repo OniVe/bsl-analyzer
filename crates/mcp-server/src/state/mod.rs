@@ -243,11 +243,30 @@ impl OwnerStop {
 
     /// Wait for every admitted owner to leave before releasing shared derived files.
     pub(crate) fn wait_empty(&self, timeout: std::time::Duration) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
+        self.wait_empty_in_slices(timeout, std::time::Duration::from_secs(60 * 60))
+    }
+
+    /// [`Self::wait_empty`] with the slice a budget too large for the clock waits in.
+    fn wait_empty_in_slices(
+        &self,
+        timeout: std::time::Duration,
+        slice: std::time::Duration,
+    ) -> bool {
+        // A budget too large to place on the clock waits in slices instead: it is bounded by
+        // the owners leaving, which is the point of the wait.
+        let deadline = std::time::Instant::now().checked_add(timeout);
         let mut stopped = self.0.stopped.lock().unwrap_or_else(|poison| poison.into_inner());
         while self.0.live.load(Ordering::SeqCst) != 0 {
-            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
-                return false;
+            let remaining = match deadline {
+                Some(deadline) => {
+                    let Some(remaining) =
+                        deadline.checked_duration_since(std::time::Instant::now())
+                    else {
+                        return false;
+                    };
+                    remaining
+                }
+                None => slice,
             };
             let (guard, result) = self
                 .0
@@ -255,7 +274,7 @@ impl OwnerStop {
                 .wait_timeout(stopped, remaining)
                 .unwrap_or_else(|poison| poison.into_inner());
             stopped = guard;
-            if result.timed_out() && self.0.live.load(Ordering::SeqCst) != 0 {
+            if deadline.is_some() && result.timed_out() && self.0.live.load(Ordering::SeqCst) != 0 {
                 return false;
             }
         }
@@ -1118,6 +1137,19 @@ impl SharedState {
     /// What the order still decides is who is told first, and that only matters for the
     /// subsystems with protocols of their own.
     pub fn shutdown(&self) {
+        self.shutdown_within(std::time::Duration::from_secs(5));
+    }
+
+    /// [`shutdown`](Self::shutdown), waiting up to `owners_budget` for the owners to leave
+    /// instead of the production five seconds. For a caller that removes what the owners read
+    /// once it returns: a stand that is deleted under a backlog still draining reads files that
+    /// are gone, and only a bound on how long the owners may take to stop protects it.
+    ///
+    /// The budget bounds the owners' wait only. The stops that run before it — the reference
+    /// worker's join, the baseline and the diagnostics sweeper — are unchanged and unbounded,
+    /// as they are in `shutdown`: a worker inside an uncancellable baseline call is joined
+    /// after it returns, not cut short here.
+    pub fn shutdown_within(&self, owners_budget: std::time::Duration) {
         // The reference worker stops FIRST: in the reference profile its baseline and this one
         // are the same `Arc`, and closing the baseline before the worker is told to stop leaves
         // it working against a shut-down service — its own `shutdown` closes the baseline in the
@@ -1140,7 +1172,7 @@ impl SharedState {
         // stdio session, a broker fallback) from demoting a long-running daemon for the whole
         // staleness window just by having started later. LAST, so nothing this daemon still
         // has in flight can publish over the next owner's caches.
-        if self.owners.wait_empty(std::time::Duration::from_secs(5)) {
+        if self.owners.wait_empty(owners_budget) {
             self.workspace_lease.release();
         } else {
             tracing::error!("workspace owners did not stop; retaining the workspace lease");
@@ -1233,7 +1265,7 @@ mod tests {
             drop(live);
             done_tx.send(()).unwrap();
         });
-        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        started_rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING).unwrap();
         assert_eq!(
             done_rx.recv_timeout(Duration::from_millis(50)),
             Err(mpsc::RecvTimeoutError::Timeout)
@@ -1249,9 +1281,24 @@ mod tests {
             "the last owner wakes the waiter without losing its notification"
         );
         drop(held);
-        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        done_rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING).unwrap();
         owner.join().unwrap();
         assert!(owners.wait_empty(Duration::ZERO));
+    }
+
+    #[test]
+    fn an_unplaceable_budget_waits_for_the_owners_past_its_first_slice() {
+        let owners = super::OwnerStop::default();
+        let live = owners.enter();
+        let leaving = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(live);
+        });
+        assert!(
+            owners.wait_empty_in_slices(Duration::MAX, Duration::from_millis(10)),
+            "a budget off the clock ends when the owners leave, not at its first slice"
+        );
+        leaving.join().unwrap();
     }
 
     #[test]
@@ -1282,7 +1329,9 @@ mod tests {
         assert!(lease.owns_caches(), "the lease remains held while the owner may still write");
         finish_tx.send(()).unwrap();
         owner.join().unwrap();
-        done_rx.recv_timeout(Duration::from_secs(1)).expect("shutdown completes after owner exit");
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("shutdown completes after owner exit");
         shutdown.join().unwrap();
         assert!(!lease.owns_caches(), "lease release follows the last owner exit");
     }
@@ -1323,28 +1372,37 @@ mod tests {
             holding_tx.send(()).unwrap();
             release.recv().unwrap();
         });
-        holding.recv_timeout(Duration::from_secs(5)).unwrap();
+        holding.recv_timeout(crate::change_hub::test_support::STATE_CEILING).unwrap();
 
         stop.stop();
 
-        let asked = std::time::Instant::now();
-        assert!(matches!(
-            SharedState::apply_workspace_search(&shared, &stop, &lease, |_| Ok(())),
-            WorkspaceSearchApply::Stopping
-        ));
-        assert!(matches!(
-            SharedState::apply_workspace_search_checkpointed(&shared, &stop, &lease, |_, _| {
-                std::ops::ControlFlow::Continue(Ok(()))
-            }),
-            WorkspaceSearchApply::Stopping
-        ));
-        assert!(
-            asked.elapsed() < Duration::from_secs(1),
-            "the owner waited out someone else's hold instead of leaving"
-        );
-
+        // The calls run off this thread while the holder keeps the lock, so a call that waited
+        // for the lock is bounded by the wait below and fails, instead of holding the test.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (shared_c, stop_c, lease_c) = (Arc::clone(&shared), stop.clone(), lease.clone());
+        std::thread::spawn(move || {
+            let first = matches!(
+                SharedState::apply_workspace_search(&shared_c, &stop_c, &lease_c, |_| Ok(())),
+                WorkspaceSearchApply::Stopping
+            );
+            let second = matches!(
+                SharedState::apply_workspace_search_checkpointed(
+                    &shared_c,
+                    &stop_c,
+                    &lease_c,
+                    |_, _| { std::ops::ControlFlow::Continue(Ok(())) }
+                ),
+                WorkspaceSearchApply::Stopping
+            );
+            let _ = done_tx.send(first && second);
+        });
+        let answered = done_rx.recv_timeout(std::time::Duration::from_secs(1));
         release_tx.send(()).unwrap();
         holder.join().unwrap();
+        assert!(
+            answered.is_ok_and(|stopping| stopping),
+            "the owner waited out someone else's hold instead of leaving"
+        );
     }
 
     #[test]
@@ -1526,7 +1584,7 @@ mod standalone_extension_tests {
 
         std::fs::write(&config, "[source]\nroot = \"cf\"\nextensions = []\n").unwrap();
         assert!(
-            crate::change_hub::test_support::eventually(std::time::Duration::from_secs(20), || {
+            crate::change_hub::test_support::eventually(|| {
                 state.scope_transport_stop().is_cancelled()
             },),
             "changing the selected root retires the session bound to the old scope"
@@ -1555,10 +1613,7 @@ mod standalone_extension_tests {
         let seeded = state.standalone_notice().expect("an extension root carries the advisory");
         state.shutdown();
         assert!(
-            crate::change_hub::test_support::eventually(
-                std::time::Duration::from_secs(5),
-                || state.owners.live() == 0
-            ),
+            crate::change_hub::test_support::eventually(|| state.owners.live() == 0),
             "the watcher did not leave"
         );
 
@@ -1585,7 +1640,6 @@ mod consumer_phase_tests {
     use crate::change_hub::{WatchTarget, WorkspaceChangeHub};
     use crate::tools::location::DriftWatch;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
 
     /// A thread that never starts drops its closure unrun, and the guard moved into it names
     /// the consumer abandoned — the phase does not stay "starting" for the life of the process.
@@ -1617,7 +1671,7 @@ mod consumer_phase_tests {
         assert_eq!(consumer_drift_watch(ConsumerPhase::Attached, &hub), DriftWatch::Starting);
         assert_eq!(consumer_drift_watch(ConsumerPhase::Attaching, &hub), DriftWatch::Starting);
         hold.release();
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         assert_eq!(consumer_drift_watch(ConsumerPhase::Attached, &hub), DriftWatch::Watching);
         assert_eq!(consumer_drift_watch(ConsumerPhase::Attaching, &hub), DriftWatch::Starting);
         hub.shutdown();
@@ -1648,7 +1702,7 @@ mod background_lifetime_tests {
         .unwrap();
         let state = SharedState::workspace(dir.path().to_path_buf()).unwrap();
         assert!(
-            eventually(Duration::from_secs(60), || state.owners.live() >= 1),
+            eventually(|| state.owners.live() >= 1),
             "no background owner ever started, so the stop below would prove nothing"
         );
         // Parked in its wait: a consumer caught mid-batch leaves on its own anyway.
@@ -1657,7 +1711,7 @@ mod background_lifetime_tests {
         state.shutdown();
 
         assert!(
-            eventually(Duration::from_secs(1), || state.owners.live() == 0),
+            crate::change_hub::test_support::eventually_within(100, || state.owners.live() == 0),
             "{} owner(s) still running a second after shutdown",
             state.owners.live()
         );
@@ -1668,7 +1722,6 @@ mod background_lifetime_tests {
     #[test]
     fn shutdown_does_not_wait_out_an_engine_hold() {
         use crate::change_hub::test_support::eventually;
-        use std::time::Duration;
 
         let _env = super::test_support::env_lock();
         let _embedding_url = super::test_support::EnvVarGuard::unset("EMBEDDING_URL");
@@ -1679,18 +1732,19 @@ mod background_lifetime_tests {
         std::fs::write(cf.join("Configuration.xml"), "<Configuration/>").unwrap();
         std::fs::write(&module, "Процедура П() Экспорт КонецПроцедуры\n").unwrap();
         let state = SharedState::workspace(dir.path().to_path_buf()).unwrap();
-        assert!(eventually(Duration::from_secs(30), || {
+        assert!(eventually(|| {
             state.search_watch().drift_watch == Some(crate::tools::location::DriftWatch::Watching)
         }));
 
         let hold = state.search_engine().lock().unwrap();
         std::fs::write(&module, "Процедура Н() Экспорт КонецПроцедуры\n").unwrap();
         assert!(
-            eventually(Duration::from_secs(10), || state.search_engine().queued() >= 1),
+            eventually(|| state.search_engine().queued() >= 1),
             "no owner came for the engine, so the stop below would prove nothing"
         );
         state.shutdown();
-        let left = eventually(Duration::from_secs(1), || state.owners.live() == 0);
+        let left =
+            crate::change_hub::test_support::eventually_within(100, || state.owners.live() == 0);
         let live = state.owners.live();
         drop(hold);
         assert!(left, "{live} owner(s) still waiting for the engine a second after shutdown");
@@ -1715,14 +1769,14 @@ mod background_lifetime_tests {
         );
         hold.release();
         assert!(
-            eventually(Duration::from_secs(5), || hub.poll_count() >= 2),
+            eventually(|| hub.poll_count() >= 2),
             "the poll never ran, so stopping it would prove nothing"
         );
 
         let mut state = SharedState::shared();
         state.change_hub = Some(hub.clone());
         state.diagnostics.spawn_sweeper_for_test();
-        assert!(eventually(Duration::from_secs(5), || state.diagnostics.sweeper_running()));
+        assert!(eventually(|| state.diagnostics.sweeper_running()));
 
         state.shutdown();
 
@@ -1730,7 +1784,9 @@ mod background_lifetime_tests {
         std::thread::sleep(PERIOD * 6);
         assert_eq!(hub.poll_count(), stopped, "the poll outlived the daemon that owned it");
         assert!(
-            eventually(Duration::from_secs(1), || !state.diagnostics.sweeper_running()),
+            crate::change_hub::test_support::eventually_within(100, || !state
+                .diagnostics
+                .sweeper_running()),
             "the daemon's shutdown left the diagnostics sweeper running"
         );
     }
@@ -1759,10 +1815,10 @@ mod background_lifetime_tests {
             &refusals,
             PollConfig { period: PERIOD, verify_bytes: 64 * 1024 },
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
-        assert!(eventually(Duration::from_secs(5), || hub.is_partially_blind()));
+        assert!(hub.wait_until_watching());
+        assert!(eventually(|| hub.is_partially_blind()));
         assert!(
-            eventually(Duration::from_secs(5), || hub.poll_count() >= 2),
+            eventually(|| hub.poll_count() >= 2),
             "the blind poll never ran, so stopping it would prove nothing"
         );
         assert!(hub.blind_poll_running());
@@ -1776,7 +1832,7 @@ mod background_lifetime_tests {
         std::thread::sleep(PERIOD * 6);
         assert_eq!(hub.poll_count(), stopped, "the blind poll outlived its daemon");
         assert!(
-            eventually(Duration::from_secs(1), || !hub.blind_poll_running()),
+            crate::change_hub::test_support::eventually_within(100, || !hub.blind_poll_running()),
             "the blind poller thread is still there"
         );
     }
@@ -1792,7 +1848,7 @@ mod background_lifetime_tests {
 
         let dir = tempfile::tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         // Positive control: with nothing stopped and no event coming, the wait runs out on its
         // own — so the release below is the stop's doing and not the hub returning anyway.
@@ -1827,14 +1883,12 @@ mod background_lifetime_tests {
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(stop.live(), 1, "the owner never started, so its exit proves nothing");
 
-        let asked = Instant::now();
         stop.stop();
 
         assert!(
-            left.recv_timeout(Duration::from_secs(1)).is_ok(),
+            left.recv_timeout(std::time::Duration::from_secs(1)).is_ok(),
             "the owner slept through its stop"
         );
-        assert!(asked.elapsed() < Duration::from_secs(1));
         hub.shutdown();
     }
 

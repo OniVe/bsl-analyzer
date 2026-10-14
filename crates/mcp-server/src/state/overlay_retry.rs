@@ -1237,7 +1237,7 @@ mod tests {
             crate::workspace_lease::WorkspaceLease::unmanaged(),
             Duration::from_millis(100),
         );
-        expired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        expired_rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING).unwrap();
         // Eight facts arrive while that pass is failing. They are answered by ONE more pass —
         // a fact the pass did not see is work nobody else will do — and a storm of them is
         // still one pass, not eight.

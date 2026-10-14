@@ -545,8 +545,6 @@ mod tests {
 
     #[test]
     fn graph_data_requests_are_pool_only_under_held_lease() {
-        use std::time::{Duration, Instant};
-
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         crate::graph::test_support::sample_workspace(root);
@@ -562,13 +560,13 @@ mod tests {
         std::fs::remove_file(lease_path).unwrap();
         lease.invalidate_verdict_for_test();
 
-        let started = Instant::now();
+        let started = std::time::Instant::now();
         let first = graph.snapshot().expect("a resident descriptor needs no lease refresh");
         let descriptors: Vec<_> = (1..crate::graph::SNAPSHOT_POOL_CAP)
             .map(|_| graph.snapshot().expect("published descriptor"))
             .collect();
         assert!(graph.snapshot().is_none());
-        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
 
         drop(held_lease);
         drop(first);

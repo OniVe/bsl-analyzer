@@ -15,6 +15,10 @@ use rmcp::service::RunningService;
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::{json, Map, Value};
 
+// Shared helpers for the gates in this binary; not every binary uses every one.
+#[allow(dead_code)]
+mod common;
+
 type Client = RunningService<RoleClient, ()>;
 
 /// The query names a field the catalog does not have. Without metadata nothing can say so;
@@ -96,16 +100,16 @@ fn codes(envelope: &Value) -> Vec<String> {
 /// Keeps asking until the answer stops being parse-only. Written as a poll rather than a
 /// single call because the tool deliberately never waits for the resident.
 async fn validate_until_semantic(client: &Client, query: &str) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let mut deadline = common::Patience::new(
+        std::time::Duration::from_secs(90),
+        std::time::Duration::from_millis(200),
+    );
     loop {
         let envelope = validate(client, args(query)).await;
         if local(&envelope)["backend"] == "workspace_semantics" {
             return envelope;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "never reached workspace_semantics: {envelope}",
-        );
+        assert!(deadline.allows(), "never reached workspace_semantics: {envelope}",);
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }

@@ -229,7 +229,7 @@ pub(super) mod tests {
     use rmcp::model::ErrorCode;
     use std::fs;
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
 
@@ -262,7 +262,8 @@ pub(super) mod tests {
         fs::write(&file, "Процедура Новая()\nКонецПроцедуры").unwrap();
         shared.lock().unwrap().as_ref().unwrap().mark_workspace_path_dirty(&file).unwrap();
         let held_lease = lease.hold_file_lock_for_test();
-        let started = Instant::now();
+        let started = std::time::Instant::now();
+        let fences = lease.disk_checks_on_this_thread();
 
         let lexical = lexical_code_hits(
             &shared,
@@ -285,7 +286,12 @@ pub(super) mod tests {
             10,
         )
         .unwrap();
-        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(
+            lease.disk_checks_on_this_thread(),
+            fences,
+            "the lexical search consulted the lease it was denied, so it would wait on it"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
         drop(held_lease);
         let hybrid = hybrid_code(
             &shared,

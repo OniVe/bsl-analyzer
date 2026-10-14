@@ -1899,12 +1899,20 @@ mod tests {
         write_common_module,
     };
     use super::SharedState;
+    use crate::change_hub::test_support::eventually;
     use bsl_search::SearchEngine;
     use std::fs;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tempfile::tempdir;
+
+    /// How many times the embedding pass has entered the publication fence on this lease — a
+    /// refused attempt and its retry both count, and the count is how a test knows the pass
+    /// reached the fence while another holder kept the lock.
+    fn fence_attempts(lease: &crate::workspace_lease::WorkspaceLease) -> usize {
+        lease.disk_check_threads().iter().filter(|name| name.as_str() == "bsl-search-embed").count()
+    }
 
     #[test]
     fn vector_lifecycle_embedding_orchestration_preserves_context_and_terminal_states() {
@@ -2057,8 +2065,11 @@ mod tests {
     }
 
     fn wait_for_embed_flight(flight: &super::EmbedFlight) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while flight.is_in_flight() && std::time::Instant::now() < deadline {
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(10),
+        );
+        while flight.is_in_flight() && deadline.allows() {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(!flight.is_in_flight(), "embedding pass did not finish");
@@ -2968,7 +2979,7 @@ mod tests {
     #[test]
     fn context_reembed_kick_fills_nulled_chunks_into_the_live_index() {
         use bsl_search::{Chunk, ChunkKind, Store};
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
@@ -3024,9 +3035,12 @@ mod tests {
         );
 
         // Poll until the background pass swaps the fresh vector into the live engine.
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(50),
+        );
         let mut live = false;
-        while Instant::now() < deadline {
+        while deadline.allows() {
             let hits = {
                 let guard = engine_arc.lock().unwrap();
                 guard
@@ -3116,7 +3130,7 @@ mod tests {
     fn xml_drift_lifecycle_refreshes_context_and_reembeds_into_live_index() {
         use crate::change_hub::{ChangeEntry, ChangeKind};
         use bsl_search::{Chunk, ChunkKind, Store};
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
@@ -3207,9 +3221,12 @@ mod tests {
 
         // The stored context is re-rendered from the real graph (no longer the stale string),
         // and the re-embed kick swaps the fresh vector into the live index.
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(50),
+        );
         let mut refreshed = false;
-        while Instant::now() < deadline {
+        while deadline.allows() {
             let (ctx, hits) = {
                 let guard = engine_arc.lock().unwrap();
                 let engine = guard.as_ref().unwrap();
@@ -3249,7 +3266,7 @@ mod tests {
     fn an_xml_descriptor_edit_rerenders_the_context_of_an_overlay_only_record() {
         use crate::change_hub::{ChangeEntry, ChangeKind};
         use bsl_search::{PointPublish, SearchEngine, Store};
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
@@ -3344,9 +3361,12 @@ mod tests {
         };
         // Every wait in this test is on a condition the test itself can re-read, with a deadline
         // instead of a sleep: the graph builds, and its hook runs, on its own thread.
-        let wait_for = |ready: &dyn Fn() -> bool, seconds: u64, what: &str| {
-            let deadline = Instant::now() + Duration::from_secs(seconds);
-            while Instant::now() < deadline {
+        let wait_for = |ready: &dyn Fn() -> bool, what: &str| {
+            let mut deadline = crate::change_hub::test_support::Patience::new(
+                crate::change_hub::test_support::STATE_CEILING,
+                std::time::Duration::from_millis(20),
+            );
+            while deadline.allows() {
                 if ready() {
                     return;
                 }
@@ -3357,8 +3377,11 @@ mod tests {
         // The production owners repeat a point batch whose outcome was transient; so does this.
         let drive_point_refresh =
             |engine: &super::SharedSearchEngine, ready: &dyn Fn() -> bool, what: &str| {
-                let deadline = Instant::now() + Duration::from_secs(30);
-                while Instant::now() < deadline {
+                let mut deadline = crate::change_hub::test_support::Patience::new(
+                    crate::change_hub::test_support::STATE_CEILING,
+                    std::time::Duration::from_millis(20),
+                );
+                while deadline.allows() {
                     if ready() {
                         return;
                     }
@@ -3374,7 +3397,6 @@ mod tests {
         graph.ensure_loading();
         wait_for(
             &|| new_generation_publications.load(Ordering::SeqCst) >= 1,
-            60,
             "the first graph publication never ran its hook",
         );
 
@@ -3450,7 +3472,6 @@ mod tests {
         // chooses (a marks-only fire against the old generation first, or the rebuild's own fire).
         wait_for(
             &|| new_generation_publications.load(Ordering::SeqCst) > publications_before,
-            60,
             "no publication served the edited descriptor",
         );
         {
@@ -3487,7 +3508,7 @@ mod tests {
     fn context_refresh_defers_marks_while_graph_drift_is_pending() {
         use crate::change_hub::{ChangeEntry, ChangeKind};
         use bsl_search::{Chunk, ChunkKind, Store};
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
@@ -3553,9 +3574,12 @@ mod tests {
         // Build a real graph the refresh can read.
         let graph = crate::graph::GraphState::for_workspace(workspace.clone());
         graph.ensure_loading();
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(20),
+        );
         while !matches!(graph.status(), crate::graph::GraphStatus::Ready { .. }) {
-            if Instant::now() > deadline {
+            if !deadline.allows() {
                 panic!("graph did not build: {:?}", graph.status());
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -3653,7 +3677,7 @@ mod tests {
     fn a_publication_clears_no_mark_nobody_handed_it() {
         use bsl_search::{Chunk, ChunkKind, SearchEngine, Store};
         use std::sync::atomic::Ordering;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
@@ -3730,8 +3754,11 @@ mod tests {
         let graph =
             crate::graph::GraphState::for_workspace(workspace.clone()).with_publish_hook(hook);
         graph.ensure_loading();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while fired.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(20),
+        );
+        while fired.load(Ordering::SeqCst) == 0 && deadline.allows() {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(fired.load(Ordering::SeqCst) >= 1, "the build published and fired the hook");
@@ -3756,7 +3783,7 @@ mod tests {
     fn leftover_marks_are_consumed_after_boot_wiring() {
         use bsl_search::{Chunk, ChunkKind, SearchEngine, Store};
         use std::sync::atomic::Ordering;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
@@ -3830,8 +3857,11 @@ mod tests {
         let graph =
             crate::graph::GraphState::for_workspace(workspace.clone()).with_publish_hook(hook);
         graph.ensure_loading();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while fired.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(20),
+        );
+        while fired.load(Ordering::SeqCst) == 0 && deadline.allows() {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(fired.load(Ordering::SeqCst) >= 1, "the boot build published and fired the hook");
@@ -3874,7 +3904,7 @@ mod tests {
     fn a_newer_mark_survives_the_leftover_pickups_captured_bound() {
         use bsl_search::{Chunk, ChunkKind, SearchEngine, Store};
         use std::sync::atomic::Ordering;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
@@ -3954,8 +3984,11 @@ mod tests {
         let graph =
             crate::graph::GraphState::for_workspace(workspace.clone()).with_publish_hook(hook);
         graph.ensure_loading();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while fired.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(20),
+        );
+        while fired.load(Ordering::SeqCst) == 0 && deadline.allows() {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(fired.load(Ordering::SeqCst) >= 1, "the boot build published and fired the hook");
@@ -3994,7 +4027,7 @@ mod tests {
     fn a_newer_mark_survives_the_deferred_leftover_pickup() {
         use bsl_search::{Chunk, ChunkKind, SearchEngine, Store};
         use std::sync::atomic::Ordering;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
@@ -4080,8 +4113,11 @@ mod tests {
             crate::graph::GraphState::for_workspace(workspace.clone()).with_publish_hook(hook);
         graph.consume_leftover_marks(leftover_bound);
         graph.ensure_loading();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while fire_bounds.lock().unwrap().is_empty() && Instant::now() < deadline {
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(20),
+        );
+        while fire_bounds.lock().unwrap().is_empty() && deadline.allows() {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(
@@ -4111,7 +4147,7 @@ mod tests {
     #[test]
     fn a_context_refresh_that_could_not_run_reports_itself_unhandled() {
         use bsl_search::{Chunk, ChunkKind, SearchEngine, Store};
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
@@ -4190,9 +4226,12 @@ mod tests {
         // so the assertion above is about the skip and not about a call that can never say yes.
         let graph = crate::graph::GraphState::for_workspace(workspace.clone());
         graph.ensure_loading();
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(20),
+        );
         while !matches!(graph.status(), crate::graph::GraphStatus::Ready { .. }) {
-            if Instant::now() > deadline {
+            if !deadline.allows() {
                 panic!("graph did not build: {:?}", graph.status());
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -4277,7 +4316,7 @@ mod tests {
     fn a_kept_leftover_obligation_is_discharged_by_the_next_publish() {
         use bsl_search::{Chunk, ChunkKind, SearchEngine, Store};
         use std::sync::atomic::Ordering;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
@@ -4347,11 +4386,14 @@ mod tests {
 
         // Wait for the fire that carries the leftover bound: the handed-over marks tell it
         // apart from a fire with nothing to consume.
-        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(20),
+        );
         let discharged = |bounds: &Arc<Mutex<Vec<i64>>>| {
             bounds.lock().unwrap()[fires_before_publish..].contains(&leftover_bound)
         };
-        while !discharged(&fire_bounds) && Instant::now() < deadline {
+        while !discharged(&fire_bounds) && deadline.allows() {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(
@@ -4453,7 +4495,7 @@ mod tests {
     #[test]
     fn embed_pass_rerun_loop_embeds_a_chunk_nulled_mid_flight() {
         use bsl_search::{Chunk, ChunkKind, Store};
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
@@ -4546,9 +4588,12 @@ mod tests {
         );
 
         // Both A and B must answer the query: A from iteration 1, B from the rerun iteration.
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(50),
+        );
         let mut both = false;
-        while Instant::now() < deadline {
+        while deadline.allows() {
             let hits = {
                 let guard = engine_arc.lock().unwrap();
                 guard
@@ -4977,8 +5022,6 @@ mod tests {
     /// grows to half an hour, and counted as work it pins the whole process for it.
     #[test]
     fn an_embed_pass_in_its_retry_pause_is_not_live_work() {
-        use crate::change_hub::test_support::eventually;
-
         let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
         let _env = mock_embedding_env(&mock);
@@ -4996,31 +5039,33 @@ mod tests {
         let stop = crate::state::OwnerStop::default();
         let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
 
-        // A peer holds the lock the publication fence needs for longer than two of its waits,
-        // so two attempts are refused: the first backs off by nothing, the second by a whole
-        // tick — the pause this test is about.
-        let holder = crate::workspace_lease::WorkspaceLease::hold_cache_lock_for(
-            &cache,
-            Duration::from_secs(5),
-        );
+        // A peer holds the lock the publication fence needs for as long as the test wants it
+        // held, so every attempt is refused: the first backs off by nothing, the second by a
+        // whole tick — the pause this test is about.
+        let (holder, release) =
+            crate::workspace_lease::WorkspaceLease::hold_cache_lock_until_released(&cache);
         SharedState::spawn_embed_pass(
             Arc::clone(&engine),
             stop.clone(),
             Arc::clone(&runtime),
             bsl_search::IndexProgress::new(),
             Arc::clone(&flight),
-            lease,
+            lease.clone(),
             db_path,
             mock_semantic_config(&mock),
             DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
         );
 
         assert!(
-            eventually(Duration::from_secs(10), || flight.is_in_flight()),
+            eventually(|| flight.is_in_flight()),
             "no pass ever claimed the flight, so the pause below would prove nothing"
         );
         assert!(
-            eventually(Duration::from_secs(10), || !flight.is_in_flight()),
+            eventually(|| fence_attempts(&lease) >= 2),
+            "the pass never made the second refused attempt that starts the pause"
+        );
+        assert!(
+            eventually(|| !flight.is_in_flight()),
             "the paused pass is still counted as live work"
         );
         assert!(
@@ -5033,13 +5078,13 @@ mod tests {
         );
 
         stop.stop();
+        release.send(()).unwrap();
         holder.join().unwrap();
     }
 
     #[test]
     fn embedding_fence_distinguishes_retry_from_supersession() {
         use bsl_search::{Chunk, ChunkKind, Store};
-        use std::time::Instant;
 
         let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
@@ -5104,9 +5149,10 @@ mod tests {
             }));
             let runtime = Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Indexing));
             let flight = super::EmbedFlight::new();
+            let stop = crate::state::OwnerStop::default();
             SharedState::spawn_embed_pass(
                 Arc::clone(&engine_arc),
-                crate::state::OwnerStop::default(),
+                stop.clone(),
                 Arc::clone(&runtime),
                 bsl_search::IndexProgress::new(),
                 Arc::clone(&flight),
@@ -5115,10 +5161,10 @@ mod tests {
                 mock_semantic_config(&mock),
                 DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
             );
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while (!old.is_superseded() || flight.is_in_flight()) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            assert!(
+                eventually(|| stop.live() == 0),
+                "the pass stayed after the takeover at {point:?}"
+            );
             assert!(old.is_superseded(), "takeover was observed at the requested fence");
             assert!(!flight.is_in_flight());
             assert!(matches!(
@@ -5155,13 +5201,12 @@ mod tests {
         let runtime = Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Indexing));
         let flight = super::EmbedFlight::new();
         let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
-        let holder = crate::workspace_lease::WorkspaceLease::hold_cache_lock_for(
-            &cache,
-            Duration::from_secs(3),
-        );
+        let (holder, release) =
+            crate::workspace_lease::WorkspaceLease::hold_cache_lock_until_released(&cache);
+        let stop = crate::state::OwnerStop::default();
         SharedState::spawn_embed_pass(
             Arc::clone(&engine),
-            crate::state::OwnerStop::default(),
+            stop.clone(),
             Arc::clone(&runtime),
             bsl_search::IndexProgress::new(),
             Arc::clone(&flight),
@@ -5170,20 +5215,26 @@ mod tests {
             mock_semantic_config(&mock),
             DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
         );
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while !matches!(*runtime.lock().unwrap(), crate::state::SemanticRuntimeStatus::Ready)
-            && Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(!lease.is_superseded());
-        let final_runtime = runtime.lock().unwrap().clone();
+        // The first attempt is refused while the peer holds the lock. The lock is released only
+        // once the retry has begun, so the refusal really happened and the retry is what
+        // succeeds, rather than the first attempt simply finding the lock free.
         assert!(
-            matches!(final_runtime, crate::state::SemanticRuntimeStatus::Ready),
-            "transient refusal must retry to Ready, got {final_runtime:?}"
+            eventually(|| fence_attempts(&lease) >= 2),
+            "the pass never retried the fence it was refused at"
         );
-        assert_eq!(engine.lock().unwrap().as_ref().unwrap().vector_count(), 1);
+        release.send(()).unwrap();
         holder.join().unwrap();
+        assert!(
+            eventually(|| matches!(
+                *runtime.lock().unwrap(),
+                crate::state::SemanticRuntimeStatus::Ready
+            )),
+            "transient refusal must retry to Ready, got {:?}",
+            runtime.lock().unwrap()
+        );
+        assert!(!lease.is_superseded());
+        assert_eq!(engine.lock().unwrap().as_ref().unwrap().vector_count(), 1);
+        assert!(eventually(|| stop.live() == 0), "the pass stayed after it became Ready");
     }
 
     /// A panicking embed pass leaves the runtime `Failed`, never stuck `Indexing`, and releases
@@ -5192,7 +5243,7 @@ mod tests {
     #[test]
     fn embed_pass_panic_leaves_status_failed_and_releases_flight() {
         use bsl_search::{Chunk, ChunkKind, Store};
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
@@ -5248,9 +5299,12 @@ mod tests {
             None,
         );
 
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(20),
+        );
         let mut failed = false;
-        while Instant::now() < deadline {
+        while deadline.allows() {
             let status = semantic_runtime.lock().unwrap_or_else(|p| p.into_inner()).clone();
             if matches!(status, crate::state::SemanticRuntimeStatus::Failed(_)) {
                 failed = true;
@@ -5260,8 +5314,11 @@ mod tests {
         }
         assert!(failed, "a panicking embed pass ends Failed, not stuck Indexing");
         // Give the guards a beat to run on unwind, then assert the claim was released.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while embed_flight.is_in_flight() && Instant::now() < deadline {
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(20),
+        );
+        while embed_flight.is_in_flight() && deadline.allows() {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!embed_flight.is_in_flight(), "the flight claim is released after the panic");

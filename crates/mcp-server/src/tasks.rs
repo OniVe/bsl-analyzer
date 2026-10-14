@@ -505,9 +505,12 @@ mod tests {
             })
         });
 
-        tokio::time::timeout(Duration::from_secs(5), wait_for_terminal(&manager, &task.task_id))
-            .await
-            .expect("a failed index must end the wait, not leave it running to its deadline");
+        tokio::time::timeout(
+            crate::change_hub::test_support::STATE_CEILING,
+            wait_for_terminal(&manager, &task.task_id),
+        )
+        .await
+        .expect("a failed index must end the wait, not leave it running to its deadline");
     }
 
     /// A deadline that elapses before the index is built says so, in the code the
@@ -532,9 +535,12 @@ mod tests {
             })
         });
 
-        tokio::time::timeout(Duration::from_secs(5), wait_for_terminal(&manager, &task.task_id))
-            .await
-            .expect("the deadline must stop the wait");
+        tokio::time::timeout(
+            crate::change_hub::test_support::STATE_CEILING,
+            wait_for_terminal(&manager, &task.task_id),
+        )
+        .await
+        .expect("the deadline must stop the wait");
         let detailed = manager.get_task(&task.task_id).expect("the task is addressable");
         assert_eq!(detailed.task.status, TaskStatus::Failed);
         let error = match detailed.payload {
@@ -562,10 +568,14 @@ mod tests {
     /// a runtime that always has this task to run is never idle. Bounded in REAL time, as a hang
     /// guard only: nothing is decided by how long this takes.
     async fn yield_until(what: &str, mut done: impl FnMut() -> bool) {
-        let give_up = std::time::Instant::now() + Duration::from_secs(20);
+        let mut patience = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            Duration::from_micros(100),
+        );
         while !done() {
-            assert!(std::time::Instant::now() < give_up, "never happened: {what}");
+            assert!(patience.allows(), "never happened: {what}");
             tokio::task::yield_now().await;
+            std::thread::sleep(Duration::from_micros(100));
         }
     }
 
@@ -588,7 +598,7 @@ mod tests {
                 move |_session| {
                     let _ = entered_tx.send(());
                     // Bounded in real time, so a stand that fails cannot strand the thread.
-                    let _ = answer_rx.recv_timeout(Duration::from_secs(20));
+                    let _ = answer_rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING);
                     Ok(CallToolResult::success(vec![]))
                 },
                 || CallToolResult::success(vec![]),
@@ -637,7 +647,7 @@ mod tests {
                     UNREACHABLE_DEADLINE,
                     move |_session| {
                         body_entered.store(true, Ordering::SeqCst);
-                        held.recv_timeout(Duration::from_secs(5))
+                        held.recv_timeout(crate::change_hub::test_support::STATE_CEILING)
                             .expect("the driver releases the finishing body");
                         Ok(answer)
                     },
@@ -882,9 +892,12 @@ mod tests {
             })
         });
 
-        tokio::time::timeout(Duration::from_secs(5), wait_for_terminal(&manager, &task.task_id))
-            .await
-            .expect("the task must settle");
+        tokio::time::timeout(
+            crate::change_hub::test_support::STATE_CEILING,
+            wait_for_terminal(&manager, &task.task_id),
+        )
+        .await
+        .expect("the task must settle");
         let detailed = manager.get_task(&task.task_id).expect("the task is addressable");
         assert_eq!(
             detailed.task.status,

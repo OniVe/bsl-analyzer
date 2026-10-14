@@ -46,9 +46,12 @@ impl Latch {
 
     /// Block until the worker has begun at least `count` requests.
     pub(super) fn wait_started(&self, count: usize) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(5),
+        );
         while self.started() < count {
-            assert!(std::time::Instant::now() < deadline, "the worker never began request {count}");
+            assert!(deadline.allows(), "the worker never began request {count}");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }

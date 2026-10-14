@@ -1580,7 +1580,7 @@ mod tests {
         let state = DiagnosticsState::for_workspace(dir.path().to_path_buf());
         state.spawn_sweeper();
         assert!(
-            eventually(Duration::from_secs(5), || state.sweeper_running()),
+            eventually(|| state.sweeper_running()),
             "the sweeper never started, so its exit below would prove nothing"
         );
 
@@ -1596,10 +1596,10 @@ mod tests {
         state.shutdown();
 
         assert!(
-            eventually(Duration::from_secs(1), || !state.sweeper_running()),
+            crate::change_hub::test_support::eventually_within(100, || !state.sweeper_running()),
             "the sweeper slept through the shutdown"
         );
-        assert!(asked.elapsed() < Duration::from_secs(1));
+        assert!(asked.elapsed() < Duration::from_secs(1), "the sweeper slept out its interval");
     }
 
     /// One resident build is exactly ONE traversal: the file set and the drift

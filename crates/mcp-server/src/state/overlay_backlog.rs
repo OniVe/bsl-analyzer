@@ -756,9 +756,12 @@ mod tests {
 
         // Taken over by a newer daemon.
         let newer = crate::workspace_lease::WorkspaceLease::claim(root);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(20),
+        );
         while !lease.is_superseded() {
-            assert!(std::time::Instant::now() < deadline, "the takeover was never observed");
+            assert!(deadline.allows(), "the takeover was never observed");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert_eq!(
@@ -870,7 +873,10 @@ mod tests {
     fn finish(handle: &OverlayBacklog, stop: &OwnerStop) {
         stop.stop();
         handle.stop();
-        assert!(eventually(Duration::from_secs(1), || stop.live() == 0), "the owner stayed");
+        assert!(
+            crate::change_hub::test_support::eventually_within(100, || stop.live() == 0),
+            "the owner stayed"
+        );
     }
 
     /// An owner that is stopped however the test leaves. A test that asserts in the middle of
@@ -902,7 +908,7 @@ mod tests {
         fn shut_down(&self) -> bool {
             self.stop.stop();
             self.handle.stop();
-            eventually(Duration::from_secs(5), || self.stop.live() == 0)
+            eventually(|| self.stop.live() == 0)
         }
 
         fn finish(self) {
@@ -996,7 +1002,7 @@ mod tests {
             let _ = allowed
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .recv_timeout(Duration::from_secs(10));
+                .recv_timeout(crate::change_hub::test_support::STATE_CEILING);
             let reading = FirstPublication {
                 backlog: backlog(&engine_to_read),
                 hit: found(&engine_to_read, "Новая"),
@@ -1009,7 +1015,7 @@ mod tests {
         handle.fresh();
 
         reached
-            .recv_timeout(Duration::from_secs(20))
+            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
             .expect("the owner never published anything to park");
         assert_eq!(
             publishes.load(Ordering::SeqCst),
@@ -1023,7 +1029,7 @@ mod tests {
         go_on.send(()).unwrap();
 
         assert!(
-            eventually(Duration::from_secs(20), || first_publication
+            eventually(|| first_publication
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .is_some()),
@@ -1119,7 +1125,7 @@ mod tests {
         // was the invalidated one, and the edit was not already in the index before it. The
         // wait is on the reading itself, not on a counter that moves before it exists.
         assert!(
-            eventually(Duration::from_secs(10), || first_publication
+            eventually(|| first_publication
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .is_some()),
@@ -1146,8 +1152,7 @@ mod tests {
 
         // The claim, with the clock exactly where it was left.
         assert!(
-            eventually(Duration::from_secs(10), || found(&shared, "Новая")
-                && backlog(&shared) == 0),
+            eventually(|| found(&shared, "Новая") && backlog(&shared) == 0),
             "one invalidation left the edit unpublished while the owner waited: it is {:?}",
             handle.state(),
         );
@@ -1196,7 +1201,7 @@ mod tests {
         let started = clock.now();
         let mut window = None;
         assert!(
-            eventually(Duration::from_secs(20), || {
+            eventually(|| {
                 window = future_pause(&handle.state(), clock.now());
                 window.is_some()
             }),
@@ -1226,7 +1231,7 @@ mod tests {
         // And the round that set it is over: the owner is parked at its wait, so the counters
         // below describe finished work and not a round still running.
         assert!(
-            eventually(Duration::from_secs(20), || !handle.is_active()),
+            eventually(|| !handle.is_active()),
             "the owner never reached the wait its pause is for: it is {:?}",
             handle.state(),
         );
@@ -1243,7 +1248,7 @@ mod tests {
             let taken = handle.wakes_consumed();
             handle.wake();
             assert!(
-                eventually(Duration::from_secs(20), || handle.wakes_consumed() > taken),
+                eventually(|| handle.wakes_consumed() > taken),
                 "wake {wake} never reached the owner",
             );
         }
@@ -1275,7 +1280,7 @@ mod tests {
         let taken = handle.wakes_consumed();
         handle.wake();
         assert!(
-            eventually(Duration::from_secs(20), || handle.wakes_consumed() > taken),
+            eventually(|| handle.wakes_consumed() > taken),
             "the wake just before the deadline never reached the owner",
         );
         std::thread::sleep(Duration::from_millis(300));
@@ -1295,8 +1300,7 @@ mod tests {
         clock.advance(Duration::from_millis(1));
         handle.wake();
         assert!(
-            eventually(Duration::from_secs(20), || handle.probe.admissions.load(Ordering::SeqCst)
-                > attempts
+            eventually(|| handle.probe.admissions.load(Ordering::SeqCst) > attempts
                 && handle.probe.publishes.load(Ordering::SeqCst) > published),
             "the deadline passed and the owner neither attempted nor published: it is {:?}",
             handle.state(),
@@ -1306,8 +1310,7 @@ mod tests {
         // not by the one just served.
         let second_step = until + super::super::overlay_retry::retry_delay(2);
         assert!(
-            eventually(Duration::from_secs(20), || future_pause(&handle.state(), clock.now())
-                == Some(second_step)),
+            eventually(|| future_pause(&handle.state(), clock.now()) == Some(second_step)),
             "the pause after the third invalidation is not the schedule's next step: it is {:?} \
              against an expected {second_step:?}",
             handle.state(),
@@ -1318,10 +1321,7 @@ mod tests {
         clock.advance(FAST.retry_budget + Duration::from_secs(1));
         handle.wake();
         assert!(
-            eventually(Duration::from_secs(20), || matches!(
-                handle.state(),
-                BacklogState::Exhausted { .. }
-            )),
+            eventually(|| matches!(handle.state(), BacklogState::Exhausted { .. })),
             "the owner never spent the retry budget its invalidations were charged to: it is {:?}",
             handle.state(),
         );
@@ -1337,8 +1337,7 @@ mod tests {
         let (handle, stop) = start(&shared, &WorkspaceLease::unmanaged(), None, FAST);
         edit(&shared, &dir.path().join("M0.bsl"), "Процедура Новая() Экспорт\nКонецПроцедуры\n");
         handle.fresh();
-        assert!(eventually(Duration::from_secs(10), || found(&shared, "Новая")
-            && backlog(&shared) == 0));
+        assert!(eventually(|| found(&shared, "Новая") && backlog(&shared) == 0));
         finish(&handle, &stop);
     }
 
@@ -1350,10 +1349,7 @@ mod tests {
         let (handle, stop) = start(&shared, &lease, None, FAST);
         lease.release();
         handle.wake();
-        assert!(
-            eventually(Duration::from_secs(5), || stop.live() == 0),
-            "the owner outlived its lease"
-        );
+        assert!(eventually(|| stop.live() == 0), "the owner outlived its lease");
         assert!(matches!(handle.state(), BacklogState::Stopped { .. }));
     }
 
@@ -1372,10 +1368,12 @@ mod tests {
         let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
         *handle.probe.before_wait_once.lock().unwrap() = Some(Box::new(move || {
             parked_tx.send(()).unwrap();
-            let _ = go_rx.recv_timeout(Duration::from_secs(10));
+            let _ = go_rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING);
         }));
         assert!(handle.start_with(shared, lease.clone(), None, stop.clone(), FAST));
-        parked_rx.recv_timeout(Duration::from_secs(10)).expect("the owner never reached its wait");
+        parked_rx
+            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+            .expect("the owner never reached its wait");
         (handle, stop, lease, go_tx)
     }
 
@@ -1389,7 +1387,7 @@ mod tests {
         stop.stop();
         lease.release();
         go.send(()).unwrap();
-        assert!(eventually(Duration::from_secs(5), || stop.live() == 0), "the owner stayed");
+        assert!(eventually(|| stop.live() == 0), "the owner stayed");
         assert_eq!(
             handle.state(),
             BacklogState::Stopped { reason: "stopped" },
@@ -1408,15 +1406,17 @@ mod tests {
         let (leave, allowed) = std::sync::mpsc::channel::<()>();
         *handle.probe.before_exit_once.lock().unwrap() = Some(Box::new(move || {
             at_exit.send(()).unwrap();
-            let _ = allowed.recv_timeout(Duration::from_secs(10));
+            let _ = allowed.recv_timeout(crate::change_hub::test_support::STATE_CEILING);
         }));
         // The cause: the lease is handed back, with no stop anywhere.
         lease.release();
         go.send(()).unwrap();
-        reached.recv_timeout(Duration::from_secs(10)).expect("the owner never reached its exit");
+        reached
+            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+            .expect("the owner never reached its exit");
         stop.stop();
         leave.send(()).unwrap();
-        assert!(eventually(Duration::from_secs(5), || stop.live() == 0), "the owner stayed");
+        assert!(eventually(|| stop.live() == 0), "the owner stayed");
         assert_eq!(
             handle.state(),
             BacklogState::Stopped { reason: "the lease went terminal" },
@@ -1433,19 +1433,16 @@ mod tests {
         lease.release();
         go.send(()).unwrap();
         handle.wake();
-        assert!(eventually(Duration::from_secs(5), || stop.live() == 0), "the owner stayed");
+        assert!(eventually(|| stop.live() == 0), "the owner stayed");
         assert_eq!(handle.state(), BacklogState::Stopped { reason: "the lease went terminal" });
 
         let dir = tempfile::tempdir().unwrap();
         let (handle, stop, lease, go) = owner_held_at_its_wait(dir.path());
         let newer = WorkspaceLease::claim(dir.path());
-        assert!(
-            eventually(Duration::from_secs(10), || lease.is_superseded()),
-            "the stand needs the takeover observed",
-        );
+        assert!(eventually(|| lease.is_superseded()), "the stand needs the takeover observed",);
         stop.stop();
         go.send(()).unwrap();
-        assert!(eventually(Duration::from_secs(5), || stop.live() == 0), "the owner stayed");
+        assert!(eventually(|| stop.live() == 0), "the owner stayed");
         assert_eq!(
             handle.state(),
             BacklogState::Stopped { reason: "the workspace was taken over" }
@@ -1471,7 +1468,7 @@ mod tests {
         }
         let started = Instant::now();
         handle.fresh();
-        assert!(eventually(Duration::from_secs(20), || backlog(&shared) == 0));
+        assert!(eventually(|| backlog(&shared) == 0));
         assert!(started.elapsed() < pacing.idle_tick, "the backlog waited on an idle tick");
         let times = handle.probe.publish_times.lock().unwrap().clone();
         assert!(times.len() >= 4, "{} batches for {files} marks", times.len());
@@ -1495,7 +1492,7 @@ mod tests {
                 &format!("Процедура Новая{counted}() Экспорт\nКонецПроцедуры\n"),
             );
             handle.fresh();
-            assert!(eventually(Duration::from_secs(5), || backlog(&shared) == 0));
+            assert!(eventually(|| backlog(&shared) == 0));
             let publishes = handle.probe.publishes.load(Ordering::SeqCst) as u64;
             assert!(publishes > 0);
             assert_eq!(handle.slow_holds(), if counted { publishes } else { 0 });
@@ -1526,10 +1523,10 @@ mod tests {
             );
         }
         handle.fresh();
-        assert!(eventually(Duration::from_secs(5), || backlog(&shared) == 0));
+        assert!(eventually(|| backlog(&shared) == 0));
         assert!(seen.load(Ordering::SeqCst), "a batch in progress did not count as work");
         assert!(
-            eventually(Duration::from_secs(2), || !handle.is_active()),
+            crate::change_hub::test_support::eventually_within(200, || !handle.is_active()),
             "the owner stayed busy"
         );
         finish(&handle, &stop);
@@ -1545,9 +1542,9 @@ mod tests {
         let (handle, stop) = start(&shared, &WorkspaceLease::unmanaged(), None, pacing);
         edit(&shared, &dir.path().join("M0.bsl"), "Процедура Новая() Экспорт\nКонецПроцедуры\n");
         handle.fresh();
-        assert!(eventually(Duration::from_secs(5), || backlog(&shared) == 0));
+        assert!(eventually(|| backlog(&shared) == 0));
         assert!(
-            eventually(Duration::from_secs(2), || !handle.is_active()),
+            crate::change_hub::test_support::eventually_within(200, || !handle.is_active()),
             "an owner waiting out its idle tick still counts as working"
         );
         finish(&handle, &stop);
@@ -1576,7 +1573,7 @@ mod tests {
             );
         }
         handle.fresh();
-        assert!(eventually(Duration::from_secs(5), || stop.live() == 0), "the owner stayed");
+        assert!(eventually(|| stop.live() == 0), "the owner stayed");
         assert_eq!(handle.probe.captures.load(Ordering::SeqCst), 1);
         let prepared = handle.probe.prepared_keys.load(Ordering::SeqCst);
         assert!(prepared <= 1, "{prepared} keys were prepared after the stop");
@@ -1627,7 +1624,7 @@ mod tests {
             pacing
         ));
         assert!(
-            eventually(Duration::from_secs(5), || found(&shared, "Поздняя")),
+            eventually(|| found(&shared, "Поздняя")),
             "the owner slept over the mark it was told about"
         );
         finish(&handle, &stop);
@@ -1660,7 +1657,7 @@ mod tests {
         // `search status` reports.
         let mut window = None;
         assert!(
-            eventually(Duration::from_secs(20), || match handle.state() {
+            eventually(|| match handle.state() {
                 BacklogState::Backoff { until } => {
                     window = Some(until);
                     true
@@ -1679,7 +1676,7 @@ mod tests {
             let taken = handle.wakes_consumed();
             handle.wake();
             assert!(
-                eventually(Duration::from_secs(20), || handle.wakes_consumed() > taken),
+                eventually(|| handle.wakes_consumed() > taken),
                 "wake {wake} never reached the owner",
             );
         }
@@ -1702,8 +1699,7 @@ mod tests {
         clock.advance(until.saturating_duration_since(clock.now()) + Duration::from_millis(1));
         handle.wake();
         assert!(
-            eventually(Duration::from_secs(20), || handle.probe.admissions.load(Ordering::SeqCst)
-                > attempts),
+            eventually(|| handle.probe.admissions.load(Ordering::SeqCst) > attempts),
             "the owner never retried after its backoff ran out",
         );
         holder.execute_batch("ROLLBACK").unwrap();
@@ -1724,23 +1720,19 @@ mod tests {
         edit(&shared, &dir.path().join("M0.bsl"), "Процедура Занятая() Экспорт\nКонецПроцедуры\n");
         handle.fresh();
         assert!(
-            eventually(Duration::from_secs(20), || matches!(
-                handle.state(),
-                BacklogState::Backoff { .. }
-            )),
+            eventually(|| matches!(handle.state(), BacklogState::Backoff { .. })),
             "the refused commit did not back the owner off: {:?}",
             handle.state(),
         );
         let attempts = handle.probe.admissions.load(Ordering::SeqCst);
         assert!(
-            eventually(Duration::from_secs(20), || handle.probe.admissions.load(Ordering::SeqCst)
-                > attempts),
+            eventually(|| handle.probe.admissions.load(Ordering::SeqCst) > attempts),
             "the owner never came back to the batch it was holding",
         );
         assert_eq!(backlog(&shared), 1, "the refused batch lost the mark it never settled");
         holder.execute_batch("ROLLBACK").unwrap();
         assert!(
-            eventually(Duration::from_secs(30), || backlog(&shared) == 0),
+            eventually(|| backlog(&shared) == 0),
             "the owner never settled the batch once the writer let go",
         );
         owner.finish();
@@ -1762,10 +1754,7 @@ mod tests {
             "Процедура Вернулась() Экспорт\nКонецПроцедуры\n",
         );
         handle.fresh();
-        assert!(eventually(Duration::from_secs(5), || matches!(
-            handle.state(),
-            BacklogState::Exhausted { .. }
-        )));
+        assert!(eventually(|| matches!(handle.state(), BacklogState::Exhausted { .. })));
         holder.execute_batch("ROLLBACK").unwrap();
         let attempts = handle.probe.publishes.load(Ordering::SeqCst);
         for _ in 0..10 {
@@ -1777,7 +1766,7 @@ mod tests {
         assert_eq!(backlog(&shared), 1, "the marks went with the budget");
 
         handle.fresh();
-        assert!(eventually(Duration::from_secs(5), || found(&shared, "Вернулась")));
+        assert!(eventually(|| found(&shared, "Вернулась")));
         finish(&handle, &stop);
     }
 
@@ -1794,10 +1783,7 @@ mod tests {
         let (handle, stop) = start(&shared, &WorkspaceLease::unmanaged(), None, FAST);
         edit(&shared, &dir.path().join("M0.bsl"), "Процедура Отказ() Экспорт\nКонецПроцедуры\n");
         handle.fresh();
-        assert!(eventually(Duration::from_secs(5), || matches!(
-            handle.state(),
-            BacklogState::Exhausted { .. }
-        )));
+        assert!(eventually(|| matches!(handle.state(), BacklogState::Exhausted { .. })));
         let rounds = handle.probe.captures.load(Ordering::SeqCst);
         for _ in 0..20 {
             handle.wake();
@@ -1819,10 +1805,7 @@ mod tests {
         fs::write(&path, [0xff, 0xfe]).unwrap();
         assert!(shared.lock().unwrap().as_ref().unwrap().mark_workspace_path_dirty(&path).unwrap());
         handle.fresh();
-        assert!(eventually(Duration::from_secs(5), || matches!(
-            handle.state(),
-            BacklogState::Backoff { .. }
-        )));
+        assert!(eventually(|| matches!(handle.state(), BacklogState::Backoff { .. })));
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(handle.probe.captures.load(Ordering::SeqCst), 1, "the failing key was re-read");
         assert_eq!(backlog(&shared), 1, "the failing key lost its mark");
@@ -1841,7 +1824,11 @@ mod tests {
             fn text_and_parse(&self, _: &str) -> bsl_search::SnapshotFetch {
                 if let Some(entered) = self.entered.lock().unwrap().take() {
                     entered.send(()).unwrap();
-                    let _ = self.release.lock().unwrap().recv_timeout(Duration::from_secs(30));
+                    let _ = self
+                        .release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(crate::change_hub::test_support::STATE_CEILING);
                 }
                 bsl_search::SnapshotFetch::Unavailable
             }
@@ -1856,7 +1843,9 @@ mod tests {
         let (handle, stop) = start(&shared, &WorkspaceLease::unmanaged(), None, FAST);
         edit(&shared, &dir.path().join("M0.bsl"), "Процедура Б() Экспорт\nКонецПроцедуры\n");
         handle.fresh();
-        entered.recv_timeout(Duration::from_secs(10)).expect("the owner reached phase B");
+        entered
+            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+            .expect("the owner reached phase B");
 
         let started = Instant::now();
         let acquired = crate::tools::search::try_acquire_engine(
@@ -1883,17 +1872,14 @@ mod tests {
         let (handle, stop) = start(&shared, &lease, None, FAST);
         edit(&shared, &dir.path().join("M0.bsl"), "Процедура Держат() Экспорт\nКонецПроцедуры\n");
         handle.fresh();
-        assert!(eventually(Duration::from_secs(5), || matches!(
-            handle.state(),
-            BacklogState::Backoff { .. }
-        )));
+        assert!(eventually(|| matches!(handle.state(), BacklogState::Backoff { .. })));
         assert_eq!(handle.probe.captures.load(Ordering::SeqCst), 1, "the reading did not run");
         assert!(handle.probe.publishes.load(Ordering::SeqCst) >= 1);
         assert!(!found(&shared, "Держат"), "a refused commit published");
         let asked = Instant::now();
         stop.stop();
         handle.stop();
-        assert!(eventually(Duration::from_secs(1), || stop.live() == 0));
+        assert!(crate::change_hub::test_support::eventually_within(100, || stop.live() == 0));
         assert!(asked.elapsed() < Duration::from_secs(1));
         drop(held);
     }
@@ -1910,15 +1896,12 @@ mod tests {
         let (handle, stop) = start(&shared, &WorkspaceLease::unmanaged(), None, FAST);
         edit(&shared, &dir.path().join("M0.bsl"), "Процедура Скоро() Экспорт\nКонецПроцедуры\n");
         handle.fresh();
-        assert!(eventually(Duration::from_secs(5), || matches!(
-            handle.state(),
-            BacklogState::Backoff { .. }
-        )));
+        assert!(eventually(|| matches!(handle.state(), BacklogState::Backoff { .. })));
         let BacklogState::Backoff { until } = handle.state() else { unreachable!() };
         let wait = until.saturating_duration_since(Instant::now());
         assert!(wait <= Duration::from_secs(1), "a busy commit waits {wait:?}");
         held.execute_batch("ROLLBACK").unwrap();
-        assert!(eventually(Duration::from_secs(5), || found(&shared, "Скоро")));
+        assert!(eventually(|| found(&shared, "Скоро")));
         assert_eq!(handle.probe.captures.load(Ordering::SeqCst), 1, "the batch was read twice");
         finish(&handle, &stop);
     }
@@ -1938,15 +1921,9 @@ mod tests {
         let (handle, stop) = start(&shared, &WorkspaceLease::unmanaged(), None, pacing);
         edit(&shared, &dir.path().join("M0.bsl"), "Процедура Занята() Экспорт\nКонецПроцедуры\n");
         handle.fresh();
-        assert!(eventually(Duration::from_secs(10), || matches!(
-            handle.state(),
-            BacklogState::Exhausted { .. }
-        )));
+        assert!(eventually(|| matches!(handle.state(), BacklogState::Exhausted { .. })));
         handle.fresh();
-        assert!(eventually(Duration::from_secs(5), || matches!(
-            handle.state(),
-            BacklogState::Backoff { .. }
-        )));
+        assert!(eventually(|| matches!(handle.state(), BacklogState::Backoff { .. })));
         let BacklogState::Backoff { until } = handle.state() else { unreachable!() };
         let wait = until.saturating_duration_since(Instant::now());
         assert!(wait <= Duration::from_millis(600), "the revived owner waits {wait:?}");
@@ -1967,7 +1944,7 @@ mod tests {
             start(&shared, &WorkspaceLease::unmanaged(), Some(Arc::clone(&retry)), FAST);
         edit(&shared, &dir.path().join("M0.bsl"), "Процедура Порция() Экспорт\nКонецПроцедуры\n");
         handle.fresh();
-        assert!(eventually(Duration::from_secs(5), || found(&shared, "Порция")));
+        assert!(eventually(|| found(&shared, "Порция")));
         assert!(retry.is_failed(), "a batch revived the embedding driver");
         finish(&handle, &stop);
     }
@@ -2000,7 +1977,7 @@ mod tests {
             WorkspaceLease::unmanaged(),
             super::super::bootstrap::DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
         );
-        assert!(eventually(Duration::from_secs(10), || retry.pass_count() >= 1));
+        assert!(eventually(|| retry.pass_count() >= 1));
 
         // The owner is held right after it prepared A's second version.
         let (parked_tx, parked) = std::sync::mpsc::channel();
@@ -2010,7 +1987,10 @@ mod tests {
         let parked_tx = Mutex::new(parked_tx);
         *handle.probe.after_prepare.lock().unwrap() = Some(Arc::new(move || {
             let _ = parked_tx.lock().unwrap().send(());
-            let _ = release.lock().unwrap().recv_timeout(Duration::from_secs(30));
+            let _ = release
+                .lock()
+                .unwrap()
+                .recv_timeout(crate::change_hub::test_support::STATE_CEILING);
         }));
         let stop = OwnerStop::default();
         assert!(handle.start_with(
@@ -2023,7 +2003,9 @@ mod tests {
         let a = workspace.join("A.bsl");
         edit(&shared, &a, "Процедура Вторая() Экспорт\nКонецПроцедуры\n");
         handle.fresh();
-        parked.recv_timeout(Duration::from_secs(10)).expect("the owner prepared a batch");
+        parked
+            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+            .expect("the owner prepared a batch");
 
         // Meanwhile A changes again and the driver's full pass publishes the newest bytes. Marks
         // alone are no work of the driver's; a fresh fact after its failure is.
@@ -2031,7 +2013,7 @@ mod tests {
         let passes = retry.pass_count();
         retry.fail_for_test();
         retry.kick_fresh();
-        assert!(eventually(Duration::from_secs(20), || retry.pass_count() > passes));
+        assert!(eventually(|| retry.pass_count() > passes));
         assert!(found(&shared, "Третья"), "the full pass did not publish the newest bytes");
 
         // Released, the held batch meets the state the full pass left. Sampled right after the
@@ -2042,18 +2024,21 @@ mod tests {
         let (published_tx, resume) = (Mutex::new(published_tx), Mutex::new(resume));
         *handle.probe.after_publish.lock().unwrap() = Some(Arc::new(move || {
             let _ = published_tx.lock().unwrap().send(());
-            let _ = resume.lock().unwrap().recv_timeout(Duration::from_secs(30));
+            let _ =
+                resume.lock().unwrap().recv_timeout(crate::change_hub::test_support::STATE_CEILING);
         }));
         *handle.probe.after_prepare.lock().unwrap() = None;
         release_tx.send(()).unwrap();
-        published.recv_timeout(Duration::from_secs(10)).expect("the held batch was published");
+        published
+            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+            .expect("the held batch was published");
         let older = found(&shared, "Вторая");
         let newest = found(&shared, "Третья");
         *handle.probe.after_publish.lock().unwrap() = None;
         resume_tx.send(()).unwrap();
         assert!(!older, "the older read was published over the full pass");
         assert!(newest, "the stale batch rolled the full pass back");
-        assert!(eventually(Duration::from_secs(10), || backlog(&shared) == 0));
+        assert!(eventually(|| backlog(&shared) == 0));
 
         // A point settlement is lexical; the driver's next pass gives it its vectors.
         let b = workspace.join("B.bsl");
@@ -2061,7 +2046,7 @@ mod tests {
         handle.fresh();
         retry.kick_fresh();
         assert!(
-            eventually(Duration::from_secs(20), || {
+            eventually(|| {
                 let guard = shared.lock().unwrap();
                 let engine = guard.as_ref().unwrap();
                 let signals = engine.workspace_overlay_retry_signals().unwrap();

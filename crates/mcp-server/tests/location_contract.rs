@@ -16,6 +16,10 @@ use rmcp::{RoleClient, ServiceExt};
 use serde_json::{Map, Value};
 use tempfile::TempDir;
 
+// Shared helpers for the gates in this binary; not every binary uses every one.
+#[allow(dead_code)]
+mod common;
+
 type Client = RunningService<RoleClient, ()>;
 
 fn designer_fixture() -> PathBuf {
@@ -78,7 +82,10 @@ fn args(pairs: &[(&str, Value)]) -> Map<String, Value> {
 /// its `status: "loading"` field — how a consumer is meant to read it — never by matching
 /// the human sentence beside it.
 async fn poll(client: &Client, tool: &'static str, call_args: Map<String, Value>) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let mut deadline = common::Patience::new(
+        std::time::Duration::from_secs(120),
+        std::time::Duration::from_millis(100),
+    );
     loop {
         let call = CallToolRequestParams::new(tool).with_arguments(call_args.clone());
         let result = client.call_tool(call).await.expect("transport ok");
@@ -87,10 +94,7 @@ async fn poll(client: &Client, tool: &'static str, call_args: Map<String, Value>
                 return structured;
             }
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{tool} never became ready for {call_args:?}"
-        );
+        assert!(deadline.allows(), "{tool} never became ready for {call_args:?}");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }

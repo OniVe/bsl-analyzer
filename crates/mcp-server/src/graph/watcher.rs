@@ -581,7 +581,7 @@ mod tests {
 
     fn watched_graph(root: &std::path::Path) -> (GraphState, WorkspaceChangeHub, OwnerStop) {
         let hub = super::super::test_support::workspace_hub(root);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
         (graph, hub, OwnerStop::default())
     }
@@ -692,7 +692,7 @@ mod tests {
             let cursor = hub.subscribe();
             std::fs::write(root.join("Новый.bsl"), "Процедура П() КонецПроцедуры").unwrap();
             assert!(
-                eventually(Duration::from_secs(10), || !hub.materialize(cursor).entries.is_empty()),
+                eventually(|| !hub.materialize(cursor).entries.is_empty()),
                 "the hub never delivered the write the observation must find waiting",
             );
             Watcher {
@@ -825,7 +825,7 @@ mod tests {
         stop.stop();
 
         assert!(
-            eventually(Duration::from_secs(5), || hub.active_cursor_count() == before),
+            eventually(|| hub.active_cursor_count() == before),
             "the graph left a cursor behind: {} of {before}",
             hub.active_cursor_count()
         );
@@ -855,7 +855,7 @@ mod tests {
         assert!(Instant::now() >= due);
         stop.stop();
         hub.interrupt_waiters();
-        assert!(eventually(Duration::from_secs(1), || stop.live() == 0));
+        assert!(crate::change_hub::test_support::eventually_within(100, || stop.live() == 0));
     }
 
     /// Work handed over inside the sampling window is not slept through.
@@ -877,7 +877,7 @@ mod tests {
         let root = dir.path();
         sample_workspace(root);
         let hub = super::super::test_support::workspace_hub(root);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let stop = OwnerStop::default();
 
         let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -905,8 +905,7 @@ mod tests {
 
         // The window is entered once per turn, so the count IS the number of turns taken.
         assert!(
-            eventually(Duration::from_secs(5), || turns.load(std::sync::atomic::Ordering::SeqCst)
-                >= 4),
+            eventually(|| turns.load(std::sync::atomic::Ordering::SeqCst) >= 4),
             "the owner slept out its slice over work handed to it inside the sampling window: \
              {} turns",
             turns.load(std::sync::atomic::Ordering::SeqCst),
@@ -917,9 +916,11 @@ mod tests {
         // the hub may deliver something of its own — but a slice of thirty seconds against a
         // handful of turns in two is the difference being asserted.
         let settled = turns.load(std::sync::atomic::Ordering::SeqCst);
+        // An absence can only be observed over a window. The window can hide a spurious turn
+        // from this check, never create one, so it is the one place a clock is read on purpose.
+        std::thread::sleep(Duration::from_secs(2));
         assert!(
-            !eventually(Duration::from_secs(2), || turns.load(std::sync::atomic::Ordering::SeqCst)
-                > settled + 2),
+            turns.load(std::sync::atomic::Ordering::SeqCst) <= settled + 2,
             "the owner turns over with nothing handed to it; the assertion above proves nothing",
         );
 
@@ -959,7 +960,7 @@ mod tests {
             CAP,
             Duration::from_secs(3600),
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let stalled = hub.subscribe();
         let graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
         let stop = OwnerStop::default();
@@ -1091,7 +1092,7 @@ mod tests {
         root: &std::path::Path,
     ) -> (GraphState, WorkspaceChangeHub, OwnerStop, Arc<Mutex<Vec<i64>>>) {
         let hub = super::super::test_support::workspace_hub(root);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let bounds = Arc::new(Mutex::new(Vec::new()));
         let hook = {
             let bounds = Arc::clone(&bounds);
@@ -1190,7 +1191,7 @@ mod tests {
         after_watch: impl FnOnce(),
     ) -> bool {
         let hub = super::super::test_support::workspace_hub(root);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
         let stop = OwnerStop::default();
         let watcher = Watcher {
@@ -1291,7 +1292,7 @@ mod tests {
         sample_workspace(root);
         write(root, "Configuration.xml", "<Configuration/>");
         let hub = super::super::test_support::workspace_hub(root);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
         let stop = OwnerStop::default();
         let cursor = hub.subscribe();
@@ -1374,7 +1375,7 @@ mod tests {
                 2,
                 Duration::from_secs(3600),
             );
-            assert!(hub.wait_until_watching(Duration::from_secs(5)));
+            assert!(hub.wait_until_watching());
             let graph = GraphState::for_workspace(root.clone()).with_change_hub(hub.clone());
             let search = hub.subscribe();
             let stop = OwnerStop::default();

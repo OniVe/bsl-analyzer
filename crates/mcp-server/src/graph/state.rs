@@ -1882,6 +1882,13 @@ impl GraphState {
         inner.claimed.is_some() || inner.building.is_some()
     }
 
+    /// Whether a recovery walk is out right now. A walk out makes a second caller's probe a
+    /// no-op, so a test that expects its own probe to run must wait for this to clear.
+    #[cfg(test)]
+    pub(crate) fn walk_out(&self) -> bool {
+        lock_recover(&self.debt).walk_out()
+    }
+
     /// The hub position a build reads BEFORE its pre-scan, recorded on its publication as
     /// [`Published::observed_through`]: every fact at or below it reached the hub before the
     /// scan read disk, so the published graph reflects it.
@@ -3145,7 +3152,8 @@ mod tests {
     #[cfg(unix)]
     use super::super::test_support::wait_until_driving;
     use super::super::test_support::{
-        drive_until, published_report, sample_workspace, wait_ready, wait_until, wait_until_within,
+        drive_until, published_report, sample_workspace, wait_ready, wait_settled, wait_until,
+        wait_until_within,
     };
     use super::*;
     use std::fs;
@@ -3230,7 +3238,6 @@ mod tests {
     /// loss was already acted on" would be asserting it against the state before the fact.
     #[test]
     fn a_quiet_delivery_is_listed_only_once_the_ledger_has_it() {
-        use crate::change_hub::test_support::eventually;
         let dir = tempfile::tempdir().unwrap();
         let graph = GraphState::for_workspace(dir.path().to_path_buf());
         let ledger = lock_recover(&graph.debt);
@@ -3243,9 +3250,13 @@ mod tests {
                 graph.record_loss_quietly(Some(7), 3);
             })
         };
-        called.recv_timeout(Duration::from_secs(10)).expect("the delivery never set out");
+        called
+            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+            .expect("the delivery never set out");
         let listed_while_the_ledger_was_busy =
-            eventually(Duration::from_secs(2), || !graph.quiet_loss_deliveries().is_empty());
+            crate::change_hub::test_support::eventually_within(200, || {
+                !graph.quiet_loss_deliveries().is_empty()
+            });
         drop(ledger);
         delivering.join().expect("the delivering thread");
 
@@ -3464,7 +3475,7 @@ mod tests {
         // Answered asynchronously now, so the statement is given time to become false before
         // it is believed: a spent budget must still be spent after every kick has run.
         assert!(
-            !crate::change_hub::test_support::eventually(Duration::from_secs(2), || !matches!(
+            !crate::change_hub::test_support::eventually_within(200, || !matches!(
                 lock_recover(&spent.inner).status,
                 GraphStatus::Failed(_)
             )),
@@ -3496,7 +3507,7 @@ mod tests {
             let root = dir.path();
             sample_workspace(root);
             let hub = crate::graph::test_support::workspace_hub(root);
-            assert!(hub.wait_until_watching(Duration::from_secs(5)));
+            assert!(hub.wait_until_watching());
 
             let late_fact = Arc::new(AtomicI64::new(-1));
             let fired = Arc::new(AtomicUsize::new(0));
@@ -3756,7 +3767,6 @@ mod tests {
                     // the second turn has run to completion and says so.
                     assert!(
                         crate::change_hub::test_support::eventually(
-                            Duration::from_secs(30),
                             || release.load(Ordering::SeqCst)
                         ),
                         "the second turn never finished",
@@ -3781,8 +3791,7 @@ mod tests {
             std::thread::spawn(move || graph.drive())
         };
         assert!(
-            crate::change_hub::test_support::eventually(Duration::from_secs(30), || parked
-                .load(Ordering::SeqCst)),
+            crate::change_hub::test_support::eventually(|| parked.load(Ordering::SeqCst)),
             "the first turn never reached the hook",
         );
 
@@ -3869,7 +3878,6 @@ mod tests {
                 if !parked.swap(true, Ordering::SeqCst) {
                     assert!(
                         crate::change_hub::test_support::eventually(
-                            Duration::from_secs(30),
                             || release.load(Ordering::SeqCst)
                         ),
                         "the new revision was never raised",
@@ -3894,8 +3902,7 @@ mod tests {
             std::thread::spawn(move || graph.drive())
         };
         assert!(
-            crate::change_hub::test_support::eventually(Duration::from_secs(30), || parked
-                .load(Ordering::SeqCst)),
+            crate::change_hub::test_support::eventually(|| parked.load(Ordering::SeqCst)),
             "the flush never reached the hook",
         );
 
@@ -4035,7 +4042,7 @@ mod tests {
         let root = dir.path();
         sample_workspace(root);
         let hub = crate::graph::test_support::workspace_hub(root);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
         graph.set_watch(super::super::watcher::WatchPhase::Running, None);
         graph.ensure_loading();
@@ -4078,7 +4085,7 @@ mod tests {
         let root = dir.path();
         sample_workspace(root);
         let hub = crate::graph::test_support::workspace_hub(root);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         let delivered = Arc::new(AtomicI64::new(-1));
         let walks_at_delivery = Arc::new(AtomicUsize::new(0));
@@ -4105,8 +4112,11 @@ mod tests {
                 );
                 // Bounded, and never an assertion from inside the graph's own thread: a
                 // barrier that panics here unwinds through the executor being tested.
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while Instant::now() < deadline {
+                let mut deadline = crate::change_hub::test_support::Patience::new(
+                    crate::change_hub::test_support::STATE_CEILING,
+                    std::time::Duration::from_millis(10),
+                );
+                while deadline.allows() {
                     let seq = hub.seq();
                     if seq > floor {
                         // Exactly what the watcher's drain does with a delivered batch.
@@ -4180,7 +4190,7 @@ mod tests {
         let root = dir.path();
         sample_workspace(root);
         let hub = crate::graph::test_support::workspace_hub(root);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
 
         let delivered = Arc::new(AtomicI64::new(-1));
         let hook = {
@@ -4201,8 +4211,11 @@ mod tests {
                 );
                 // Bounded, and never an assertion from inside the graph's own walk: a barrier
                 // that panics here unwinds through the code under test.
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while Instant::now() < deadline {
+                let mut deadline = crate::change_hub::test_support::Patience::new(
+                    crate::change_hub::test_support::STATE_CEILING,
+                    std::time::Duration::from_millis(10),
+                );
+                while deadline.allows() {
                     let seq = hub.seq();
                     if seq > floor {
                         graph.record_change_quietly(seq);
@@ -4234,8 +4247,7 @@ mod tests {
         let issued_after = hub.seq().max(watermark);
         std::fs::write(root.join("unscanned.txt"), "a change no scan reads").unwrap();
         assert!(
-            crate::change_hub::test_support::eventually(Duration::from_secs(10), || hub.seq()
-                > issued_after),
+            crate::change_hub::test_support::eventually(|| hub.seq() > issued_after),
             "the hub never reported the change this fixture made",
         );
         graph.record_change_quietly(graph.observation());
@@ -6111,7 +6123,7 @@ mod tests {
                     if armed.swap(false, Ordering::SeqCst) {
                         entered_tx.send(()).expect("the test outlives the parked build");
                         lock_recover(&release_rx)
-                            .recv_timeout(Duration::from_secs(30))
+                            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
                             .expect("the test released the parked build");
                     }
                 }) as Arc<dyn Fn() + Send + Sync>
@@ -6132,7 +6144,7 @@ mod tests {
         /// Fails instead of hanging when no publication reaches the window.
         fn wait_entered(&self) {
             self.entered
-                .recv_timeout(Duration::from_secs(30))
+                .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
                 .expect("a publication reached the publish window");
         }
 
@@ -6364,7 +6376,7 @@ mod tests {
             if signal.mark_bound == LEFTOVER_BOUND {
                 entered_tx.send(()).expect("the test outlives the parked pass");
                 lock_recover(&release_rx)
-                    .recv_timeout(Duration::from_secs(30))
+                    .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
                     .expect("the test released the parked pass");
             }
             GraphPublishOutcome { topology_handled: false, roots_handled: false }
@@ -6391,7 +6403,9 @@ mod tests {
             let graph = graph.clone();
             std::thread::spawn(move || graph.notify_published(false))
         };
-        entered.recv_timeout(Duration::from_secs(30)).expect("the pass reached its consume");
+        entered
+            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+            .expect("the pass reached its consume");
         assert!(graph.marks_pending(), "inside the pass the marks already read consumed");
 
         release_tx.send(()).expect("the parked pass is still running");
@@ -6421,7 +6435,7 @@ mod tests {
             if signal.mark_bound == BOUND {
                 entered_tx.send(()).expect("the test outlives the parked consume");
                 lock_recover(&release_rx)
-                    .recv_timeout(Duration::from_secs(30))
+                    .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
                     .expect("the test released the parked consume");
             }
             GraphPublishOutcome::HANDLED
@@ -6448,7 +6462,9 @@ mod tests {
             let graph = graph.clone();
             std::thread::spawn(move || graph.marks_placed(BOUND, 9))
         };
-        entered.recv_timeout(Duration::from_secs(30)).expect("the consume reached its hook");
+        entered
+            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+            .expect("the consume reached its hook");
 
         // Meanwhile a build tries to install an unsound publication of its own.
         let installing = {
@@ -6880,7 +6896,6 @@ mod tests {
                 if !inside.swap(true, Ordering::SeqCst) {
                     assert!(
                         crate::change_hub::test_support::eventually(
-                            Duration::from_secs(30),
                             || second_done.load(Ordering::SeqCst)
                         ),
                         "the second caller never finished",
@@ -6906,8 +6921,7 @@ mod tests {
             std::thread::spawn(move || graph.probe_recovery())
         };
         assert!(
-            crate::change_hub::test_support::eventually(Duration::from_secs(30), || inside
-                .load(Ordering::SeqCst)),
+            crate::change_hub::test_support::eventually(|| inside.load(Ordering::SeqCst)),
             "the first probe never reached its window",
         );
 
@@ -7130,7 +7144,7 @@ mod tests {
         };
         let graph = GraphState::for_workspace(root.to_path_buf()).with_probe_window_hook(hook);
         graph.ensure_loading();
-        wait_ready(&graph);
+        wait_settled(&graph);
         assert!(graph.owes_recovery(), "the fixture needs an outstanding obligation");
         lock_recover(&graph.debt).probe_now(Instant::now());
         let before = graph.probe_walks.load(Ordering::SeqCst);
@@ -7299,7 +7313,7 @@ mod tests {
         }
         let graph = GraphState::for_workspace(root.to_path_buf());
         graph.ensure_loading();
-        wait_ready(&graph);
+        wait_settled(&graph);
         assert!(graph.owes_recovery(), "the fixture needs outstanding obligations");
 
         // One healing, measured through the real pass.
@@ -8075,8 +8089,11 @@ mod tests {
                 .with_post_claim_hook({
                     let release = Arc::clone(&release);
                     Arc::new(move |_: &GraphState| {
-                        let deadline = Instant::now() + Duration::from_secs(30);
-                        while !release.load(Ordering::SeqCst) && Instant::now() < deadline {
+                        let mut deadline = crate::change_hub::test_support::Patience::new(
+                            crate::change_hub::test_support::STATE_CEILING,
+                            std::time::Duration::from_millis(5),
+                        );
+                        while !release.load(Ordering::SeqCst) && deadline.allows() {
                             std::thread::sleep(Duration::from_millis(5));
                         }
                     })
@@ -8460,7 +8477,7 @@ mod tests {
         sample_workspace(root);
         let graph = GraphState::for_workspace(root.to_path_buf());
         graph.ensure_loading();
-        wait_ready(&graph);
+        wait_settled(&graph);
 
         // A healing on record, measured through the production pass.
         {
@@ -8569,7 +8586,7 @@ mod tests {
         let edited = root.join("CommonModules").join("Полный1").join("Ext").join("Module.bsl");
 
         let hub = crate::graph::test_support::workspace_hub(root);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
         graph.set_watch(super::super::watcher::WatchPhase::Running, None);
         graph.ensure_loading();
@@ -8681,7 +8698,7 @@ mod tests {
         // A real hub, so the facts the marks are placed for are real positions rather than
         // the no-stream sentinel a workspace without one reports.
         let hub = crate::graph::test_support::workspace_hub(root);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
         graph.set_watch(super::super::watcher::WatchPhase::Running, None);
         graph.ensure_loading();
@@ -9264,7 +9281,6 @@ mod tests {
                 if !inside.swap(true, Ordering::SeqCst) {
                     assert!(
                         crate::change_hub::test_support::eventually(
-                            Duration::from_secs(30),
                             || turn_done.load(Ordering::SeqCst)
                         ),
                         "the executor turn never finished",
@@ -9296,7 +9312,7 @@ mod tests {
             );
             std::thread::spawn(move || {
                 assert!(
-                    crate::change_hub::test_support::eventually(Duration::from_secs(30), || {
+                    crate::change_hub::test_support::eventually(|| {
                         inside.load(Ordering::SeqCst)
                     }),
                     "the publish pass never reached its hook",
@@ -10227,7 +10243,7 @@ mod tests {
         sample_workspace(root);
         fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
         let hub = super::super::test_support::workspace_hub(root);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let offered = Arc::new(Mutex::new(Vec::new()));
         let mark_attempts = Arc::new(AtomicUsize::new(0));
         let graph = GraphState::for_workspace(root.to_path_buf())
@@ -10259,9 +10275,7 @@ mod tests {
         let before = hub.seq().max(publication);
         fs::write(&metadata_path, &same_bytes).unwrap();
         assert!(
-            crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
-                hub.seq() > before
-            }),
+            crate::change_hub::test_support::eventually(|| { hub.seq() > before }),
             "the same-byte XML write did not reach the workspace hub"
         );
         let first_fact = hub.seq();
@@ -10282,9 +10296,7 @@ mod tests {
         let before = hub.seq();
         fs::write(&metadata_path, &same_bytes).unwrap();
         assert!(
-            crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
-                hub.seq() > before
-            }),
+            crate::change_hub::test_support::eventually(|| { hub.seq() > before }),
             "the second same-byte XML write did not reach the workspace hub"
         );
         let second_fact = hub.seq();
@@ -10320,7 +10332,7 @@ mod tests {
         sample_workspace(root);
         fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
         let hub = super::super::test_support::workspace_hub(root);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let graph = GraphState::for_workspace(root.to_path_buf())
             .with_change_hub(hub.clone())
             .with_publish_hook(Arc::new(|_| GraphPublishOutcome::HANDLED));
@@ -10337,9 +10349,7 @@ mod tests {
         let before = hub.seq().max(observed);
         fs::write(&path, &same_bytes).unwrap();
         assert!(
-            crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
-                hub.seq() > before
-            }),
+            crate::change_hub::test_support::eventually(|| { hub.seq() > before }),
             "the first same-byte touch did not reach the hub"
         );
         let reported_fact = hub.seq();
@@ -10354,9 +10364,7 @@ mod tests {
         // must retain the fact at which it reported the mark, not rebind it to this later seq.
         fs::write(&path, &same_bytes).unwrap();
         assert!(
-            crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
-                hub.seq() > reported_fact
-            }),
+            crate::change_hub::test_support::eventually(|| { hub.seq() > reported_fact }),
             "the later same-byte touch did not advance the hub"
         );
         graph.register_owed_context_marks();
@@ -10376,9 +10384,7 @@ mod tests {
 
         fs::write(&path, &same_bytes).unwrap();
         assert!(
-            crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
-                hub.seq() > newer_fact
-            }),
+            crate::change_hub::test_support::eventually(|| { hub.seq() > newer_fact }),
             "the comparison touch for the newer provider mark did not reach the hub"
         );
         let comparison_fact = hub.seq();
@@ -10597,8 +10603,11 @@ mod tests {
             .with_handover_hook({
                 let successor_carried = Arc::clone(&successor_carried);
                 Arc::new(move |graph: &GraphState| {
-                    let deadline = Instant::now() + Duration::from_secs(10);
-                    while Instant::now() < deadline {
+                    let mut deadline = crate::change_hub::test_support::Patience::new(
+                        crate::change_hub::test_support::STATE_CEILING,
+                        std::time::Duration::from_millis(5),
+                    );
+                    while deadline.allows() {
                         let carrying = lock_recover(&graph.inner)
                             .building
                             .is_some_and(|ticket| ticket.kind == BuildKind::Reload);
@@ -10614,12 +10623,15 @@ mod tests {
                 let (handed_over, parked, release) =
                     (Arc::clone(&handed_over), Arc::clone(&parked), Arc::clone(&release));
                 Arc::new(move || {
-                    let deadline = Instant::now() + Duration::from_secs(10);
-                    while !handed_over.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    let mut deadline = crate::change_hub::test_support::Patience::new(
+                        crate::change_hub::test_support::STATE_CEILING,
+                        std::time::Duration::from_millis(5),
+                    );
+                    while !handed_over.load(Ordering::SeqCst) && deadline.allows() {
                         std::thread::sleep(Duration::from_millis(5));
                     }
                     parked.store(true, Ordering::SeqCst);
-                    while !release.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    while !release.load(Ordering::SeqCst) && deadline.allows() {
                         std::thread::sleep(Duration::from_millis(5));
                     }
                 })
@@ -10743,7 +10755,7 @@ mod tests {
         sample_workspace(root);
         let graph = GraphState::for_workspace(root.to_path_buf());
         graph.ensure_loading();
-        wait_ready(&graph);
+        wait_settled(&graph);
 
         graph.loader_cannot_spawn.store(true, Ordering::SeqCst);
         lock_recover(&graph.debt).record_forced(Instant::now(), 7);
@@ -10921,8 +10933,11 @@ mod tests {
                 if parked.swap(true, Ordering::SeqCst) {
                     return;
                 }
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while !release.load(Ordering::SeqCst) && Instant::now() < deadline {
+                let mut deadline = crate::change_hub::test_support::Patience::new(
+                    crate::change_hub::test_support::STATE_CEILING,
+                    std::time::Duration::from_millis(5),
+                );
+                while !release.load(Ordering::SeqCst) && deadline.allows() {
                     std::thread::sleep(Duration::from_millis(5));
                 }
             })

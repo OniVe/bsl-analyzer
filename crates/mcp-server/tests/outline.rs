@@ -15,6 +15,10 @@ use rmcp::{RoleClient, ServiceExt};
 use serde_json::{Map, Value};
 use tempfile::TempDir;
 
+// Shared helpers for the gates in this binary; not every binary uses every one.
+#[allow(dead_code)]
+mod common;
+
 type Client = RunningService<RoleClient, ()>;
 
 const MODULE_REL: &str = "CommonModules/ПервыйОбщийМодуль/Ext/Module.bsl";
@@ -76,16 +80,16 @@ async fn call(client: &Client, tool: &'static str, call_args: Map<String, Value>
 
 /// Wait until the resident reports `ready`, so the second stand below really is warm.
 async fn wait_until_resident_is_ready(client: &Client) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    let mut deadline = common::Patience::new(
+        std::time::Duration::from_secs(180),
+        std::time::Duration::from_millis(100),
+    );
     loop {
         let status = call(client, "diagnostics", args(&[("action", Value::from("status"))])).await;
         if status["state"] == "ready" {
             return;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the resident never became ready, last status {status}",
-        );
+        assert!(deadline.allows(), "the resident never became ready, last status {status}",);
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }

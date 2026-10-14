@@ -2067,7 +2067,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex as StdMutex};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     use tempfile::tempdir;
 
     /// A postgres project config whose credential helper resolves synchronously (tiny
@@ -2739,13 +2739,19 @@ mod tests {
     #[test]
     fn external_baseline_service_shutdown_times_out_without_blocking_future_requests() {
         let (sender, receiver) = mpsc::channel();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
         let worker = std::thread::Builder::new()
             .name("baseline-service-test-timeout".to_owned())
             .spawn(move || {
                 while let Ok(BaselineServiceRequest { kind, .. }) = receiver.recv() {
                     match kind {
                         BaselineRequestKind::ResolveSnapshot { reply } => {
-                            std::thread::sleep(Duration::from_millis(250));
+                            let _ = entered_tx.send(());
+                            // Held until the test has seen shutdown return: the resolve is
+                            // still running when it does, and a shutdown that waited for it
+                            // would never return here.
+                            let _ = gate_rx.recv();
                             let _ = reply.send(Ok(None));
                         }
                         BaselineRequestKind::Shutdown { reply } => {
@@ -2787,15 +2793,24 @@ mod tests {
         let probe_thread = std::thread::spawn(move || {
             let _ = probe_service.resolve_snapshot(&uncancellable());
         });
-        std::thread::sleep(Duration::from_millis(20));
+        entered_rx
+            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+            .expect("the resolve reached the worker");
 
-        let started = Instant::now();
-        service.shutdown();
+        let shutdown_service = Arc::clone(&service);
+        let (shut_tx, shut_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            shutdown_service.shutdown();
+            let _ = shut_tx.send(());
+        });
+        // The gate proves shutdown does not wait for the blocked resolve. The bound is the
+        // The bound is a latency contract: shutdown gives up after its acknowledgement timeout
+        // (100 ms in this build), ten times over that. The resolve's own wait is far longer.
         assert!(
-            started.elapsed() < Duration::from_millis(200),
-            "shutdown blocked for {:?}",
-            started.elapsed()
+            shut_rx.recv_timeout(Duration::from_secs(1)).is_ok(),
+            "shutdown waited for a resolve that was still blocked"
         );
+        gate_tx.send(()).unwrap();
 
         let error = service.resolve_snapshot(&uncancellable()).unwrap_err().into_error();
         assert!(
@@ -2914,17 +2929,18 @@ mod tests {
     fn status_probe_first_call_returns_pending_without_blocking() {
         let service = unreachable_workspace_service();
 
-        let started = Instant::now();
+        let started = std::time::Instant::now();
         let probe = service.probe_status_cached();
-
-        // The real probe against the unreachable server takes seconds (pool connection
-        // timeout); the cached call must come back immediately with Pending and leave
-        // the probing to the background thread it kicked.
         assert!(
             started.elapsed() < Duration::from_millis(500),
             "probe_status_cached blocked for {:?}",
             started.elapsed()
         );
+
+        // The cached call leaves the probing to the background thread it kicked, so it has
+        // nothing to answer with but Pending. A call that waited for the probe would answer
+        // with the probe's outcome instead, which is why this is the whole assertion: no clock
+        // is needed to tell the two apart.
         assert!(matches!(probe, BaselineStatusProbe::Pending), "expected Pending: {probe:?}");
         // The kicked probe is either still in flight or already finished and published
         // its (error) result — asserting the disjunction keeps the test independent of

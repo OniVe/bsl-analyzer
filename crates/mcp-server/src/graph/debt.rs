@@ -1598,6 +1598,12 @@ impl GraphDebt {
         }
     }
 
+    /// Whether a recovery walk is out, for a test to wait on before it reads the walk counter.
+    #[cfg(test)]
+    pub(super) fn walk_out(&self) -> bool {
+        self.probe_owner.is_some()
+    }
+
     /// Take the episode's one probe reservation, with the basis and the whole outstanding set
     /// to observe.
     ///

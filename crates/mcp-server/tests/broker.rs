@@ -8,6 +8,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+// Shared helpers for the gates in this binary; not every binary uses every one.
+#[allow(dead_code)]
+mod common;
+
 #[cfg(any(unix, windows))]
 use interprocess::local_socket::tokio::prelude::*;
 #[cfg(any(unix, windows))]
@@ -71,12 +75,12 @@ async fn connect(key: &BackendKey) -> std::io::Result<TokioStream> {
 
 #[cfg(any(unix, windows))]
 async fn connect_within(key: &BackendKey, budget: Duration) -> TokioStream {
-    let deadline = tokio::time::Instant::now() + budget;
+    let mut deadline = common::Patience::new(budget, std::time::Duration::from_millis(20));
     loop {
         if let Ok(s) = connect(key).await {
             return s;
         }
-        assert!(tokio::time::Instant::now() < deadline, "backend never became reachable");
+        assert!(deadline.allows(), "backend never became reachable");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -114,7 +118,7 @@ async fn workspace_cache_scope_drift_retires_broker_and_reconnects_on_new_key() 
     )
     .unwrap();
     std::fs::write(src.path().join("bsl-analyzer.toml"), "[source]\nroot = \"src/cf\"\n").unwrap();
-    tokio::time::timeout(Duration::from_secs(10), old_backend)
+    tokio::time::timeout(common::STATE_CEILING, old_backend)
         .await
         .expect("scope drift closes the old broker daemon")
         .expect("old daemon task joins")
@@ -145,7 +149,7 @@ async fn workspace_cache_scope_drift_retires_broker_and_reconnects_on_new_key() 
         ().serve(connect_within(&new_key, Duration::from_secs(10)).await).await.unwrap();
     new_client.cancel().await.expect("new scope client closes cleanly");
     // Workspace startup work can legitimately outlive the backend's idle TTL.
-    tokio::time::timeout(Duration::from_secs(20), new_backend)
+    tokio::time::timeout(common::STATE_CEILING, new_backend)
         .await
         .expect("new scope backend can serve and exit")
         .expect("new daemon task joins")
@@ -189,7 +193,7 @@ async fn backend_survives_client_disconnect_and_stays_reusable() {
     let mut args = serde_json::Map::new();
     args.insert("action".to_owned(), serde_json::Value::String("status".to_owned()));
     let call = c2.call_tool(CallToolRequestParams::new("search").with_arguments(args));
-    let after = tokio::time::timeout(Duration::from_secs(15), call).await;
+    let after = tokio::time::timeout(common::STATE_CEILING, call).await;
     assert!(
         matches!(after, Ok(Ok(_))),
         "surviving session must still be served after a peer disconnects, got: {after:?}"
@@ -271,7 +275,8 @@ async fn superseded_backend_lifecycle() {
     let newer = SharedState::workspace_with_cache(root.clone(), cache.clone()).unwrap();
     let mut status = serde_json::Map::new();
     status.insert("action".to_owned(), serde_json::Value::String("status".to_owned()));
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+    let mut deadline =
+        common::Patience::new(common::STATE_CEILING, std::time::Duration::from_millis(20));
     loop {
         let answer = client
             .call_tool(CallToolRequestParams::new("metadata").with_arguments(status.clone()))
@@ -280,12 +285,12 @@ async fn superseded_backend_lifecycle() {
         if answer.structured_content.as_ref().is_some_and(|body| body["owns_caches"] == false) {
             break;
         }
-        assert!(tokio::time::Instant::now() < deadline, "backend never observed takeover");
+        assert!(deadline.allows(), "backend never observed takeover");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     // A superseded backend leaves with its client still connected: the session is closed for
     // it rather than waited for.
-    tokio::time::timeout(Duration::from_secs(10), backend)
+    tokio::time::timeout(common::STATE_CEILING, backend)
         .await
         .expect("superseded backend leaves without waiting for its session")
         .expect("backend task joined")
@@ -360,7 +365,7 @@ async fn backend_idles_out_after_ttl() {
     // Disconnect: `warmed` is set (initialize was sent), so the backend exits after the
     // short idle TTL, not after the much longer orphan grace.
     c.cancel().await.ok();
-    let exited = tokio::time::timeout(Duration::from_secs(20), backend).await;
+    let exited = tokio::time::timeout(common::STATE_CEILING, backend).await;
     assert!(exited.is_ok(), "warm backend idled out after its TTL once the last client left");
     exited.unwrap().expect("backend task joined").expect("backend run ok");
 }
@@ -399,7 +404,7 @@ async fn background_work_holds_the_backend_and_then_lets_it_go() {
 
     pass.finish(bsl_search::IndexPassState::Ready);
 
-    let exited = tokio::time::timeout(Duration::from_secs(20), backend).await;
+    let exited = tokio::time::timeout(common::STATE_CEILING, backend).await;
     assert!(exited.is_ok(), "the backend held on after its background work was done");
     exited.unwrap().expect("backend task joined").expect("backend run ok");
 }
@@ -430,7 +435,7 @@ async fn silent_connection_does_not_warm_the_backend() {
     drop(probe);
 
     // Must exit on the orphan grace (~3s), well before the 60s idle TTL.
-    let exited = tokio::time::timeout(Duration::from_secs(20), backend).await;
+    let exited = tokio::time::timeout(common::STATE_CEILING, backend).await;
     assert!(exited.is_ok(), "never-used backend must exit via the short orphan grace");
     exited.unwrap().expect("backend task joined").expect("backend run ok");
 }
@@ -471,7 +476,7 @@ async fn second_launch_defers_while_first_is_still_building() {
         Duration::from_secs(15),
         Duration::from_secs(15),
     );
-    tokio::time::timeout(Duration::from_secs(8), second)
+    tokio::time::timeout(common::STATE_CEILING, second)
         .await
         .expect("second launch defers while the first is building (no socket steal)")
         .expect("second launch ok");
@@ -529,12 +534,12 @@ async fn client_closing_input_ends_session_and_backend_idles_out() {
     // relay must finish without hanging.
     client.cancel().await.ok();
 
-    let relayed = tokio::time::timeout(Duration::from_secs(20), relay).await;
+    let relayed = tokio::time::timeout(common::STATE_CEILING, relay).await;
     assert!(relayed.is_ok(), "relay returned after the client closed its input (no hang)");
     relayed.unwrap().expect("relay task joined").expect("relay ok");
 
     // The session is gone; the warm backend idles out after its TTL.
-    let exited = tokio::time::timeout(Duration::from_secs(20), backend).await;
+    let exited = tokio::time::timeout(common::STATE_CEILING, backend).await;
     assert!(exited.is_ok(), "backend idled out after the last session ended");
     exited.unwrap().expect("backend task joined").expect("backend run ok");
 }
@@ -567,7 +572,7 @@ async fn successful_connect_is_always_served_at_idle_boundary() {
             // The connect succeeded → the connection is in the backlog → the backend MUST
             // serve it. A connection dropped on a racing expiry would fail this handshake.
             Ok(stream) => {
-                let client = tokio::time::timeout(Duration::from_secs(20), ().serve(stream))
+                let client = tokio::time::timeout(common::STATE_CEILING, ().serve(stream))
                     .await
                     .expect("serve did not hang")
                     .expect("a connect that succeeded must be served");
@@ -633,7 +638,7 @@ async fn workspace_backend_serves_concurrent_sessions_without_deadlock() {
                 handles.push(tokio::spawn(async move {
                     let call = client
                         .call_tool(CallToolRequestParams::new(tool).with_arguments(arguments));
-                    match tokio::time::timeout(Duration::from_secs(20), call).await {
+                    match tokio::time::timeout(common::STATE_CEILING, call).await {
                         Ok(Ok(_)) => (label, "ok"),
                         Ok(Err(_)) => (label, "transport-err"),
                         Err(_) => (label, "HUNG"),

@@ -2656,8 +2656,8 @@ mod tests {
         WorkspaceDiff,
     };
     use super::super::test_support::{
-        meta_string, published_report, sample_workspace, seed_cache, wait_ready, wait_until,
-        wait_until_within, write, write_common_module, write_extension_config,
+        meta_string, published_report, sample_workspace, seed_cache, wait_ready, wait_settled,
+        wait_until, wait_until_within, write, write_common_module, write_extension_config,
         write_extension_workspace,
     };
     use super::*;
@@ -4427,7 +4427,7 @@ mod tests {
         let lease = crate::workspace_lease::WorkspaceLease::claim(root);
         let graph = GraphState::for_workspace(root.to_path_buf()).with_lease(lease.clone());
         graph.ensure_loading();
-        wait_ready(&graph);
+        wait_settled(&graph);
         write(
             root,
             "CommonModules/Сервер/Ext/Module.bsl",
@@ -5725,7 +5725,7 @@ mod tests {
         });
 
         let (callers, module_placed, module_without_source) = rx
-            .recv_timeout(Duration::from_secs(20))
+            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
             .expect("no projection here can use the bytes, so none may block on reading them");
         assert_eq!(callers, 1, "the fixture has exactly one caller of Считать");
         assert!(module_placed, "the pair costs no I/O and is served without it");
@@ -9293,10 +9293,13 @@ mod form_twin_tests {
     use std::path::Path;
 
     fn wait_for_build_to_settle(graph: &GraphState) {
-        let deadline = std::time::Instant::now() + super::super::test_support::WAIT_CEILING;
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(10),
+        );
         while graph.build_in_flight() {
-            assert!(std::time::Instant::now() < deadline, "initial graph build did not settle");
-            std::thread::yield_now();
+            assert!(deadline.allows(), "initial graph build did not settle");
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
