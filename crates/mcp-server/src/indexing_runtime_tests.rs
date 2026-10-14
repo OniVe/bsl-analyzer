@@ -27,7 +27,7 @@ fn isolated(test: &str) -> bool {
     // The two fixture watchdogs together fit the 180-second acceptance budget.
     let seconds = if test == "indexing_polling_smoke" { 150 } else { 30 };
     let mut deadline = crate::change_hub::test_support::Patience::new(
-        crate::change_hub::test_support::STATE_CEILING,
+        std::time::Duration::from_secs(seconds),
         std::time::Duration::from_millis(10),
     );
     while child.try_wait().unwrap().is_none() {

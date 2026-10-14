@@ -9299,7 +9299,7 @@ mod form_twin_tests {
         );
         while graph.build_in_flight() {
             assert!(deadline.allows(), "initial graph build did not settle");
-            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 

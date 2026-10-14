@@ -2803,8 +2803,11 @@ mod tests {
             shutdown_service.shutdown();
             let _ = shut_tx.send(());
         });
+        // The gate proves shutdown does not wait for the blocked resolve. The bound proves it
+        // gives up after its acknowledgement timeout: ten times that is far above the timeout
+        // itself, and far below the resolve's own wait, which a regression would sit out.
         assert!(
-            shut_rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING).is_ok(),
+            shut_rx.recv_timeout(super::shutdown_ack_timeout() * 10).is_ok(),
             "shutdown waited for a resolve that was still blocked"
         );
         gate_tx.send(()).unwrap();

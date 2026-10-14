@@ -759,10 +759,10 @@ mod tests {
         let ticker = std::thread::spawn(move || {
             let mut deadline = crate::change_hub::test_support::Patience::new(
                 crate::change_hub::test_support::STATE_CEILING,
-                std::time::Duration::from_millis(10),
+                std::time::Duration::from_millis(1),
             );
             while armed.forced_rescans() == 0 && deadline.allows() {
-                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
             cancel.cancel_all();
         });

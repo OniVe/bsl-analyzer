@@ -5788,7 +5788,7 @@ pub(crate) mod test_support {
 
     impl Patience {
         pub(crate) fn new(ceiling: Duration, step: Duration) -> Self {
-            let polls = ceiling.as_millis() / step.as_millis().max(1);
+            let polls = ceiling.as_nanos() / step.as_nanos().max(1);
             Self { left: u64::try_from(polls).unwrap_or(u64::MAX) }
         }
 
@@ -7875,7 +7875,7 @@ mod tests {
         // The carry is done the moment the old cursor leaves the map; raise the window then,
         // while the worker waits on `blind` just past `drop(acc)`.
         let mut patience =
-            test_support::Patience::new(test_support::STATE_CEILING, Duration::from_micros(10));
+            test_support::Patience::new(test_support::STATE_CEILING, Duration::from_micros(100));
         loop {
             let mut acc = hub.inner.lock_acc();
             if !acc.cursors.contains_key(&old_id) {
@@ -7884,7 +7884,7 @@ mod tests {
             }
             drop(acc);
             assert!(patience.allows(), "the carry never happened");
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_micros(100));
         }
         drop(blind);
         let (replaced, token) = worker.join().unwrap();

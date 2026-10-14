@@ -27,7 +27,7 @@ pub struct Patience {
 #[allow(dead_code)]
 impl Patience {
     pub fn new(ceiling: Duration, step: Duration) -> Self {
-        let polls = ceiling.as_millis() / step.as_millis().max(1);
+        let polls = ceiling.as_nanos() / step.as_nanos().max(1);
         Self { left: u64::try_from(polls).unwrap_or(u64::MAX) }
     }
 

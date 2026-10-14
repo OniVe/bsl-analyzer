@@ -570,11 +570,12 @@ mod tests {
     async fn yield_until(what: &str, mut done: impl FnMut() -> bool) {
         let mut patience = crate::change_hub::test_support::Patience::new(
             crate::change_hub::test_support::STATE_CEILING,
-            Duration::from_micros(10),
+            Duration::from_micros(100),
         );
         while !done() {
             assert!(patience.allows(), "never happened: {what}");
             tokio::task::yield_now().await;
+            std::thread::sleep(Duration::from_micros(100));
         }
     }
 
