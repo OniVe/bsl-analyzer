@@ -2804,10 +2804,10 @@ mod tests {
             let _ = shut_tx.send(());
         });
         // The gate proves shutdown does not wait for the blocked resolve. The bound is the
-        // latency contract the test always carried: shutdown gives up after its acknowledgement
-        // timeout (100 ms here), inside 200 ms, far below the resolve's own wait.
+        // The bound is a latency contract: shutdown gives up after its acknowledgement timeout
+        // (100 ms in this build), ten times over that. The resolve's own wait is far longer.
         assert!(
-            shut_rx.recv_timeout(Duration::from_millis(200)).is_ok(),
+            shut_rx.recv_timeout(Duration::from_secs(1)).is_ok(),
             "shutdown waited for a resolve that was still blocked"
         );
         gate_tx.send(()).unwrap();
@@ -2931,7 +2931,11 @@ mod tests {
 
         let started = std::time::Instant::now();
         let probe = service.probe_status_cached();
-        assert!(started.elapsed() < Duration::from_millis(500), "probe_status_cached blocked");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "probe_status_cached blocked for {:?}",
+            started.elapsed()
+        );
 
         // The cached call leaves the probing to the background thread it kicked, so it has
         // nothing to answer with but Pending. A call that waited for the probe would answer

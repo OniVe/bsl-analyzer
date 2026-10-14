@@ -3618,7 +3618,7 @@ mod tests {
         let lease = state.workspace_lease().clone();
         let server = McpServer::new(McpProfile::Workspace, state);
         let held_lease = lease.hold_file_lock_for_test();
-        let fences_before = lease.disk_check_threads().len();
+        let fences_before = lease.disk_checks_on_this_thread();
         std::fs::remove_file(lease_path).unwrap();
         lease.invalidate_verdict_for_test();
         let token = || tokio_util::sync::CancellationToken::new();
@@ -3699,18 +3699,13 @@ mod tests {
         .expect("graph status response");
 
         // The status path answers from what the lease already knows, so it takes no fence. The
-        // journal names the threads that fenced, in order: a fence made for a status call runs
-        // on a runtime worker, and would appear among the entries written after the lock was
-        // taken. Background owners fence on threads of their own and are not counted here.
-        let fenced_by_status: Vec<String> = lease
-            .disk_check_threads()
-            .into_iter()
-            .skip(fences_before)
-            .filter(|name| name.starts_with("tokio-runtime-worker"))
-            .collect();
-        assert!(
-            fenced_by_status.is_empty(),
-            "a status call fenced the lease: {fenced_by_status:?}"
+        // test body runs on the test's own thread (a current-thread block_on), and the status
+        // calls answer inline there, so a fence they made is counted against this thread.
+        // Background owners fence on threads of their own and are not counted here.
+        assert_eq!(
+            lease.disk_checks_on_this_thread(),
+            fences_before,
+            "a status call fenced the lease"
         );
 
         drop(held_lease);
