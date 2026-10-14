@@ -8477,7 +8477,7 @@ mod tests {
         sample_workspace(root);
         let graph = GraphState::for_workspace(root.to_path_buf());
         graph.ensure_loading();
-        wait_ready(&graph);
+        wait_settled(&graph);
 
         // A healing on record, measured through the production pass.
         {
