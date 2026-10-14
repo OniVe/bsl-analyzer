@@ -30,6 +30,10 @@ type SearchCall = Box<
         + Sync,
 >;
 
+/// How long a cancelled call may take to come back. Well above one poll (25 ms) and well
+/// below every wait it must not sit out (a 2 s held lock, a 12 s embed, a latched actor).
+const CANCEL_BOUND: Duration = Duration::from_millis(500);
+
 fn fts_engine(dir: &TempDir) -> SharedEngine {
     let engine = SearchEngine::fts_only(&dir.path().join("search.db")).unwrap();
     crate::state::shared_engine(Some(engine))
@@ -132,13 +136,14 @@ fn a_search_waiting_for_the_engine_lock_returns_at_its_cancellation() {
         });
         std::thread::sleep(Duration::from_millis(50));
         cancel.cancel();
-        let (out, _waited) = outcome
+        let (out, waited) = outcome
             .recv_timeout(HOLD * 2)
             .unwrap_or_else(|_| panic!("{name}: the cancelled call never came back"));
         assert!(
             matches!(out, Err(SearchFailure::Cancelled)),
             "{name}: expected Cancelled, got {out:?}"
         );
+        assert!(waited < CANCEL_BOUND, "{name}: waited {waited:?} past its cancellation");
 
         // Positive control: an uncancelled call queues until the lock frees, then answers.
         let outcome = on_thread({
@@ -184,15 +189,18 @@ fn a_cancelled_search_waiting_on_the_actor_releases_the_engine_lock() {
     assert!(engine.try_lock().is_err(), "sanity: the first search holds the engine while it waits");
 
     cancel.cancel();
-    let (out, _waited) = first
+    let (out, waited) = first
         .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
         .expect("the cancelled search returns");
     assert!(matches!(out, Err(SearchFailure::Cancelled)), "got {:?}", out.map(|_| ()));
+    assert!(waited < CANCEL_BOUND, "waited {waited:?} past the cancellation");
 
     // The actor is still latched, and the lock is free for the next caller.
     assert_eq!(latch.executed(), Vec::<&str>::new(), "the latched request has not answered");
+    let acquired = Instant::now();
     let guard = try_acquire_engine(&engine, &CancellationToken::new());
     assert!(guard.is_ok(), "the next search must take the engine lock");
+    assert!(acquired.elapsed() < CANCEL_BOUND, "the lock was still held: {:?}", acquired.elapsed());
     drop(guard);
 
     latch.release_one();
@@ -229,13 +237,16 @@ fn a_cancelled_identity_gate_releases_the_engine_lock() {
     assert!(engine.try_lock().is_err(), "sanity: the identity gate runs under the guard");
 
     cancel.cancel();
-    let (out, _waited) = first
+    let (out, waited) = first
         .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
         .expect("the cancelled search returns");
     assert!(matches!(out, Err(SearchFailure::Cancelled)), "got {:?}", out.map(|_| ()));
+    assert!(waited < CANCEL_BOUND, "waited {waited:?} past the cancellation");
 
+    let acquired = Instant::now();
     let guard = try_acquire_engine(&engine, &CancellationToken::new());
     assert!(guard.is_ok(), "the next search must take the engine lock");
+    assert!(acquired.elapsed() < CANCEL_BOUND, "the lock was still held: {:?}", acquired.elapsed());
     drop(guard);
 
     latch.release_one();
@@ -262,10 +273,11 @@ fn a_cancelled_docs_search_does_not_fall_back_to_the_corpus_view() {
     assert_eq!(latch.executed(), vec!["resolve_snapshot"], "the lexical query is the one latched");
 
     cancel.cancel();
-    let (out, _waited) = outcome
+    let (out, waited) = outcome
         .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
         .expect("the cancelled search returns");
     assert!(matches!(out, Err(SearchFailure::Cancelled)), "got {:?}", out.map(|_| ()));
+    assert!(waited < CANCEL_BOUND, "waited {waited:?} past the cancellation");
 
     latch.release_one();
     service.shutdown();
@@ -365,10 +377,11 @@ fn a_search_inside_the_query_embed_holds_no_lock_and_returns_at_its_cancellation
         assert_eq!(embedder.accepted(), 1, "{name}: exactly one embed per query");
 
         cancel.cancel();
-        let (out, _waited) = outcome
+        let (out, waited) = outcome
             .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
             .unwrap_or_else(|_| panic!("{name}: the cancelled call never came back"));
         assert!(matches!(out, Err(SearchFailure::Cancelled)), "{name}: expected Cancelled");
+        assert!(waited < CANCEL_BOUND, "{name}: waited {waited:?} past its cancellation");
 
         embedder.hang_up();
         if let Some((service, _)) = service {

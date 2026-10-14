@@ -410,7 +410,9 @@ mod tests {
         // The control compares the same neighbour call on a resident nobody holds. Both sides are
         // taken under the same load, so only the ratio says whether the stand's walk is long
         // enough for a cancel to make a difference.
-        let idle = neighbour(subject.clone()).await;
+        // Measured on a fresh resident: the subject's own resident has just walked, and its warm
+        // memos would make the idle call cheaper than the stand's real overhead.
+        let idle = neighbour(ready_state(dir.path())).await;
         assert!(
             waited_behind_a_live_call > idle * 3,
             "positive control is inert: the neighbour waited {waited_behind_a_live_call:?} behind \

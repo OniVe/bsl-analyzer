@@ -4338,9 +4338,11 @@ mod tests {
             .collect();
         drop(tx);
 
+        let deadline = Instant::now() + Duration::from_secs(90);
         for done in 0..owners.len() {
+            let left = deadline.saturating_duration_since(Instant::now());
             assert!(
-                rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING).is_ok(),
+                !left.is_zero() && rx.recv_timeout(left).is_ok(),
                 "the graph's owners deadlocked: {done} of {} finished",
                 owners.len(),
             );

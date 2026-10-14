@@ -4016,12 +4016,19 @@ impl PollGate {
             test_support::STATE_CEILING,
             std::time::Duration::from_millis(20),
         );
-        while counts.0 == 0 && patience.allows() && !stop.is_raised() {
-            counts = self
-                .moved
-                .wait_timeout(counts, Duration::from_millis(20))
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
+        let mut wakes = 0;
+        while counts.0 == 0 && !stop.is_raised() {
+            let (next, go) = test_support::wait_step(
+                &self.moved,
+                counts,
+                Duration::from_millis(20),
+                &mut patience,
+                &mut wakes,
+            );
+            counts = next;
+            if !go {
+                break;
+            }
         }
         counts.0 = counts.0.saturating_sub(1);
     }
@@ -4034,12 +4041,19 @@ impl PollGate {
             test_support::STATE_CEILING,
             std::time::Duration::from_millis(20),
         );
-        while counts.1 < arrivals && patience.allows() {
-            counts = self
-                .moved
-                .wait_timeout(counts, Duration::from_millis(20))
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
+        let mut wakes = 0;
+        while counts.1 < arrivals {
+            let (next, go) = test_support::wait_step(
+                &self.moved,
+                counts,
+                Duration::from_millis(20),
+                &mut patience,
+                &mut wakes,
+            );
+            counts = next;
+            if !go {
+                break;
+            }
         }
         assert!(counts.1 >= arrivals, "the blind poll never reached its gate {arrivals} times");
     }
@@ -4104,12 +4118,19 @@ impl AnnounceBarrier {
             test_support::STATE_CEILING,
             std::time::Duration::from_millis(20),
         );
-        while !state.2 && patience.allows() && !stop.is_raised() {
-            state = self
-                .moved
-                .wait_timeout(state, Duration::from_millis(20))
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
+        let mut wakes = 0;
+        while !state.2 && !stop.is_raised() {
+            let (next, go) = test_support::wait_step(
+                &self.moved,
+                state,
+                Duration::from_millis(20),
+                &mut patience,
+                &mut wakes,
+            );
+            state = next;
+            if !go {
+                break;
+            }
         }
         state.1 = false;
         self.moved.notify_all();
@@ -4122,12 +4143,19 @@ impl AnnounceBarrier {
             test_support::STATE_CEILING,
             std::time::Duration::from_millis(20),
         );
-        while !state.1 && patience.allows() {
-            state = self
-                .moved
-                .wait_timeout(state, Duration::from_millis(20))
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
+        let mut wakes = 0;
+        while !state.1 {
+            let (next, go) = test_support::wait_step(
+                &self.moved,
+                state,
+                Duration::from_millis(20),
+                &mut patience,
+                &mut wakes,
+            );
+            state = next;
+            if !go {
+                break;
+            }
         }
         assert!(state.1, "the announcement never reached its barrier");
     }
@@ -5784,6 +5812,30 @@ pub(crate) mod test_support {
     /// that loops on it gives up after the same number of polls whatever the machine's speed.
     pub(crate) struct Patience {
         left: u64,
+    }
+
+    /// Wakes a condition-variable wait may take before it gives up. A cap against a notify storm
+    /// that would keep the wait alive forever; ordinary runs take a handful.
+    const WAKE_CAP: u32 = 100_000;
+
+    /// One step of a bounded condition-variable wait. Waits up to `step` for a wake and spends a
+    /// poll only when the step runs out unwoken, so the budget counts time spent waiting rather
+    /// than wakeups. Returns the guard and whether the wait may go on.
+    pub(crate) fn wait_step<'a, T>(
+        moved: &std::sync::Condvar,
+        guard: std::sync::MutexGuard<'a, T>,
+        step: Duration,
+        patience: &mut Patience,
+        wakes: &mut u32,
+    ) -> (std::sync::MutexGuard<'a, T>, bool) {
+        let (guard, outcome) =
+            moved.wait_timeout(guard, step).unwrap_or_else(std::sync::PoisonError::into_inner);
+        if outcome.timed_out() {
+            let go = patience.allows();
+            return (guard, go);
+        }
+        *wakes += 1;
+        (guard, *wakes <= WAKE_CAP)
     }
 
     impl Patience {
