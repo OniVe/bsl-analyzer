@@ -51,19 +51,25 @@ async fn client(root: &Path) -> Client {
     ().serve(client_io).await.expect("session initialized")
 }
 
-/// A workspace answer that has caught up with the watcher: polls until the tree is
-/// reported stale, or gives back the last answer for the assertion to fail on.
+/// A workspace answer that has caught up with the unreadable file: polls until the tree is
+/// stale and the unreadable file is a hole in the baseline, or gives back the last answer for
+/// the assertion to fail on.
+///
+/// Staleness alone is not that fact. The edit that precedes the permission change is seen as
+/// drift first, and the answer is stale with the baseline still `full` until the read failure
+/// is observed as a hole; a hole, once it exists, keeps the answer `partial` until it heals.
 ///
 /// Gated like its only caller: the unreadable-file case it serves needs a permission bit
 /// Windows does not have, and an ungated helper is dead code there — which the mirror's
 /// Windows job, unlike ours, builds with warnings denied and so reports as an error.
 #[cfg(unix)]
-async fn workspace_until_stale(client: &Client) -> Value {
+async fn workspace_until_partial_stale(client: &Client) -> Value {
     let mut deadline =
         common::Patience::new(common::STATE_CEILING, std::time::Duration::from_millis(20));
     loop {
         let body = diagnostics(client, args("workspace")).await;
-        if body["stale"] == true || !deadline.allows() {
+        let settled = body["stale"] == true && body["result"]["baseline"]["state"] == "partial";
+        if settled || !deadline.allows() {
             return body;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -184,12 +190,12 @@ async fn baseline_parity_partial_stale_error_recovery_and_cancellation() {
             // instead of racing it — once the unreadable file IS observed it becomes a
             // hole, and a hole keeps the answer stale until it heals, so this settles in
             // one direction only.
-            let stale = workspace_until_stale(&client).await;
+            let stale = workspace_until_partial_stale(&client).await;
             assert_eq!(
                 stale["stale"], true,
                 "the unreadable file has to make the answer stale: {stale}"
             );
-            assert_eq!(stale["result"]["baseline"]["state"], "partial");
+            assert_eq!(stale["result"]["baseline"]["state"], "partial", "{stale}");
             assert_eq!(stale["result"]["baseline"]["resolved"], 0);
         } else {
             eprintln!("skipping the unreadable-file leg: mode 0o000 is not an obstacle here");
