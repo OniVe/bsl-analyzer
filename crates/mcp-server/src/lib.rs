@@ -1244,7 +1244,8 @@ impl McpServer {
     }
 
     /// [`shutdown`](Self::shutdown) with a caller-chosen bound on how long the owners may take
-    /// to leave. See [`SharedState::shutdown_within`].
+    /// to leave. The bound covers the owners' wait only; the stops before it are unchanged.
+    /// See [`SharedState::shutdown_within`].
     pub fn shutdown_within(&self, owners_budget: std::time::Duration) {
         self.state.shutdown_within(owners_budget);
     }

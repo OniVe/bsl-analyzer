@@ -1125,6 +1125,11 @@ impl SharedState {
     /// instead of the production five seconds. For a caller that removes what the owners read
     /// once it returns: a stand that is deleted under a backlog still draining reads files that
     /// are gone, and only a bound on how long the owners may take to stop protects it.
+    ///
+    /// The budget bounds the owners' wait only. The stops that run before it — the reference
+    /// worker's join, the baseline and the diagnostics sweeper — are unchanged and unbounded,
+    /// as they are in `shutdown`: a worker inside an uncancellable baseline call is joined
+    /// after it returns, not cut short here.
     pub fn shutdown_within(&self, owners_budget: std::time::Duration) {
         // The reference worker stops FIRST: in the reference profile its baseline and this one
         // are the same `Arc`, and closing the baseline before the worker is told to stop leaves
