@@ -1503,7 +1503,7 @@ mod tests {
             retry_after_ms: Some(5_000),
             watch: None,
         };
-        let crate::tools::resident::FailureAnswer::Failed(data) =
+        let crate::tools::resident::FailureAnswer::Failed { data, .. } =
             crate::tools::resident::failure_answer(&failed, "broken cache")
         else {
             panic!("a failed report answers as a failure");

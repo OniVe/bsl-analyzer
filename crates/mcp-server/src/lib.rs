@@ -1444,8 +1444,8 @@ impl McpServer {
                         None,
                     )),
                     ResidentOutcome::Failed(msg) => match session.resident_failure(&msg) {
-                        FailureAnswer::Failed(data) => Err(McpError::internal_error(
-                            format!("metadata database: {msg}"),
+                        FailureAnswer::Failed { reason, data } => Err(McpError::internal_error(
+                            format!("metadata database: {reason}"),
                             Some(data),
                         )),
                         // The lifecycle moved on between the read and the snapshot: the retry
@@ -2364,8 +2364,8 @@ impl McpServer {
                         ))
                     }
                     ResidentOutcome::Failed(msg) => match session.resident_failure(&msg) {
-                        FailureAnswer::Failed(data) => {
-                            return Err(tools::symbol_info::database_error(msg, data))
+                        FailureAnswer::Failed { reason, data } => {
+                            return Err(tools::symbol_info::database_error(reason, data))
                         }
                         FailureAnswer::Moved(report) => {
                             return Ok(tools::symbol_info::loading(&report))
@@ -2573,10 +2573,12 @@ impl McpServer {
                             None,
                         )),
                         ResidentOutcome::Failed(msg) => match session.resident_failure(&msg) {
-                            FailureAnswer::Failed(data) => Err(McpError::internal_error(
-                                format!("references database: {msg}"),
-                                Some(data),
-                            )),
+                            FailureAnswer::Failed { reason, data } => {
+                                Err(McpError::internal_error(
+                                    format!("references database: {reason}"),
+                                    Some(data),
+                                ))
+                            }
                             FailureAnswer::Moved(report) => Ok(tools::references::loading(&report)),
                         },
                     }
@@ -2737,8 +2739,8 @@ impl McpServer {
                         None,
                     )),
                     ResidentOutcome::Failed(msg) => match session.resident_failure(&msg) {
-                        FailureAnswer::Failed(data) => Err(McpError::internal_error(
-                            format!("diagnostics database: {msg}"),
+                        FailureAnswer::Failed { reason, data } => Err(McpError::internal_error(
+                            format!("diagnostics database: {reason}"),
                             Some(data),
                         )),
                         FailureAnswer::Moved(report) => Ok(tools::diagnostics::loading(&report)),
@@ -2836,8 +2838,8 @@ impl McpServer {
                         None,
                     )),
                     ResidentOutcome::Failed(msg) => match session.resident_failure(&msg) {
-                        FailureAnswer::Failed(data) => Err(McpError::internal_error(
-                            format!("diagnostics database: {msg}"),
+                        FailureAnswer::Failed { reason, data } => Err(McpError::internal_error(
+                            format!("diagnostics database: {reason}"),
                             Some(data),
                         )),
                         FailureAnswer::Moved(report) => Ok(tools::diagnostics::loading(&report)),

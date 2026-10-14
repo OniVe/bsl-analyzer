@@ -111,10 +111,18 @@ pub(super) fn retry_delay(base: Duration, cap: Duration, attempts: u32) -> Durat
     if attempts == 0 {
         return Duration::ZERO;
     }
-    // The EXPONENT is clamped, not the product: `base * 2^40` overflows the multiplication
-    // long before the cap could bite, and a saturating multiply is not the schedule.
-    let exponent = attempts.saturating_sub(1).min(20);
-    base.saturating_mul(1u32 << exponent).min(cap)
+    // Doubled step by step and stopped at the cap, so any ceiling the environment sets is
+    // reached rather than plateaued under: a fixed exponent clamp would stop short of a long
+    // cap, and a shift by `attempts` overflows. The loop ends once the cap is reached, which a
+    // saturating doubling does within a few dozen steps whatever `attempts` says.
+    let mut delay = base;
+    for _ in 1..attempts {
+        if delay >= cap || delay.is_zero() {
+            break;
+        }
+        delay = delay.saturating_mul(2);
+    }
+    delay.min(cap)
 }
 
 /// Milliseconds of `span`, saturated at `u64::MAX`: a duration that long is not a number any
@@ -976,11 +984,13 @@ impl DiagnosticsState {
         // would drop the subscription the LIVE attempt is building under, leaving the resident
         // that arrives to be served under a window nobody opened for it. So a retired attempt
         // touches nothing, cursor included.
-        let retired_before_start = lock_recover(&self.inner).build_attempt != attempt;
-        if retired_before_start {
-            self.discard_stale_attempt(attempt, "start");
-            return;
-        }
+        //
+        // The check and the re-subscription happen under ONE hold of `inner`: retiring an
+        // attempt takes the same lock, so a deadline that fires between a passed check and the
+        // cursor swap cannot leave a retired attempt replacing the live one's subscription.
+        // Holding `inner` while taking the cursor is the order eviction already uses — no path
+        // holds the cursor and then asks for `inner`.
+        //
         // Snapshot the hub cursor at build start: the build's baseline scan captures the
         // disk as of now, so only events landing after this point need replaying onto the
         // published resident.
@@ -992,7 +1002,17 @@ impl DiagnosticsState {
         // the same story `run_reload` tells, and the reason the carry is settled below rather
         // than dropped. Whoever holds the slot, the subscription is replaced here so the
         // retry's baseline scan covers exactly the window its own events land after.
-        let carried = self.resubscribe_cursor();
+        let carried = {
+            let inner = lock_recover(&self.inner);
+            if inner.build_attempt != attempt {
+                drop(inner);
+                self.discard_stale_attempt(attempt, "start");
+                return;
+            }
+            let carried = self.resubscribe_cursor();
+            drop(inner);
+            carried
+        };
         tracing::info!(?root, attempt, "diagnostics resident db build started");
         match Self::catch_build(|| Self::build_resident(&root, &self.excluded)) {
             Ok(built) => {
@@ -1729,7 +1749,17 @@ mod tests {
         assert_eq!(retry_delay(base, cap, 3), Duration::from_secs(20));
         assert_eq!(retry_delay(base, cap, 4), Duration::from_secs(40));
         assert_eq!(retry_delay(base, cap, 5), cap, "the cap bites one step later");
-        assert_eq!(retry_delay(base, cap, u32::MAX), cap, "and stays: the exponent is clamped");
+        assert_eq!(retry_delay(base, cap, u32::MAX), cap, "and stays at the cap");
+
+        // A ceiling far above the default is still reached by doubling, not stopped short of.
+        let year = Duration::from_secs(365 * 24 * 60 * 60);
+        assert_eq!(
+            retry_delay(base, year, 22),
+            base * (1 << 21),
+            "doubling continues under a long cap"
+        );
+        assert_eq!(retry_delay(base, year, 30), year, "and ends at the cap the caller set");
+        assert_eq!(retry_delay(base, year, u32::MAX), year);
     }
 
     /// A failure is not terminal: once its backoff has elapsed, the next call starts another

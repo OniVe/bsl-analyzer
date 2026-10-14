@@ -95,8 +95,9 @@ pub(crate) fn readiness_status(state: &str) -> &'static str {
 /// The two answers a resident read that came back `Failed` can become, decided from ONE
 /// lifecycle snapshot — see [`failure_answer`].
 pub(crate) enum FailureAnswer {
-    /// The resident IS failed: the structured `data` for the error, taken from that snapshot.
-    Failed(Value),
+    /// The resident IS failed: the cause and the structured `data` for the error, both taken
+    /// from that snapshot.
+    Failed { reason: String, data: Value },
     /// The lifecycle moved on between the read and the snapshot (a retry started, a resident
     /// was published): the snapshot itself is what the tool renders as its not-ready envelope.
     Moved(super::super::diagnostics_state::StatusReport),
@@ -111,10 +112,13 @@ pub(crate) enum FailureAnswer {
 /// is no longer current at all: what the caller gets is the lifecycle as it IS (the retry
 /// running, or the resident that arrived), not a stale verdict carrying the new attempt's
 /// numbers.
-pub(crate) fn failure_answer(report: &StatusReport, reason: &str) -> FailureAnswer {
+pub(crate) fn failure_answer(report: &StatusReport, read_reason: &str) -> FailureAnswer {
     if report.state != "failed" {
         return FailureAnswer::Moved(report.clone());
     }
+    // The snapshot names its own cause; the read's is the fallback for a failed state that
+    // carries none, so a failure republished in between is not answered with the older one.
+    let reason = report.error.as_deref().unwrap_or(read_reason).to_owned();
     let mut data = json!({
         "state": "failed",
         "reason": reason,
@@ -127,7 +131,7 @@ pub(crate) fn failure_answer(report: &StatusReport, reason: &str) -> FailureAnsw
     if let Some(ms) = report.failed_age_ms {
         data["failed_age_ms"] = json!(ms);
     }
-    FailureAnswer::Failed(data)
+    FailureAnswer::Failed { reason, data }
 }
 
 /// The body of a "still building the resident database" envelope: the machine-readable
@@ -278,12 +282,41 @@ mod tests {
         assert_eq!(loading_body["attempts"], 2);
 
         let answer = failure_answer(&report, "builder panicked");
-        let FailureAnswer::Failed(data) = answer else {
+        let FailureAnswer::Failed { data, .. } = answer else {
             panic!("a failed report must answer as a failure");
         };
         assert_eq!(data["state"], "failed");
         assert_eq!(data["reason"], "builder panicked");
         assert_eq!(data["retry_after_ms"], 4_500);
+        assert_eq!(data["attempts"], 2);
+    }
+
+    /// The reason is a fact of the same snapshot as the retry contract: a failure republished
+    /// between the read and the snapshot is answered with ITS cause, not the cause the read saw
+    /// beside the newer attempt's numbers.
+    #[test]
+    fn a_failure_is_answered_with_the_reason_of_its_own_snapshot() {
+        let report = StatusReport {
+            state: "failed",
+            generation: 1,
+            files: None,
+            unread_files: None,
+            reload: "none",
+            error: Some("second attempt failed".to_owned()),
+            elapsed_ms: None,
+            failed_age_ms: Some(10),
+            attempts: 2,
+            retry_after_ms: Some(9_000),
+            watch: None,
+        };
+
+        let FailureAnswer::Failed { reason, data } =
+            failure_answer(&report, "first attempt failed")
+        else {
+            panic!("a failed report must answer as a failure");
+        };
+        assert_eq!(reason, "second attempt failed", "the error text names the snapshot's cause");
+        assert_eq!(data["reason"], "second attempt failed");
         assert_eq!(data["attempts"], 2);
     }
 
@@ -346,7 +379,7 @@ mod tests {
                 assert_eq!(moved.error.as_deref(), Some("the cause the retry answers"));
                 assert_eq!(moved.elapsed_ms, Some(120));
             }
-            FailureAnswer::Failed(data) => {
+            FailureAnswer::Failed { data, .. } => {
                 panic!("a running retry was served as a failure: {data}")
             }
         }
