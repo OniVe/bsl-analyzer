@@ -98,4 +98,4 @@ Detailed reference: `docs/architecture/ARCHITECTURE.md`, `docs/contributing/DEVE
 - **Lowering works without `db`.** `hir-def/body/lower` makes only syntactic decisions. Any decision that requires the receiver type, resolver, or configuration belongs in `hir-ty` (see the cascade gate in `infer.rs::dispatch_bare_ident_field_call` as the model). Adapters (`ide-diagnostics`, `ide-completion`, ...) are thin projections without their own business logic.
 - Remove unused code and do not leave stubs.
 - Do not use regex for BSL parsing or semantics: use AST / HIR / SDBL APIs. Regex is allowed only for infrastructure utilities such as text search and output formatters.
-- Push only to `origin`, not to the `github` mirror.
+- origin — GitHub itrous/bsl-analyzer; develop защищена, изменения попадают в неё через PR.
