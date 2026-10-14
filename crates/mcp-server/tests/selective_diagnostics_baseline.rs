@@ -10,6 +10,10 @@ use rmcp::service::RunningService;
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::{json, Map, Value};
 
+// Shared helpers for the gates in this binary; not every binary uses every one.
+#[allow(dead_code)]
+mod common;
+
 type Client = RunningService<RoleClient, ()>;
 
 fn write(root: &Path, relative: &str, contents: &str) {
@@ -84,7 +88,8 @@ async fn client(root: &Path) -> Client {
 }
 
 async fn diagnostics(client: &Client, arguments: Map<String, Value>) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut deadline =
+        common::Patience::new(common::STATE_CEILING, std::time::Duration::from_millis(20));
     loop {
         let result = client
             .call_tool(CallToolRequestParams::new("diagnostics").with_arguments(arguments.clone()))
@@ -94,7 +99,7 @@ async fn diagnostics(client: &Client, arguments: Map<String, Value>) -> Value {
         if body["status"] != "loading" {
             return body;
         }
-        assert!(tokio::time::Instant::now() < deadline);
+        assert!(deadline.allows());
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -152,13 +157,14 @@ async fn diagnostics_selective_baseline_config_reload_changes_result_id() {
     let first_id = first["result"]["result_id"].as_str().unwrap().to_owned();
     config(temp.path(), &["main", "extension:Ext"]);
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut deadline =
+        common::Patience::new(common::STATE_CEILING, std::time::Duration::from_millis(50));
     let changed = loop {
         let current = diagnostics(&client, request.clone()).await;
         if current["result"]["result_id"] != first_id {
             break current;
         }
-        assert!(tokio::time::Instant::now() < deadline, "config reload did not change result_id");
+        assert!(deadline.allows(), "config reload did not change result_id");
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     assert_eq!(changed["result"]["baseline"]["partitions_enabled"], 2);
@@ -194,13 +200,14 @@ async fn diagnostics_selective_baseline_schema_15_bounds_success_and_error_envel
     let mut changed = std::fs::read(&object).unwrap();
     changed.push(b'\n');
     std::fs::write(object, changed).unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut deadline =
+        common::Patience::new(common::STATE_CEILING, std::time::Duration::from_millis(50));
     let error = loop {
         let current = diagnostics(&client, request.clone()).await;
         if current["result"]["baseline"]["state"] == "error" {
             break current;
         }
-        assert!(tokio::time::Instant::now() < deadline, "enabled error was not reloaded");
+        assert!(deadline.allows(), "enabled error was not reloaded");
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     let baseline = &error["result"]["baseline"];

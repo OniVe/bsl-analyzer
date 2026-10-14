@@ -12,6 +12,10 @@ use rmcp::service::{PeerRequestOptions, RunningService};
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::{json, Map, Value};
 
+// Shared helpers for the gates in this binary; not every binary uses every one.
+#[allow(dead_code)]
+mod common;
+
 type Client = RunningService<RoleClient, ()>;
 
 fn write(root: &Path, relative: &str, contents: &str) {
@@ -55,10 +59,11 @@ async fn client(root: &Path) -> Client {
 /// Windows job, unlike ours, builds with warnings denied and so reports as an error.
 #[cfg(unix)]
 async fn workspace_until_stale(client: &Client) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut deadline =
+        common::Patience::new(common::STATE_CEILING, std::time::Duration::from_millis(20));
     loop {
         let body = diagnostics(client, args("workspace")).await;
-        if body["stale"] == true || tokio::time::Instant::now() >= deadline {
+        if body["stale"] == true || !deadline.allows() {
             return body;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -66,7 +71,8 @@ async fn workspace_until_stale(client: &Client) -> Value {
 }
 
 async fn diagnostics(client: &Client, arguments: Map<String, Value>) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut deadline =
+        common::Patience::new(common::STATE_CEILING, std::time::Duration::from_millis(20));
     loop {
         let result = client
             .call_tool(CallToolRequestParams::new("diagnostics").with_arguments(arguments.clone()))
@@ -76,7 +82,20 @@ async fn diagnostics(client: &Client, arguments: Map<String, Value>) -> Value {
         if body["status"] != "loading" {
             return body;
         }
-        assert!(tokio::time::Instant::now() < deadline, "resident did not become ready");
+        assert!(deadline.allows(), "resident did not become ready");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Asks the workspace until it counts both modules of the stand.
+async fn workspace_until_both_modules(client: &Client) {
+    let mut patience = common::Patience::new(common::STATE_CEILING, Duration::from_millis(20));
+    loop {
+        let body = diagnostics(client, args("workspace")).await;
+        if body["result"]["files_total"] == 2 {
+            return;
+        }
+        assert!(patience.allows(), "the workspace never counted both modules: {body}");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -136,6 +155,10 @@ async fn baseline_parity_partial_stale_error_recovery_and_cancellation() {
         initial["result"]["findings"].as_array().unwrap().len()
     );
 
+    // `partial` is the answer for a sweep cut short by the file cap, which needs a second file
+    // to cut. The resident can report ready before it has counted both modules, so the cap is
+    // applied only once the workspace has said it sees both.
+    workspace_until_both_modules(&client).await;
     let mut workspace_args = args("workspace");
     workspace_args.insert("min_severity".to_owned(), json!("hint"));
     workspace_args.insert("max_files".to_owned(), json!(1));

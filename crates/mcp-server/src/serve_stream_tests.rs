@@ -228,7 +228,7 @@ async fn legacy_scope_change_retires_mcp_stream_and_reconnects_with_explicit_cac
     assert!(serde_json::to_string(&before).unwrap().contains("schema"));
 
     std::fs::write(&project_file, config_for_scope(Some("InfoBase"))).unwrap();
-    tokio::time::timeout(Duration::from_secs(15), old_stop.cancelled())
+    tokio::time::timeout(crate::change_hub::test_support::STATE_CEILING, old_stop.cancelled())
         .await
         .expect("scope-only project drift retires the old transport");
     session_finished(old_task).await;

@@ -17,7 +17,23 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+// Shared gates helpers; each binary uses the subset it needs, so the rest is allowed to be unused.
+#[allow(dead_code)]
+mod common;
+use common::Retired;
+
 const TOOL: &str = "references";
+
+/// The symbol every call in this binary asks about: declared by a module the stand lists.
+const STAND_METHOD: &str = "ПервыйОбщийМодуль.НеУстаревшаяФункция";
+
+/// Bound on a single answer. A hang guard: the answer comes on its own when the server is right.
+const HANG_GUARD: Duration = Duration::from_secs(180);
+
+/// Polls at this interval, for at most `POLL_ATTEMPTS` polls. The bound counts polls so that a
+/// slow machine waits longer for the same answer instead of failing on it.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+const POLL_ATTEMPTS: u32 = 9_000;
 
 /// A stand that becomes ready quickly and then works for a long time: the build costs 0.7 s
 /// and the whole-config sweep 13 s, so a 2.4 s deadline falls squarely inside the work with
@@ -62,20 +78,24 @@ struct Wire {
     write: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
     read: Box<dyn tokio::io::AsyncBufRead + Send + Unpin>,
     next_id: i64,
+    /// Declared last, so it is dropped with the session: the server's owners leave before the
+    /// stand the test declared ahead of this session is removed.
+    _server: Retired,
 }
 
 impl Wire {
     async fn connect(root: &Path) -> Self {
         let state = SharedState::workspace(root.to_path_buf()).expect("valid workspace project");
         let gate = ToolGate::for_launch(McpProfile::Workspace, &[TOOL.to_owned()]);
-        let server = McpServer::with_gate(McpProfile::Workspace, state, &gate);
+        let server = Retired(McpServer::with_gate(McpProfile::Workspace, state, &gate));
         let (client_io, server_io) = tokio::io::duplex(4 * 1024 * 1024);
-        tokio::spawn(serve_stream(server, server_io));
+        tokio::spawn(serve_stream((*server).clone(), server_io));
         let (read_half, write_half) = tokio::io::split(client_io);
         let mut wire = Self {
             write: Box::new(write_half),
             read: Box::new(BufReader::new(read_half)),
             next_id: 1,
+            _server: server,
         };
         let hello = wire
             .request(
@@ -106,7 +126,7 @@ impl Wire {
         self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})).await;
         loop {
             let mut line = String::new();
-            tokio::time::timeout(Duration::from_secs(180), self.read.read_line(&mut line))
+            tokio::time::timeout(HANG_GUARD, self.read.read_line(&mut line))
                 .await
                 .expect("the server must answer within the deadline")
                 .expect("frame read");
@@ -121,9 +141,24 @@ impl Wire {
         self.request("tools/call", json!({"name": tool, "arguments": arguments})).await
     }
 
+    /// Waits until the analysis index answers without building, so that the gated task below
+    /// starts where its gate means it to: in the reading phase, not racing the build. A
+    /// lifetime shorter than the build would otherwise expire in the waiting phase on a slow
+    /// machine.
+    async fn warm(&mut self) {
+        for _ in 0..POLL_ATTEMPTS {
+            let answer = self.call(TOOL, json!({"symbol": STAND_METHOD})).await;
+            if answer["result"]["structuredContent"]["status"] != "loading" {
+                return;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+        panic!("the analysis index never finished building");
+    }
+
     /// Poll a handle to its terminal state, refusing to report a swept entry as an outcome.
     async fn settle(&mut self, task_id: &str) -> Value {
-        loop {
+        for _ in 0..POLL_ATTEMPTS {
             let seen = self.request("tasks/get", json!({"taskId": task_id})).await;
             assert!(
                 seen["error"].is_null(),
@@ -133,8 +168,9 @@ impl Wire {
             if seen["result"]["status"] != "working" {
                 return seen["result"].clone();
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
+        panic!("the task never reached a terminal status: {task_id}");
     }
 }
 
@@ -161,6 +197,7 @@ async fn a_task_stopped_mid_answer_does_not_blame_the_index() {
 
     let dst = stage(LONG_WORK_MODULES, LONG_WORK_BODIES);
     let mut wire = Wire::connect(dst.path()).await;
+    wire.warm().await;
 
     let id = task_id(&wire.call("diagnostics", json!({"action": "workspace"})).await);
     let task = wire.settle(&id).await;

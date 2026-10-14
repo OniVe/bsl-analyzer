@@ -1243,6 +1243,12 @@ impl McpServer {
         self.state.shutdown();
     }
 
+    /// [`shutdown`](Self::shutdown) with a caller-chosen bound on how long the owners may take
+    /// to leave. See [`SharedState::shutdown_within`].
+    pub fn shutdown_within(&self, owners_budget: std::time::Duration) {
+        self.state.shutdown_within(owners_budget);
+    }
+
     pub(crate) fn scope_transport_stop(&self) -> tokio_util::sync::CancellationToken {
         self.state.scope_transport_stop()
     }
@@ -3595,6 +3601,10 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// Hang guard for a call that must answer while the lease lock is held by the test. It is
+    /// never a speed bound: the assertions say what the answer is, not how soon it came.
+    const HANG_GUARD: Duration = Duration::from_secs(60);
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn all_status_requests_are_cached_under_held_lease() {
         let dir = tempfile::tempdir().unwrap();
@@ -3607,12 +3617,13 @@ mod tests {
         let lease = state.workspace_lease().clone();
         let server = McpServer::new(McpProfile::Workspace, state);
         let held_lease = lease.hold_file_lock_for_test();
+        let fences_before = lease.disk_check_threads().len();
         std::fs::remove_file(lease_path).unwrap();
         lease.invalidate_verdict_for_test();
         let token = || tokio_util::sync::CancellationToken::new();
 
         tokio::time::timeout(
-            Duration::from_millis(500),
+            HANG_GUARD,
             server.metadata(
                 Parameters(MetadataParams {
                     action: "status".to_owned(),
@@ -3636,7 +3647,7 @@ mod tests {
         .expect("metadata status response");
 
         tokio::time::timeout(
-            Duration::from_millis(500),
+            HANG_GUARD,
             server.diagnostics(
                 Parameters(DiagnosticsParams {
                     action: "status".to_owned(),
@@ -3661,7 +3672,7 @@ mod tests {
         .expect("diagnostics status response");
 
         tokio::time::timeout(
-            Duration::from_millis(500),
+            HANG_GUARD,
             server.graph(
                 Parameters(GraphParams {
                     action: "status".to_owned(),
@@ -3685,6 +3696,21 @@ mod tests {
         .await
         .expect("graph status must not wait for the lease lock")
         .expect("graph status response");
+
+        // The status path answers from what the lease already knows, so it takes no fence. The
+        // journal names the threads that fenced, in order: a fence made for a status call runs
+        // on a runtime worker, and would appear among the entries written after the lock was
+        // taken. Background owners fence on threads of their own and are not counted here.
+        let fenced_by_status: Vec<String> = lease
+            .disk_check_threads()
+            .into_iter()
+            .skip(fences_before)
+            .filter(|name| name.starts_with("tokio-runtime-worker"))
+            .collect();
+        assert!(
+            fenced_by_status.is_empty(),
+            "a status call fenced the lease: {fenced_by_status:?}"
+        );
 
         drop(held_lease);
         server.shutdown();
@@ -3811,6 +3837,7 @@ mod graph_supersession_contract {
     }
 
     async fn assert_busy_graph_handler_returns_immediately(handler: BusyGraphHandler) {
+        let _serialised = crate::walk_probe::WALK_GATE.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         crate::graph::test_support::sample_workspace(root);
@@ -3880,7 +3907,7 @@ mod graph_supersession_contract {
         // the release — slower, not stuck. The bound below is only a hang guard, not the
         // discriminator: a budget in the hundreds of milliseconds measured the runtime's
         // scheduling as much as the handler, and a loaded suite fails it for neither reason.
-        let answer = tokio::time::timeout(Duration::from_secs(30), call)
+        let answer = tokio::time::timeout(crate::change_hub::test_support::STATE_CEILING, call)
             .await
             .expect("the handler never answered while the lease lock was held")
             .expect("the handler did not panic");
@@ -4041,8 +4068,7 @@ mod graph_supersession_contract {
         // it does not come back — so the hold is given up only once that thread has gone, and
         // the graph then stays idle for as long as this test needs it to.
         assert!(
-            crate::change_hub::test_support::eventually(Duration::from_secs(60), || !state
-                .search_initializing()),
+            crate::change_hub::test_support::eventually(|| !state.search_initializing()),
             "the boot's workspace-search init never finished",
         );
         drop(held);
@@ -4099,10 +4125,11 @@ mod graph_supersession_contract {
                         server.graph(asked, tokio_util::sync::CancellationToken::new()).await
                     })
                 };
-                let answered = tokio::time::timeout(Duration::from_secs(5), calling)
-                    .await
-                    .unwrap_or_else(|_| panic!("{what}: graph {action} never came back"))
-                    .expect("the request task did not panic");
+                let answered =
+                    tokio::time::timeout(crate::change_hub::test_support::STATE_CEILING, calling)
+                        .await
+                        .unwrap_or_else(|_| panic!("{what}: graph {action} never came back"))
+                        .expect("the request task did not panic");
                 // A failed graph answers some actions with an error, and that IS the answer:
                 // what this test is about is the thread it came back on, not its shape.
                 let _ = answered;
@@ -4186,8 +4213,7 @@ mod graph_supersession_contract {
         release_the_lock.send(()).expect("the lock holder is still there to be released");
         lock.join().unwrap();
         assert!(
-            crate::change_hub::test_support::eventually(Duration::from_secs(30), || state
-                .ownership_verdict_established()),
+            crate::change_hub::test_support::eventually(|| state.ownership_verdict_established()),
             "no background check ever established the verdict",
         );
         let body = answered(
@@ -4241,8 +4267,7 @@ mod graph_supersession_contract {
                 .expect("the background check starts")
         };
         assert!(
-            crate::change_hub::test_support::eventually(Duration::from_secs(5), || state
-                .lease_lifecycle_is_busy()),
+            crate::change_hub::test_support::eventually(|| state.lease_lifecycle_is_busy()),
             "the background check never reached the lock this test is about",
         );
 
@@ -4353,8 +4378,7 @@ mod graph_supersession_contract {
         release_the_lock.send(()).expect("the lock holder is still there to be released");
         lock.join().unwrap();
         assert!(
-            crate::change_hub::test_support::eventually(Duration::from_secs(30), || state
-                .ownership_verdict_established()),
+            crate::change_hub::test_support::eventually(|| state.ownership_verdict_established()),
             "no background check ever established the verdict",
         );
         assert_eq!(
@@ -5578,7 +5602,7 @@ mod resolve_envelope {
         graph.ensure_loading();
 
         entered_rx
-            .recv_timeout(std::time::Duration::from_secs(30))
+            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
             .expect("real graph producer reached the post-persistence boundary");
         assert_eq!(graph.status(), crate::graph::GraphStatus::Loading);
         assert!(!graph.has_installed_snapshot());
@@ -5849,6 +5873,7 @@ mod rescan_hatch_consultations {
     /// The same for the answer-shaped miss this tool decides by its outcome.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn references_consults_the_rescan_hatch_on_a_named_symbol_miss() {
+        let _serialised = crate::walk_probe::WALK_GATE.lock().await;
         let (_dir, server, diag) = stand();
 
         let before = diag.stale_miss_consultations();
@@ -5881,9 +5906,6 @@ mod rescan_hatch_consultations {
 mod search_cancellation_matrix {
     use super::*;
     use serde_json::json;
-    use std::time::{Duration, Instant};
-
-    const BOUND: Duration = Duration::from_millis(500);
 
     fn cancelled_token() -> tokio_util::sync::CancellationToken {
         let token = tokio_util::sync::CancellationToken::new();
@@ -5907,14 +5929,10 @@ mod search_cancellation_matrix {
         release_tx
     }
 
-    fn assert_cancelled(answer: Result<CallToolResult, McpError>, elapsed: Duration, cell: &str) {
+    fn assert_cancelled(answer: Result<CallToolResult, McpError>, cell: &str) {
         let error =
             answer.err().unwrap_or_else(|| panic!("{cell}: a cancelled call produced a body"));
         assert_eq!(error.message, "request cancelled", "{cell}: {error:?}");
-        assert!(
-            elapsed < BOUND,
-            "{cell}: answered only after {elapsed:?}, i.e. after the held lock"
-        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5937,9 +5955,13 @@ mod search_cancellation_matrix {
             let held = hold_lock(engine);
             let params =
                 Parameters(serde_json::from_value::<WorkspaceSearchParams>(arguments).unwrap());
-            let started = Instant::now();
-            let answer = server.workspace_search(params, cancelled_token()).await;
-            assert_cancelled(answer, started.elapsed(), cell);
+            let answer = tokio::time::timeout(
+                crate::change_hub::test_support::STATE_CEILING,
+                server.workspace_search(params, cancelled_token()),
+            )
+            .await
+            .expect("a cancelled request answers while the lock is still held");
+            assert_cancelled(answer, cell);
             drop(held);
         }
         server.shutdown();
@@ -5959,9 +5981,13 @@ mod search_cancellation_matrix {
                 )
                 .unwrap(),
             );
-            let started = Instant::now();
-            let answer = server.reference_search(params, cancelled_token()).await;
-            assert_cancelled(answer, started.elapsed(), action);
+            let answer = tokio::time::timeout(
+                crate::change_hub::test_support::STATE_CEILING,
+                server.reference_search(params, cancelled_token()),
+            )
+            .await
+            .expect("a cancelled request answers while the lock is still held");
+            assert_cancelled(answer, action);
             drop(held);
         }
         server.shutdown();
@@ -6103,6 +6129,7 @@ mod resident_failed_answers {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_failed_resident_answers_every_reading_tool_with_the_same_structured_failure() {
+        let _serialised = crate::walk_probe::WALK_GATE.lock().await;
         let (_dir, server, _diag) = failed_stand();
 
         let error = match server

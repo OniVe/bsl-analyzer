@@ -18,6 +18,10 @@ use rmcp::{RoleClient, ServiceExt};
 use serde_json::{Map, Value};
 use tempfile::TempDir;
 
+// Shared helpers for the gates in this binary; not every binary uses every one.
+#[allow(dead_code)]
+mod common;
+
 type Client = RunningService<RoleClient, ()>;
 
 fn designer_fixture() -> PathBuf {
@@ -89,7 +93,8 @@ fn args(pairs: &[(&str, Value)]) -> Map<String, Value> {
 /// must not model: a resolved card, a resident miss AND the retry envelope all carry
 /// structured content.
 async fn poll_card(client: &Client, call_args: Map<String, Value>) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut deadline =
+        common::Patience::new(common::STATE_CEILING, std::time::Duration::from_millis(100));
     loop {
         let call = CallToolRequestParams::new("symbol_info").with_arguments(call_args.clone());
         let result = client.call_tool(call).await.expect("transport ok");
@@ -102,10 +107,7 @@ async fn poll_card(client: &Client, call_args: Map<String, Value>) -> Value {
             assert!(structured["state"].is_string());
             assert!(structured["generation"].is_u64());
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "resident never became ready for {call_args:?}"
-        );
+        assert!(deadline.allows(), "resident never became ready for {call_args:?}");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -117,14 +119,15 @@ async fn poll_card(client: &Client, call_args: Map<String, Value>) -> Value {
 /// `freshness.completeness`. A gate asking whether a symbol EXISTS has to wait for that to
 /// clear, or it reads "not indexed yet" as "not there".
 async fn poll_complete_card(client: &Client, call_args: Map<String, Value>) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut deadline =
+        common::Patience::new(common::STATE_CEILING, std::time::Duration::from_millis(100));
     loop {
         let card = poll_card(client, call_args.clone()).await;
         if card["freshness"]["completeness"]["status"] == "complete" {
             return card;
         }
         assert!(
-            tokio::time::Instant::now() < deadline,
+            deadline.allows(),
             "the name sources never all reported in for {call_args:?}: {card}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;

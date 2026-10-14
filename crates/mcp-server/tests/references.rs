@@ -96,7 +96,8 @@ fn args(pairs: &[(&str, Value)]) -> Map<String, Value> {
 /// its `status: "loading"` field — how a consumer is meant to read it — never by matching
 /// the human sentence beside it.
 async fn poll(client: &Client, tool: &'static str, call_args: Map<String, Value>) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let mut deadline =
+        common::Patience::new(common::STATE_CEILING, std::time::Duration::from_millis(100));
     loop {
         let call = CallToolRequestParams::new(tool).with_arguments(call_args.clone());
         let result = client.call_tool(call).await.expect("transport ok");
@@ -105,10 +106,7 @@ async fn poll(client: &Client, tool: &'static str, call_args: Map<String, Value>
                 return structured;
             }
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{tool} never became ready for {call_args:?}"
-        );
+        assert!(deadline.allows(), "{tool} never became ready for {call_args:?}");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -2556,7 +2554,7 @@ async fn a_cancelled_call_publishes_nothing() {
     /// of reporting it.
     async fn next_frame<R: tokio::io::AsyncBufRead + Unpin>(read: &mut R) -> Value {
         let mut line = String::new();
-        tokio::time::timeout(Duration::from_secs(120), read.read_line(&mut line))
+        tokio::time::timeout(common::STATE_CEILING, read.read_line(&mut line))
             .await
             .expect("the server must answer within the deadline")
             .expect("frame read");

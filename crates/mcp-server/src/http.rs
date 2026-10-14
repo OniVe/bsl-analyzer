@@ -322,8 +322,6 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_cache_scope_stops_the_http_listener() {
-        use std::time::Duration;
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let state = crate::SharedState::shared();
@@ -338,7 +336,7 @@ mod tests {
         ));
 
         state.scope_transport_stop().cancel();
-        tokio::time::timeout(Duration::from_secs(5), task)
+        tokio::time::timeout(crate::change_hub::test_support::STATE_CEILING, task)
             .await
             .expect("scope retirement closes HTTP within a finite grace")
             .expect("HTTP task joins")

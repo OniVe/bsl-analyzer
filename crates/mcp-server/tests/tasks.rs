@@ -19,6 +19,11 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+// Shared gates helpers; each binary uses the subset it needs, so the rest is allowed to be unused.
+#[allow(dead_code)]
+mod common;
+use common::Retired;
+
 const TOOL: &str = "references";
 
 /// The declaration every gate asks about. Declared by a module the fixture's configuration
@@ -34,15 +39,17 @@ const STAND_METHOD: &str = "ПервыйОбщийМодуль.НеУстаре�
 const SWEEP_STAND_MODULES: usize = 800;
 const SWEEP_STAND_BODIES: usize = 100;
 
-/// How long the caller after a cancellation may wait. Chosen from both sides of the
-/// measurement rather than for comfort: a released resident answers it in 0.19 s, while a
-/// build that abandons the sweep instead of cancelling it makes the same caller wait 11.4 s
-/// for the rest of it. A bound anywhere near that second number passes on both builds and is
-/// therefore not a gate at all.
-const FREED_RESIDENT_BOUND: Duration = Duration::from_secs(3);
-
 /// How long the sweep is left to run before it is cancelled.
 const SWEEP_DWELL: Duration = Duration::from_secs(2);
+
+/// Bound on any wait for the server to answer or for an owner to leave. It is a hang guard:
+/// every such wait ends on its own when the code is right, so the bound is only ever reached
+/// by a server that never answers, and no assertion depends on how long the answer took.
+const HANG_GUARD: Duration = Duration::from_secs(180);
+
+/// Polls `tasks/get` at this interval, for at most [`HANG_GUARD`] worth of polls.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const POLL_ATTEMPTS: u32 = (HANG_GUARD.as_millis() / POLL_INTERVAL.as_millis()) as u32;
 
 /// Enough modules that a cold resident is still building when the first call arrives. A
 /// smaller stand lets the build win the race, and the gates that need an unready resident
@@ -91,10 +98,10 @@ fn write_module(root: &Path, name: &str, body: &str) {
     std::fs::write(dir.join("Module.bsl"), body).expect("write module");
 }
 
-fn server_for(root: &Path) -> McpServer {
+fn server_for(root: &Path) -> Retired {
     let state = SharedState::workspace(root.to_path_buf()).expect("valid workspace project");
     let gate = ToolGate::for_launch(McpProfile::Workspace, &[TOOL.to_owned()]);
-    McpServer::with_gate(McpProfile::Workspace, state, &gate)
+    Retired(McpServer::with_gate(McpProfile::Workspace, state, &gate))
 }
 
 /// One client connection, spoken as frames.
@@ -155,7 +162,7 @@ impl Wire {
         self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})).await;
         loop {
             let mut line = String::new();
-            tokio::time::timeout(Duration::from_secs(180), self.read.read_line(&mut line))
+            tokio::time::timeout(HANG_GUARD, self.read.read_line(&mut line))
                 .await
                 .expect("the server must answer within the deadline")
                 .expect("frame read");
@@ -182,26 +189,25 @@ impl Wire {
         self.request("tasks/cancel", json!({"taskId": task_id})).await
     }
 
-    /// Poll until `settled` accepts a `tasks/get` answer, or give up loudly.
+    /// Poll until `settled` accepts a `tasks/get` answer, or give up loudly. The bound counts
+    /// polls, so a slow machine waits longer for the same answer instead of failing on it.
     async fn poll_until(
         &mut self,
         task_id: &str,
         what: &str,
         settled: impl Fn(&Value) -> bool,
     ) -> Value {
-        let deadline = std::time::Instant::now() + Duration::from_secs(180);
-        loop {
+        let mut last = Value::Null;
+        for _ in 0..POLL_ATTEMPTS {
             let answer = self.get_task(task_id).await;
             let task = &answer["result"];
             if settled(task) {
                 return task.clone();
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the task never reached {what}; last seen: {task}"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            last = task.clone();
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
+        panic!("the task never reached {what}; last seen: {last}");
     }
 }
 
@@ -253,9 +259,7 @@ async fn a_client_that_declared_nothing_reads_the_answer_it_always_read() {
 async fn every_tool_that_waits_on_the_resident_offers_the_handle() {
     arm_the_branch();
     let dst = stage(COLD_STAND_MODULES, 1);
-    let state = SharedState::workspace(dst.path().to_path_buf()).expect("valid workspace project");
-    let gate = ToolGate::for_launch(McpProfile::Workspace, &[TOOL.to_owned()]);
-    let server = McpServer::with_gate(McpProfile::Workspace, state, &gate);
+    let server = server_for(dst.path());
     let mut wire = Wire::connect(&server, true).await;
 
     // Fired back to back, before the cold resident can become ready: each call has to meet
@@ -373,12 +377,34 @@ async fn cancelling_a_waiting_handle_settles_it() {
 /// The release is the half that cannot be skipped. A build that drops the task's future
 /// instead of cancelling it looks identical up to the status — `cancelled` either way — and
 /// differs only here: the blocking read keeps running, and the next caller waits behind it.
+///
+/// How long that next caller waits is a speed, so the gate does not compare it with a fixed
+/// bound. It compares it with the wait behind the same sweep left running on an identical stand,
+/// taken under the same load: a released resident answers in a small fraction of the time the
+/// sweep takes to finish, and an abandoned one answers only after the sweep has finished.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelling_a_working_handle_stops_the_read_and_frees_the_resident() {
     arm_the_branch();
-    let dst = stage(SWEEP_STAND_MODULES, SWEEP_STAND_BODIES);
-    let server = server_for(dst.path());
-    let mut wire = Wire::connect(&server, true).await;
+    let live_stand = stage(SWEEP_STAND_MODULES, SWEEP_STAND_BODIES);
+    let live = server_for(live_stand.path());
+    let waited_behind_live = wait_behind_sweep(&live, false).await;
+
+    let cancelled_stand = stage(SWEEP_STAND_MODULES, SWEEP_STAND_BODIES);
+    let cancelled = server_for(cancelled_stand.path());
+    let waited_behind_cancelled = wait_behind_sweep(&cancelled, true).await;
+
+    assert!(
+        waited_behind_cancelled * 3 < waited_behind_live,
+        "the cancelled read still held the resident: the next caller waited \
+         {waited_behind_cancelled:?} behind a cancelled sweep against {waited_behind_live:?} \
+         behind a live one"
+    );
+}
+
+/// Starts the whole-config sweep on `server`, waits until it is reading, then cancels it or
+/// leaves it running, and returns how long the next caller waited for the resident.
+async fn wait_behind_sweep(server: &McpServer, cancel: bool) -> Duration {
+    let mut wire = Wire::connect(server, true).await;
 
     // The whole-config sweep, not a reference walk: it is the heaviest thing that runs under
     // the resident lock, and the difference this gate measures is only visible while that
@@ -396,31 +422,25 @@ async fn cancelling_a_working_handle_stops_the_read_and_frees_the_resident() {
     .await;
     // The phase flips when the work is handed to a blocking thread, not when that thread
     // gets to run. Cancelling in that window stops work that had not started, which every
-    // build survives; the dwell puts the sweep demonstrably in flight — and holding the
-    // resident — before anything is asked of the cancellation.
+    // build survives; the dwell puts the sweep in flight — and holding the resident — before
+    // anything is asked of the cancellation.
     tokio::time::sleep(SWEEP_DWELL).await;
 
-    wire.cancel_task(&id).await;
-    let task = wire.poll_until(&id, "a terminal status", |task| task["status"] != "working").await;
-    assert_eq!(task["status"], "cancelled", "the read was cancelled, not finished: {task}");
+    if cancel {
+        wire.cancel_task(&id).await;
+        let task =
+            wire.poll_until(&id, "a terminal status", |task| task["status"] != "working").await;
+        assert_eq!(task["status"], "cancelled", "the read was cancelled, not finished: {task}");
+    }
 
     let started = std::time::Instant::now();
-    let freed = tokio::time::timeout(
-        FREED_RESIDENT_BOUND,
-        wire.call("metadata", json!({"action": "info"})),
-    )
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "the next caller waited more than {FREED_RESIDENT_BOUND:?}, so the cancelled \
-                 read is still holding the resident"
-        )
-    });
+    let freed = wire.call("metadata", json!({"action": "info"})).await;
+    let waited = started.elapsed();
     assert!(
         freed["error"].is_null() && freed["result"].is_object(),
-        "the next caller gets a normal answer after {:?}: {freed}",
-        started.elapsed()
+        "the next caller gets a normal answer after {waited:?}: {freed}"
     );
+    waited
 }
 
 /// A task that answered before the cancellation is not reported as cancelled.

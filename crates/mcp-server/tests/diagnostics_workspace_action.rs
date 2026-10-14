@@ -13,6 +13,10 @@ use rmcp::service::RunningService;
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::{json, Map, Value};
 
+// Shared helpers for the gates in this binary; not every binary uses every one.
+#[allow(dead_code)]
+mod common;
+
 type Client = RunningService<RoleClient, ()>;
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -50,7 +54,8 @@ async fn client(root: &Path) -> Client {
 }
 
 async fn diagnostics(client: &Client, arguments: Map<String, Value>) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut deadline =
+        common::Patience::new(common::STATE_CEILING, std::time::Duration::from_millis(20));
     loop {
         let result = client
             .call_tool(CallToolRequestParams::new("diagnostics").with_arguments(arguments.clone()))
@@ -60,7 +65,7 @@ async fn diagnostics(client: &Client, arguments: Map<String, Value>) -> Value {
         if body["status"] != "loading" {
             return body;
         }
-        assert!(tokio::time::Instant::now() < deadline, "resident did not become ready");
+        assert!(deadline.allows(), "resident did not become ready");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }

@@ -75,25 +75,27 @@ pub(crate) const WAIT_POLL: Duration = Duration::from_millis(10);
 /// The default ceiling for a bounded wait on graph state.
 pub(crate) const WAIT_CEILING: Duration = Duration::from_secs(30);
 
+/// How many polls a bounded wait of nominal length `ceiling` makes. The count bounds the wait,
+/// not the clock: a loaded machine stretches each poll, so the same polls still cover the same
+/// work, and only a condition that never holds uses them all up.
+fn polls_for(ceiling: Duration) -> u128 {
+    ceiling.as_millis() / WAIT_POLL.as_millis()
+}
+
 /// Every pooled handle of `graph`, taken once none is lent. A consumer of a fresh publication —
 /// the search hook confirming which generation it serves — borrows one for a moment right after
 /// the graph reads as ready, so a stand that must hold them all waits for that to pass.
 pub(crate) fn hold_every_handle(graph: &GraphState) -> Vec<super::GraphSnapshot> {
-    let deadline = std::time::Instant::now() + WAIT_CEILING;
-    loop {
+    for _ in 0..polls_for(WAIT_CEILING) {
         let held: Vec<_> =
             std::iter::from_fn(|| graph.snapshot()).take(super::SNAPSHOT_POOL_CAP).collect();
         if held.len() == super::SNAPSHOT_POOL_CAP {
             return held;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the pool never had every handle idle: {}",
-            graph_state_summary(graph)
-        );
         drop(held);
         std::thread::sleep(WAIT_POLL);
     }
+    panic!("the pool never had every handle idle: {}", graph_state_summary(graph));
 }
 
 /// Everything a timed-out wait needs to say to be diagnosable: which condition it
@@ -144,18 +146,17 @@ pub(crate) fn wait_until_within(
     what: &str,
     mut condition: impl FnMut() -> bool,
 ) {
-    let deadline = std::time::Instant::now() + ceiling;
-    loop {
+    for _ in 0..polls_for(ceiling) {
         if condition() {
             return;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out after {ceiling:?} waiting for {what}; {}",
-            graph_state_summary(graph)
-        );
         std::thread::sleep(WAIT_POLL);
     }
+    assert!(
+        condition(),
+        "timed out after {ceiling:?} waiting for {what}; {}",
+        graph_state_summary(graph)
+    );
 }
 
 /// [`wait_until`] for a stand that has no watcher: `drive` plays it, before every look.
@@ -211,6 +212,18 @@ pub(crate) fn wait_ready(graph: &GraphState) {
             panic!("graph load failed: {msg}; {}", graph_state_summary(graph))
         }
         _ => false,
+    });
+}
+
+/// Wait until the first build has settled, not merely reported itself ready: its publish pass
+/// has run to the end, and no build still holds the slot. [`wait_ready`] alone is a status
+/// barrier, and a test that then reads a probe counter, the slot, or a consumed mark reads a
+/// value the background work has not finished leaving.
+pub(crate) fn wait_settled(graph: &GraphState) {
+    wait_ready(graph);
+    wait_publish_pass_within(graph, WAIT_CEILING, 1);
+    wait_until(graph, "the build slot and the recovery walk to be free", || {
+        !graph.build_in_flight() && !graph.walk_out()
     });
 }
 
@@ -322,7 +335,7 @@ pub(crate) fn watched_graph(
     root: &Path,
 ) -> (GraphState, crate::change_hub::WorkspaceChangeHub, crate::state::OwnerStop) {
     let hub = workspace_hub(root);
-    assert!(hub.wait_until_watching(Duration::from_secs(5)), "the hub did not arm");
+    assert!(hub.wait_until_watching(), "the hub did not arm");
     let graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
     let stop = crate::state::OwnerStop::default();
     assert!(super::watcher::start(&graph, &hub, None, stop.clone()));
@@ -340,13 +353,16 @@ pub(crate) fn wait_for_hub_seq_above(
     hub: &crate::change_hub::WorkspaceChangeHub,
     floor: u64,
 ) -> u64 {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut deadline = crate::change_hub::test_support::Patience::new(
+        crate::change_hub::test_support::STATE_CEILING,
+        std::time::Duration::from_millis(10),
+    );
     loop {
         let seq = hub.seq();
         if seq > floor {
             return seq;
         }
-        assert!(std::time::Instant::now() < deadline, "the hub never saw the write");
+        assert!(deadline.allows(), "the hub never saw the write");
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }

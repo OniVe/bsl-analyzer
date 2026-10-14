@@ -332,13 +332,16 @@ mod tests {
         let mut state = DiagnosticsState::for_workspace(root.to_path_buf());
         state.drift_interval = Duration::from_millis(0);
         state.ensure_loading();
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(10),
+        );
         loop {
             match state.status() {
                 super::super::types::DiagnosticsStatus::Ready { .. } => return state,
                 super::super::types::DiagnosticsStatus::Failed(msg) => panic!("resident: {msg}"),
                 other => {
-                    assert!(Instant::now() < deadline, "resident never became ready: {other:?}");
+                    assert!(deadline.allows(), "resident never became ready: {other:?}");
                     std::thread::sleep(Duration::from_millis(10));
                 }
             }
@@ -404,10 +407,15 @@ mod tests {
             "the cancelled call must answer as cancelled"
         );
 
+        // The control compares the same neighbour call on a resident nobody holds. Both sides are
+        // taken under the same load, so only the ratio says whether the stand's walk is long
+        // enough for a cancel to make a difference.
+        let idle = neighbour(subject.clone()).await;
         assert!(
-            waited_behind_a_live_call > Duration::from_secs(1),
-            "positive control is inert: the neighbour waited only {waited_behind_a_live_call:?} \
-             behind a LIVE call, so this stand cannot show a cancel freeing the slot"
+            waited_behind_a_live_call > idle * 3,
+            "positive control is inert: the neighbour waited {waited_behind_a_live_call:?} behind \
+             a LIVE call against {idle:?} on an idle resident, so this stand cannot show a cancel \
+             freeing the slot"
         );
         assert!(
             waited_behind_a_cancelled_call * 3 < waited_behind_a_live_call,
@@ -494,7 +502,7 @@ mod tests {
             let out = applying.read(|resident, _| resident.file_count());
             let _ = tx.send(matches!(out, ResidentOutcome::Ready(_, _)));
         });
-        let applied = rx.recv_timeout(Duration::from_secs(30)).expect(
+        let applied = rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING).expect(
             "the incremental apply must not block: a handle from the cancelled call \
                      is still alive and salsa is waiting for it to drop",
         );
@@ -749,8 +757,11 @@ mod tests {
         // window is measuring the scheduler.
         let armed = state.clone();
         let ticker = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while armed.forced_rescans() == 0 && Instant::now() < deadline {
+            let mut deadline = crate::change_hub::test_support::Patience::new(
+                crate::change_hub::test_support::STATE_CEILING,
+                std::time::Duration::from_millis(10),
+            );
+            while armed.forced_rescans() == 0 && deadline.allows() {
                 std::thread::yield_now();
             }
             cancel.cancel_all();

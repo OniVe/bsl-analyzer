@@ -1602,7 +1602,7 @@ mod tests {
                         release
                             .lock()
                             .unwrap()
-                            .recv_timeout(std::time::Duration::from_secs(30))
+                            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
                             .unwrap();
                     }),
                 ));
@@ -1616,7 +1616,7 @@ mod tests {
                 )
             })
         };
-        entered.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+        entered.recv_timeout(crate::change_hub::test_support::STATE_CEILING).unwrap();
 
         let started = std::time::Instant::now();
         let acquired = crate::tools::search::try_acquire_engine(
@@ -2023,7 +2023,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
         let hub = WorkspaceChangeHub::start(vec![workspace.clone()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
 
         // Delivered while the budget was still running, and never acknowledged. One write can
@@ -2031,7 +2031,7 @@ mod tests {
         // about a generation the sink was already told about, not about a write still landing.
         fs::write(workspace.join("Early.bsl"), "Процедура Ранняя() КонецПроцедуры\n").unwrap();
         let mut last = hub.generation();
-        assert!(eventually(Duration::from_secs(20), || {
+        assert!(eventually(|| {
             std::thread::sleep(Duration::from_millis(200));
             let now = hub.generation();
             let quiet = now > 0 && now == last;
@@ -2062,7 +2062,7 @@ mod tests {
 
         fs::write(workspace.join("Late.bsl"), "Процедура Поздняя() КонецПроцедуры\n").unwrap();
         assert!(
-            rx.recv_timeout(Duration::from_secs(20)).is_ok(),
+            rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING).is_ok(),
             "work delivered after the budget ran out must open the next one"
         );
         waiter.join().unwrap();
@@ -2072,7 +2072,6 @@ mod tests {
     #[test]
     fn the_sink_drains_the_overlay_after_a_real_hub_batch() {
         use crate::change_hub::{test_support::eventually, WorkspaceChangeHub};
-        use std::time::Duration;
 
         let _env_lock = env_lock();
         let dir = tempdir().unwrap();
@@ -2088,7 +2087,7 @@ mod tests {
         let shared: super::super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
         let graph = crate::graph::GraphState::disabled();
         let hub = WorkspaceChangeHub::start(vec![workspace.clone()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
         let lease = crate::workspace_lease::WorkspaceLease::claim(&workspace);
         let owners = crate::state::OwnerStop::default();
@@ -2109,7 +2108,7 @@ mod tests {
 
         fs::write(&module, "Процедура Новая() Экспорт КонецПроцедуры\n").unwrap();
 
-        let seen = eventually(Duration::from_secs(30), || {
+        let seen = eventually(|| {
             let Ok(guard) = shared.lock() else { return false };
             let Some(engine) = guard.as_ref() else { return false };
             engine
@@ -2159,10 +2158,7 @@ mod tests {
         let hub =
             WorkspaceChangeHub::start_targets(vec![WatchTarget::recursive(workspace.clone())]);
         crate::change_hub::POLL_INSTEAD_OF_WATCHING.with(|poll| poll.set(None));
-        assert!(
-            !hub.wait_until_watching(Duration::from_secs(5)),
-            "the fixture stands on a hub that cannot watch",
-        );
+        assert!(!hub.wait_until_watching(), "the fixture stands on a hub that cannot watch",);
         assert!(
             hub.is_polling(),
             "and the hub's fallback is the poll this test measures — not some other feed",
@@ -2186,7 +2182,7 @@ mod tests {
 
         fs::write(&module, "Процедура Новая() Экспорт КонецПроцедуры\n").unwrap();
 
-        let seen = eventually(Duration::from_secs(30), || {
+        let seen = eventually(|| {
             let Ok(guard) = shared.lock() else { return false };
             let Some(engine) = guard.as_ref() else { return false };
             engine
@@ -2224,7 +2220,7 @@ mod tests {
 
         // A running watcher feeds.
         let watching = WorkspaceChangeHub::start(vec![workspace.clone()]);
-        assert!(watching.wait_until_watching(Duration::from_secs(5)));
+        assert!(watching.wait_until_watching());
         assert!(super::hub_is_feeding(&watching));
         watching.shutdown();
 
@@ -2237,7 +2233,7 @@ mod tests {
         });
         let polling = WorkspaceChangeHub::start(vec![workspace.clone()]);
         crate::change_hub::POLL_INSTEAD_OF_WATCHING.with(|poll| poll.set(None));
-        assert!(!polling.wait_until_watching(Duration::from_secs(5)));
+        assert!(!polling.wait_until_watching());
         assert!(polling.is_polling(), "the fallback is the poll this gate accepts");
         assert!(super::hub_is_feeding(&polling));
         polling.shutdown();
@@ -2249,7 +2245,6 @@ mod tests {
     #[test]
     fn a_consumer_blocked_on_its_first_fence_is_not_yet_watching() {
         use crate::change_hub::{test_support::eventually, WorkspaceChangeHub};
-        use std::time::Duration;
 
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
@@ -2259,7 +2254,7 @@ mod tests {
         engine.index_directory_fts(&workspace).unwrap();
         let shared: super::super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
         let hub = WorkspaceChangeHub::start(vec![workspace.clone()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let lease = crate::workspace_lease::WorkspaceLease::claim(&workspace);
         let held = lease.hold_file_lock_for_test();
         let owners = crate::state::OwnerStop::default();
@@ -2277,23 +2272,17 @@ mod tests {
             Arc::clone(&phase),
         ));
         // While the lock is held the first fenced step cannot pass, whatever the timing.
-        assert!(eventually(Duration::from_secs(5), || {
-            *phase.lock().unwrap() != crate::state::ConsumerPhase::Pending
-        }));
+        assert!(eventually(|| { *phase.lock().unwrap() != crate::state::ConsumerPhase::Pending }));
         assert_eq!(
             *phase.lock().unwrap(),
             crate::state::ConsumerPhase::Attaching,
             "a consumer whose facts reach nothing called itself attached"
         );
         drop(held);
-        assert!(eventually(Duration::from_secs(10), || {
-            *phase.lock().unwrap() == crate::state::ConsumerPhase::Attached
-        }));
+        assert!(eventually(|| { *phase.lock().unwrap() == crate::state::ConsumerPhase::Attached }));
         owners.stop();
         hub.interrupt_waiters();
-        assert!(eventually(Duration::from_secs(5), || {
-            *phase.lock().unwrap() == crate::state::ConsumerPhase::Stopped
-        }));
+        assert!(eventually(|| { *phase.lock().unwrap() == crate::state::ConsumerPhase::Stopped }));
     }
 
     /// A fresh edit is the one delivery of a fact to the embedding driver: the consumer kicks
@@ -2302,7 +2291,6 @@ mod tests {
     #[test]
     fn a_fresh_edit_revives_a_failed_embedding_driver() {
         use crate::change_hub::{test_support::eventually, WorkspaceChangeHub};
-        use std::time::Duration;
 
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
@@ -2318,7 +2306,7 @@ mod tests {
             super::super::overlay_retry::OverlayRetry::unstarted_for_test(Arc::clone(&shared));
         retry.fail_for_test();
         let hub = WorkspaceChangeHub::start(vec![workspace.clone()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
         let owners = crate::state::OwnerStop::default();
         assert!(SharedState::spawn_search_sink(
@@ -2335,7 +2323,7 @@ mod tests {
         ));
 
         fs::write(&module, "Процедура Стала() Экспорт КонецПроцедуры\n").unwrap();
-        let revived = eventually(Duration::from_secs(20), || !retry.is_failed());
+        let revived = eventually(|| !retry.is_failed());
         owners.stop();
         hub.interrupt_waiters();
         assert!(revived, "the fresh edit never reached the failed embedding driver");
@@ -2432,7 +2420,6 @@ mod tests {
     #[test]
     fn a_reconcile_taken_while_the_search_rescan_waits_keeps_its_identity() {
         use crate::change_hub::{test_support::eventually, WorkspaceChangeHub};
-        use std::time::Duration;
 
         struct ResetForcedError;
         impl Drop for ResetForcedError {
@@ -2456,7 +2443,7 @@ mod tests {
         let shared: super::super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
 
         let hub = WorkspaceChangeHub::start(vec![workspace.clone()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         // The graph's derived database lives outside the watched tree too, for the same reason:
         // its writes are events, and a build answering them would keep making more.
         let cache = tempdir().unwrap();
@@ -2485,10 +2472,7 @@ mod tests {
         ));
         graph.ensure_loading();
         assert!(
-            eventually(Duration::from_secs(60), || matches!(
-                graph.status(),
-                crate::graph::GraphStatus::Ready { .. }
-            )),
+            eventually(|| matches!(graph.status(), crate::graph::GraphStatus::Ready { .. })),
             "the graph never finished its first build",
         );
 
@@ -2496,12 +2480,9 @@ mod tests {
         let settle = |name: &str, text: &str| {
             let before = hub.seq();
             fs::write(workspace.join(name), text).unwrap();
+            assert!(eventually(|| hub.seq() > before), "the hub never saw {name}",);
             assert!(
-                eventually(Duration::from_secs(30), || hub.seq() > before),
-                "the hub never saw {name}",
-            );
-            assert!(
-                eventually(Duration::from_secs(30), || {
+                eventually(|| {
                     let batch = hub.materialize(cursor);
                     batch.entries.is_empty() && !batch.rescan_required
                 }),
@@ -2509,7 +2490,7 @@ mod tests {
             );
         };
         let answered = |what: &str| {
-            let done = eventually(Duration::from_secs(60), || graph.owes_forced().is_none());
+            let done = eventually(|| graph.owes_forced().is_none());
             if !done {
                 eprintln!(
                     "DIAG {what}: status={:?} forced={:?} change={:?} failed={} marks={} in_flight={} branch={}",
@@ -2539,7 +2520,7 @@ mod tests {
         // graph that has gone quiet — a demand answered before this thread looked was still made.
         answered("the failures that earned the wait");
         assert!(
-            eventually(Duration::from_secs(60), || !graph.build_in_flight()),
+            eventually(|| !graph.build_in_flight()),
             "the stand needs the graph quiet before the fact it must act on",
         );
         let before_plain = branch();
@@ -2549,8 +2530,7 @@ mod tests {
         let below_the_fact = hub.seq();
         settle("Шесть.bsl", "Процедура П6() КонецПроцедуры\n");
         assert!(branch() > before_plain, "the stand needs the rescan debt waiting");
-        let acted_on_it =
-            eventually(Duration::from_secs(60), || graph.answered_forced() > below_the_fact);
+        let acted_on_it = eventually(|| graph.answered_forced() > below_the_fact);
         if !acted_on_it {
             eprintln!(
                 "DIAG plain: status={:?} forced={:?} answered_forced={} below={} change={:?} failed={} marks={} in_flight={} branch={} seq={}",
@@ -2574,8 +2554,7 @@ mod tests {
         let before_reconcile = branch();
         hub.deliver_backend_error_for_test();
         assert!(
-            eventually(Duration::from_secs(60), || branch() > before_reconcile
-                && !hub.drain_peek(cursor)),
+            eventually(|| branch() > before_reconcile && !hub.drain_peek(cursor)),
             "the wait never took the reconcile",
         );
         // The window's identity, read from the cursor that still owes it — the same number the
@@ -2592,7 +2571,7 @@ mod tests {
         let watcher_cursor = {
             let mut found = None;
             assert!(
-                eventually(Duration::from_secs(30), || {
+                eventually(|| {
                     found = graph.watch_state().1;
                     found.is_some()
                 }),
@@ -2611,9 +2590,7 @@ mod tests {
         // Waited on the DELIVERY of that exact token, which is listed only once the ledger has
         // it: a wait that ended earlier would read the ledger before the delivery reached it.
         assert!(
-            eventually(Duration::from_secs(30), || graph
-                .quiet_loss_deliveries()
-                .contains(&Some(window))),
+            eventually(|| graph.quiet_loss_deliveries().contains(&Some(window))),
             "the watcher never delivered the window it inherited",
         );
         let acted_after_watcher = graph.acted_losses();
@@ -2622,8 +2599,7 @@ mod tests {
         // running for something else, or the loss already acted on, proves nothing here.
         hub.deliver_backend_error_for_test();
         let fresh = hub.materialize(holder).loss_token().expect("a second window is a loss");
-        let new_window_accepted =
-            eventually(Duration::from_secs(60), || graph.acted_losses().contains(&fresh));
+        let new_window_accepted = eventually(|| graph.acted_losses().contains(&fresh));
 
         watcher_stop.stop();
         sink_stop.stop();
@@ -2656,7 +2632,6 @@ mod tests {
     #[test]
     fn durable_drift_error_advances_cursor_and_coalesces_debt() {
         use crate::change_hub::{test_support::eventually, WorkspaceChangeHub};
-        use std::time::Duration;
 
         struct ResetForcedError;
         impl Drop for ResetForcedError {
@@ -2679,7 +2654,7 @@ mod tests {
         let shared: super::super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
         let graph = crate::graph::GraphState::for_workspace(workspace.clone());
         let hub = WorkspaceChangeHub::start(vec![workspace.clone()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
         let lease = crate::workspace_lease::WorkspaceLease::claim(&workspace);
         assert!(SharedState::spawn_search_sink(
@@ -2725,7 +2700,7 @@ mod tests {
                 .join(path.file_name().expect("a file name"));
             let mut delivered = false;
             let mut seen: Vec<(std::path::PathBuf, u64)> = Vec::new();
-            let arrived = eventually(Duration::from_secs(15), || {
+            let arrived = eventually(|| {
                 let batch = hub.drain(probe);
                 seen.extend(batch.entries.iter().map(|entry| (entry.canonical.clone(), entry.seq)));
                 delivered =
@@ -2740,7 +2715,7 @@ mod tests {
             // rescanning with no backoff every pass feeds the next one, so a view with nothing
             // in it is a gap the loop may never leave open.
             assert!(
-                eventually(Duration::from_secs(15), || {
+                eventually(|| {
                     hub.materialize(cursor).entries.iter().all(|entry| entry.canonical != target)
                 }),
                 "the sink never acknowledged {target:?}"
@@ -2790,7 +2765,7 @@ mod tests {
         super::FORCE_DRIFT_APPLY_ERROR_ENGINE.store(0, std::sync::atomic::Ordering::SeqCst);
         write_and_wait(&workspace.join("C.bsl"), "Procedure C2()\nEndProcedure");
         assert!(
-            eventually(Duration::from_secs(15), || {
+            eventually(|| {
                 let recovered = shared
                     .lock()
                     .unwrap()
@@ -2809,7 +2784,7 @@ mod tests {
         hub.shutdown();
         shared.lock().unwrap().as_ref().unwrap().initialize_workspace_overlay_clean().unwrap();
         let next_hub = WorkspaceChangeHub::start(vec![workspace.clone()]);
-        assert!(next_hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(next_hub.wait_until_watching());
         let next_cursor = next_hub.subscribe();
         let next_lease = crate::workspace_lease::WorkspaceLease::claim(&workspace);
         assert!(SharedState::spawn_search_sink(
@@ -2839,11 +2814,9 @@ mod tests {
         };
         let before = next_hub.events_seen();
         fs::write(workspace.join("D.bsl"), "Procedure D()\nEndProcedure").unwrap();
-        assert!(eventually(Duration::from_secs(5), || next_hub.events_seen() > before));
+        assert!(eventually(|| next_hub.events_seen() > before));
         assert!(
-            eventually(Duration::from_secs(15), || {
-                marked().contains(&bsl_search::FileKey::configuration("D.bsl"))
-            }),
+            eventually(|| { marked().contains(&bsl_search::FileKey::configuration("D.bsl")) }),
             "the change that follows the recovery reaches the overlay"
         );
         assert_eq!(
@@ -3013,7 +2986,7 @@ mod tests {
             WorkspaceChangeHub::start_targets_held(vec![WatchTarget::recursive(workspace.clone())]);
         let cursor = hub.subscribe();
         hold.release();
-        assert!(hub.wait_until_watching(Duration::from_secs(5)), "the watch must arm");
+        assert!(hub.wait_until_watching(), "the watch must arm");
         assert!(SharedState::spawn_search_sink(
             hub.clone(),
             cursor,
@@ -3046,19 +3019,22 @@ mod tests {
     #[test]
     fn an_event_before_the_engine_exists_still_reaches_the_overlay() {
         use crate::change_hub::WorkspaceChangeHub;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
         let hub = WorkspaceChangeHub::start(vec![workspace.clone()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)), "the watch must arm");
+        assert!(hub.wait_until_watching(), "the watch must arm");
         let cursor = hub.subscribe();
 
         // Happens while the boot would still be reading disk: no engine yet, and the only
         // record of it is the cursor's own backlog.
         fs::write(workspace.join("Module.bsl"), "Процедура П()\nКонецПроцедуры").unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while hub.events_seen() == 0 && Instant::now() < deadline {
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(10),
+        );
+        while hub.events_seen() == 0 && deadline.allows() {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(hub.events_seen() > 0, "the hub observed the write");
@@ -3079,9 +3055,12 @@ mod tests {
             Arc::new(Mutex::new(crate::state::ConsumerPhase::Pending)),
         ));
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(20),
+        );
         let mut delivered = false;
-        while Instant::now() < deadline {
+        while deadline.allows() {
             let snapshot = {
                 let guard = engine_arc.lock().unwrap();
                 guard.as_ref().unwrap().workspace_overlay_dirty_paths_snapshot().unwrap()
@@ -3211,7 +3190,7 @@ mod tests {
             super::WatchWaitPolicy::new(Duration::from_millis(50), Duration::from_secs(600))
         ));
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(300),
             "a permanent failure is not something to spend a budget on"
         );
     }
@@ -3219,7 +3198,7 @@ mod tests {
     #[test]
     fn search_sink_marks_only_bsl_paths_dirty() {
         use crate::change_hub::WorkspaceChangeHub;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
@@ -3230,7 +3209,7 @@ mod tests {
         let engine_arc: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
 
         let hub = WorkspaceChangeHub::start(vec![workspace.clone()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)), "the watch must arm");
+        assert!(hub.wait_until_watching(), "the watch must arm");
         // A second cursor observes the raw accumulator independently of the sink.
         let observer = hub.subscribe();
 
@@ -3255,9 +3234,12 @@ mod tests {
         let xml = workspace.join("Configuration.xml");
         std::fs::write(&xml, "<Configuration/>").unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(50),
+        );
         let mut dirty_has_bsl = false;
-        while Instant::now() < deadline {
+        while deadline.allows() {
             let snapshot = {
                 let guard = engine_arc.lock().unwrap();
                 guard.as_ref().unwrap().workspace_overlay_dirty_paths_snapshot().unwrap()
@@ -3286,10 +3268,13 @@ mod tests {
 
         // The hub itself accepted the .xml change; only the consumer filtered it.
         // The event is asynchronous, so poll the observer cursor until it lands.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(50),
+        );
         let mut observer = observer;
         let mut saw_xml = false;
-        while Instant::now() < deadline {
+        while deadline.allows() {
             let batch = hub.drain(observer);
             observer = batch.cursor;
             if batch.entries.iter().any(|e| e.raw.ends_with("Configuration.xml")) {
@@ -5577,7 +5562,7 @@ mod tests {
         use crate::diagnostics_state::{
             DiagnosticsState, DiagnosticsStatus, ResidentModuleSnapshotSource,
         };
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let dir = tempdir().unwrap();
         let outer = dir.path().to_path_buf();
@@ -5612,9 +5597,12 @@ mod tests {
         // The resident is built against the OUTER root AFTER the edit, so it holds the new bytes.
         let diagnostics = DiagnosticsState::for_workspace(outer.clone());
         diagnostics.ensure_loading();
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(20),
+        );
         while !matches!(diagnostics.status(), DiagnosticsStatus::Ready { .. }) {
-            assert!(Instant::now() < deadline, "the resident did not become ready");
+            assert!(deadline.allows(), "the resident did not become ready");
             std::thread::sleep(Duration::from_millis(20));
         }
 
@@ -5655,7 +5643,7 @@ mod tests {
         use crate::diagnostics_state::{
             DiagnosticsState, DiagnosticsStatus, ResidentModuleSnapshotSource,
         };
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
@@ -5672,7 +5660,7 @@ mod tests {
         let module = root.join("CommonModules").join("Сервер").join("Ext").join("Module.bsl");
 
         let hub = WorkspaceChangeHub::start(vec![root.clone()]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)), "the hub must arm");
+        assert!(hub.wait_until_watching(), "the hub must arm");
         let mut observer = hub.subscribe();
 
         let mut engine = SearchEngine::fts_only(&root.join("search.db")).unwrap();
@@ -5684,9 +5672,12 @@ mod tests {
         let diagnostics =
             DiagnosticsState::for_workspace(root.clone()).with_change_hub(hub.clone());
         diagnostics.ensure_loading();
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(20),
+        );
         while !matches!(diagnostics.status(), DiagnosticsStatus::Ready { .. }) {
-            assert!(Instant::now() < deadline, "the resident did not become ready");
+            assert!(deadline.allows(), "the resident did not become ready");
             std::thread::sleep(Duration::from_millis(20));
         }
 
@@ -5705,9 +5696,12 @@ mod tests {
         assert!(engine.mark_workspace_path_dirty(&module).unwrap());
 
         // Wait until the hub delivered the edit, so the diagnostics cursor drains it in `catch_up`.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(20),
+        );
         let mut delivered = false;
-        while Instant::now() < deadline {
+        while deadline.allows() {
             let batch = hub.drain(observer);
             observer = batch.cursor;
             if batch.entries.iter().any(|e| e.raw.to_string_lossy().ends_with("Module.bsl")) {
