@@ -5857,14 +5857,23 @@ pub(crate) mod test_support {
     /// [`eventually`] with a bound of its own, for a wait whose event is scheduled by a
     /// production retry rather than by the work the test drives.
     pub(crate) fn eventually_within(attempts: u32, mut f: impl FnMut() -> bool) -> bool {
+        let started = std::time::Instant::now();
         for _ in 0..attempts {
             if f() {
                 return true;
+            }
+            if started.elapsed() > HANG_GUARD {
+                break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
         f()
     }
+
+    /// Wall-clock backstop for the poll budgets. A poll that is itself slow would stretch the
+    /// budget far past its nominal length; this bounds the failing path to minutes, and no wait
+    /// that succeeds comes near it.
+    const HANG_GUARD: Duration = Duration::from_secs(20 * 60);
 
     /// One live root and one the watch refuses to take, so the hub is standing degraded for
     /// a reason no drain clears. The period is an hour, so every tick is one the test asked

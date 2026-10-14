@@ -639,10 +639,10 @@ impl WorkspaceLease {
     /// threads of their own, so counting by the caller's name isolates the caller's own work.
     #[cfg(test)]
     pub(crate) fn disk_checks_on_this_thread(&self) -> usize {
-        let me = std::thread::current().name().map(str::to_owned);
+        let me = std::thread::current().name().unwrap_or("<unnamed>").to_owned();
         lock_recover(&self.inner.disk_check_threads)
             .iter()
-            .filter(|name| Some(name.as_str()) == me.as_deref())
+            .filter(|name| name.as_str() == me)
             .count()
     }
 
