@@ -1221,7 +1221,10 @@ pub(crate) enum ReferencesOutput {
 pub(crate) struct ReferencesLoading {
     /// Version of this response shape. Always `"1"`.
     schema_version: LoadingSchemaVersion,
-    /// Always `loading`: how a consumer tells this envelope from an answer.
+    /// What this envelope says about readiness: `loading` while a build runs, `failed` when
+    /// the resident could not be built (with `error`, `retry_after_ms`, `attempts`,
+    /// `failed_age_ms` beside it). The two values are how a consumer tells this envelope from
+    /// an answer — and from an eternal wait.
     status: LoadingStatus,
     /// A human sentence beside the machine fields; never the thing to match on.
     detail: String,
@@ -1233,10 +1236,22 @@ pub(crate) struct ReferencesLoading {
     elapsed_ms: Option<u64>,
     /// Why the build failed, when it did.
     error: Option<String>,
+    /// Milliseconds until the next attempt at a failed build; `None` while one is running.
+    retry_after_ms: Option<u64>,
+    /// Consecutive failed attempts behind the failure being retried, when there is one.
+    attempts: Option<u64>,
+    /// How long ago that failure was published.
+    failed_age_ms: Option<u64>,
 }
 
 crate::wire_enum!(LoadingSchemaVersion { V1 => "1" });
-crate::wire_enum!(LoadingStatus { Loading => "loading" });
+// `loading` while a build runs; `failed` when the resident this envelope is about could not
+// be built (it is retried on its backoff, and the surrounding fields say when). Publishing
+// only `loading` would make the schema itself claim work that is not happening.
+crate::wire_enum!(LoadingStatus {
+    Loading => "loading",
+    Failed => "failed",
+});
 
 /// The published schema: the union, not the answer alone.
 pub(crate) fn references_output_schema(
@@ -1354,6 +1369,9 @@ mod tests {
             reload: "none",
             elapsed_ms: Some(1_200),
             error: None,
+            failed_age_ms: None,
+            attempts: 0,
+            retry_after_ms: None,
             watch: None,
         }
     }

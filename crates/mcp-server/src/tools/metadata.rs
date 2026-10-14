@@ -1378,7 +1378,10 @@ pub fn configs_from_db(
 
 /// A "still loading, retry shortly" envelope for a metadata call issued while the resident
 /// db is building (or rebuilding after an idle eviction). Never a hard "not loaded" error —
-/// the resident always eventually becomes ready.
+/// the resident becomes ready, OR fails and is retried on its own backoff, so the answer is
+/// always either "ask again in a moment" or "here is why it stopped and when the next try
+/// comes". A `status` of `failed` (with `error` and `retry_after_ms`) is a build that did not
+/// finish; it is not an eternal wait, and it is not terminal either.
 ///
 /// The machine-readable body has the same shape `diagnostics` returns — only `detail`
 /// differs, naming this tool's view of the one build — so "not ready" is recognized by one
@@ -2010,6 +2013,9 @@ mod tests {
             reload: "none",
             error: None,
             elapsed_ms: Some(20),
+            failed_age_ms: None,
+            attempts: 0,
+            retry_after_ms: None,
             watch: None,
         };
 

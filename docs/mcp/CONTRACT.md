@@ -30,7 +30,7 @@ uri: bsl-analyzer://contract
 
 ```jsonc
 {
-  "contract_version": "3.4",
+  "contract_version": "3.5",
   "build_version": "0.2.80",
   "mcp": {
     "profiles": {
@@ -113,6 +113,11 @@ uri: bsl-analyzer://contract
   остаётся совместимым, но больше не обязателен для справки платформы.
 - В контракте `3.4` CLI добавляет команду `platform-help package` (подготовка
   пакета справки платформы); поверхность MCP не изменилась.
+- В контракте `3.5` конверт «не готово» резидентных инструментов (`metadata`,
+  `symbol_info`, `diagnostics`, `references`) получает второе допустимое значение
+  `status` — `"failed"` — и поля `error`, `retry_after_ms`, `attempts`,
+  `failed_age_ms`: неудачная сборка резидента видна поллеру как отказ с
+  расписанием повтора, а не как вечное `"loading"`.
 
 - `tools` — то, что сервер отдаёт в `tools/list` при обычном запуске;
   `opt_in_tools` — то, что эта же сборка умеет, но отдаёт только по явному

@@ -218,6 +218,19 @@ impl ResidentSession {
     pub(crate) fn status_report(&self) -> super::types::StatusReport {
         self.diag.status_report()
     }
+
+    /// The answer to a read that came back `Failed`, taken from ONE lifecycle snapshot.
+    ///
+    /// The read and the snapshot are two moments, and the state can move on between them: a
+    /// retry starts, or a resident is published. Deciding from one sample is what keeps the
+    /// two halves of the failure consistent — the state it describes and the retry contract
+    /// that goes with it — and lets a lifecycle that moved on be answered as what it IS
+    /// rather than as a failure nobody can act on.
+    pub(crate) fn resident_failure(&self, reason: &str) -> crate::tools::resident::FailureAnswer {
+        #[cfg(test)]
+        self.diag.fire_failure_probe();
+        crate::tools::resident::failure_answer(&self.diag.status_report(), reason)
+    }
 }
 
 /// Run one resident-reading call under the rmcp per-request cancellation token.

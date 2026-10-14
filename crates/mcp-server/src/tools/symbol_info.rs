@@ -47,12 +47,20 @@ enum SymbolInfoOutput {
 #[derive(Deserialize, JsonSchema, Serialize)]
 struct SymbolInfoLoading {
     schema_version: SchemaVersion,
+    /// `loading` while a build runs, `failed` when the resident it would answer from could
+    /// not be built (the envelope still reports the lifecycle rather than claiming work).
     status: LoadingStatus,
     detail: String,
     state: String,
     generation: u64,
     elapsed_ms: Option<u64>,
     error: Option<String>,
+    /// Milliseconds until the next attempt at a failed build; `None` while one is running.
+    retry_after_ms: Option<u64>,
+    /// Consecutive failed attempts behind the failure being retried, when there is one.
+    attempts: Option<u64>,
+    /// How long ago that failure was published.
+    failed_age_ms: Option<u64>,
 }
 
 #[derive(Deserialize, JsonSchema, Serialize)]
@@ -173,7 +181,13 @@ wire_enum!(SchemaVersion { V1 => "1" });
 wire_enum!(OkStatus { Ok => "ok" });
 wire_enum!(NotFoundStatus { NotFound => "not_found" });
 wire_enum!(AmbiguousStatus { Ambiguous => "ambiguous" });
-wire_enum!(LoadingStatus { Loading => "loading" });
+// `loading` while a build runs; `failed` when the resident this envelope is about could not
+// be built (it is retried on its backoff, and the surrounding fields say when). Publishing
+// only `loading` would make the schema itself claim work that is not happening.
+wire_enum!(LoadingStatus {
+    Loading => "loading",
+    Failed => "failed",
+});
 wire_enum!(MemberKind {
     Attribute => "attribute",
     TabularSection => "tabular_section",
@@ -265,8 +279,12 @@ fn single_value_enums_to_consts(object: &mut Map<String, Value>) {
     }
 }
 
-pub(crate) fn database_error(message: impl std::fmt::Display) -> McpError {
-    McpError::internal_error(format!("symbol_info database: {message}"), None)
+/// A resident that could not be built is a failure with a retry contract, not an opaque
+/// internal error: the reason, the attempt count and the wait before the next attempt ride
+/// in the error's `data` (built by `tools::resident::failure_answer` from ONE lifecycle
+/// snapshot), so a client can tell "try again in 5 s" from "this will never be answered".
+pub(crate) fn database_error(message: impl std::fmt::Display, data: serde_json::Value) -> McpError {
+    McpError::internal_error(format!("symbol_info database: {message}"), Some(data))
 }
 
 /// Preserve the resident loading envelope used by sibling tools while making the
@@ -1117,6 +1135,9 @@ mod tests {
             reload: "none",
             error: None,
             elapsed_ms: Some(20),
+            failed_age_ms: None,
+            attempts: 0,
+            retry_after_ms: None,
             watch: None,
         };
         let body = loading(&report).structured_content.expect("loading structuredContent");
@@ -1125,6 +1146,31 @@ mod tests {
             .expect("loading output schema shape");
         assert_eq!(body["schema_version"], "1");
         assert_eq!(body["status"], "loading");
+    }
+
+    /// The other readiness verdict this envelope can carry parses too: a resident whose
+    /// build failed is not "loading", and the schema admits the value it publishes.
+    #[test]
+    fn a_failed_resident_parses_as_the_failed_branch_of_the_loading_envelope() {
+        let report = crate::diagnostics_state::StatusReport {
+            state: "failed",
+            generation: 4,
+            files: None,
+            unread_files: None,
+            reload: "none",
+            error: Some("builder panicked".to_owned()),
+            elapsed_ms: None,
+            failed_age_ms: Some(120),
+            attempts: 1,
+            retry_after_ms: Some(4_880),
+            watch: None,
+        };
+        let body = loading(&report).structured_content.expect("loading structuredContent");
+
+        serde_json::from_value::<SymbolInfoOutput>(body.clone())
+            .expect("failed output schema shape");
+        assert_eq!(body["status"], "failed");
+        assert_eq!(body["retry_after_ms"], 4_880);
     }
 
     #[test]
@@ -1444,8 +1490,30 @@ mod tests {
             .expect("ambiguous output schema shape");
         assert_eq!(body["status"], "ambiguous");
 
-        let error = database_error("broken cache");
+        let failed = crate::diagnostics_state::StatusReport {
+            state: "failed",
+            generation: 0,
+            files: None,
+            unread_files: None,
+            reload: "none",
+            error: Some("broken cache".to_owned()),
+            elapsed_ms: None,
+            failed_age_ms: Some(10),
+            attempts: 1,
+            retry_after_ms: Some(5_000),
+            watch: None,
+        };
+        let crate::tools::resident::FailureAnswer::Failed { data, .. } =
+            crate::tools::resident::failure_answer(&failed, "broken cache")
+        else {
+            panic!("a failed report answers as a failure");
+        };
+        let error = database_error("broken cache", data);
         assert_eq!(error.code.0, -32603);
         assert!(error.message.contains("broken cache"));
+        let data = error.data.expect("the failure carries its retry contract");
+        assert_eq!(data["state"], "failed");
+        assert_eq!(data["reason"], "broken cache");
+        assert_eq!(data["retry_after_ms"], 5_000);
     }
 }
