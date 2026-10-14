@@ -8,8 +8,10 @@ use syntax::{SyntaxKind, SyntaxNode, TextSize};
 
 use super::{CompletionItem, CompletionItemKind, CompletionPosition};
 
-const PRIMITIVE_TYPE_NAMES: [&str; 6] =
+const PRIMITIVE_TYPE_NAMES_RU: [&str; 6] =
     ["Число", "Строка", "Дата", "Булево", "Неопределено", "Null"];
+const PRIMITIVE_TYPE_NAMES_EN: [&str; 6] =
+    ["Number", "String", "Date", "Boolean", "Undefined", "Null"];
 
 /// Completion inside the string argument of `Тип("…")` / `Type("…")`: offers
 /// platform type names (`ТаблицаЗначений`, `Структура`, …) and configuration
@@ -19,6 +21,11 @@ const PRIMITIVE_TYPE_NAMES: [&str; 6] =
 /// become just the trailing segment (`Документ1`), so the client — which
 /// filters/replaces by the word after the last `.` — narrows and inserts
 /// correctly instead of listing everything.
+///
+/// The platform accepts type names in either language. Without a typed base the
+/// list holds the names of the interface locale only; once a base is typed, both
+/// languages are matched against it, so `DocumentRef.` narrows in a Russian
+/// locale as well.
 pub(super) fn type_string_completions<DB: RootDatabase>(
     db: &DB,
     position: CompletionPosition,
@@ -31,8 +38,7 @@ pub(super) fn type_string_completions<DB: RootDatabase>(
         return None;
     }
 
-    // The string must be an argument of a bare `Тип(...)` / `Type(...)` call.
-    let call = token.parent()?.ancestors().find(|n| n.kind() == SyntaxKind::CALL_EXPR)?;
+    let call = type_call_of_argument(&token.parent()?)?;
     if !callee_is_type(&call) {
         return None;
     }
@@ -46,6 +52,12 @@ pub(super) fn type_string_completions<DB: RootDatabase>(
     if rel == tok_len && tok_len > TextSize::from(1) && tok_text.ends_with('"') {
         return None;
     }
+    // A continuation line follows a line break, which belongs to the string
+    // value, so no type name can be completed there; matching only this line
+    // would also re-insert the base typed on an earlier line.
+    if matches!(token.kind(), SyntaxKind::STRING_PART | SyntaxKind::STRING_TAIL) {
+        return Some(Vec::new());
+    }
     let typed = tok_text
         .get(1..usize::from(rel)) // skip the opening quote
         .unwrap_or("")
@@ -55,13 +67,20 @@ pub(super) fn type_string_completions<DB: RootDatabase>(
         None => String::new(),
     };
 
+    let locales: &[Locale] =
+        if base_lower.is_empty() { &[position.locale] } else { &[Locale::Ru, Locale::En] };
+
     let mut items = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
     // Primitive and special types are absent from the platform type list, yet
     // `Тип()` accepts them. They have no dotted form, so only without a base.
     if base_lower.is_empty() {
-        for name in PRIMITIVE_TYPE_NAMES {
+        let names = match position.locale {
+            Locale::Ru => PRIMITIVE_TYPE_NAMES_RU,
+            Locale::En => PRIMITIVE_TYPE_NAMES_EN,
+        };
+        for name in names {
             consider(&mut items, &mut seen, &base_lower, name);
         }
     }
@@ -70,18 +89,31 @@ pub(super) fn type_string_completions<DB: RootDatabase>(
     // `ДокументСсылка.<Имя документа>` are skipped in `consider`: the concrete
     // forms come from the configuration below.
     for ty in PlatformDataInner::instance().all_types() {
-        consider(&mut items, &mut seen, &base_lower, ty.name.as_str());
+        for &locale in locales {
+            let name = match locale {
+                Locale::Ru => ty.name.as_str(),
+                Locale::En => ty.english_name.as_str(),
+            };
+            consider(&mut items, &mut seen, &base_lower, name);
+        }
     }
 
     // Configuration reference types: `ref_kind_for` maps a metadata object kind
-    // to its reference kind, whose Russian label is the type prefix
-    // (`СправочникСсылка`, `ДокументСсылка`, …).
+    // to its reference kind, whose label is the type prefix (`ДокументСсылка`,
+    // `DocumentRef`, …).
     let configs = db.get_all_configurations(position.file_id);
     for (_source, config) in &configs {
         for mdo in config.metadata_objects() {
             if let Some(kind) = hir::MetadataKind::ref_kind_for(mdo.mdo_type) {
-                let prefix = kind.display_label(Locale::Ru);
-                consider(&mut items, &mut seen, &base_lower, &format!("{}.{}", prefix, mdo.name));
+                for &locale in locales {
+                    let prefix = kind.display_label(locale);
+                    consider(
+                        &mut items,
+                        &mut seen,
+                        &base_lower,
+                        &format!("{}.{}", prefix, mdo.name),
+                    );
+                }
             }
         }
     }
@@ -131,6 +163,20 @@ fn consider(
         filter_text: None,
         source: None,
     });
+}
+
+/// The call whose argument list holds the string literal `literal` as a whole
+/// argument. Only `EXPR` wrappers may stand between them: a string inside a
+/// concatenation, an index key or a nested call is not the type name.
+fn type_call_of_argument(literal: &SyntaxNode) -> Option<SyntaxNode> {
+    if literal.kind() != SyntaxKind::LITERAL {
+        return None;
+    }
+    let arg_list = literal.ancestors().skip(1).find(|n| n.kind() != SyntaxKind::EXPR)?;
+    if arg_list.kind() != SyntaxKind::ARG_LIST {
+        return None;
+    }
+    arg_list.parent().filter(|call| call.kind() == SyntaxKind::CALL_EXPR)
 }
 
 /// `Тип` is a bare global function: the callee — the first child of the call —

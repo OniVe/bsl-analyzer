@@ -1,35 +1,25 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" version="2.10">
-	<ChartOfCharacteristicTypes uuid="aaaaaaaa-0000-0000-0000-000000000001">
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="2.20">
+	<ChartOfCharacteristicTypes uuid="7e1c0028-3a5b-4c6d-8e7f-5a0000000028">
 		<Properties>
 			<Name>ПланВидовХарактеристик1</Name>
 		</Properties>
 		<ChildObjects>
-			<Attribute uuid="aaaaaaaa-0000-0000-0000-000000000002">
-				<Properties>
-					<Name>Комментарий</Name>
-					<Type>
-						<v8:Type>xs:string</v8:Type>
-						<v8:StringQualifiers>
-							<v8:Length>100</v8:Length>
-						</v8:StringQualifiers>
-					</Type>
-				</Properties>
-			</Attribute>
-			<TabularSection uuid="aaaaaaaa-0000-0000-0000-000000000003">
+			<TabularSection uuid="7e1c0027-3a5b-4c6d-8e7f-5a0000000027">
 				<Properties>
 					<Name>ДоступныеОперации</Name>
 				</Properties>
 				<ChildObjects>
-					<Attribute uuid="aaaaaaaa-0000-0000-0000-000000000004">
+			<Attribute uuid="7e1c0026-3a5b-4c6d-8e7f-5a0000000026">
 						<Properties>
 							<Name>Операция</Name>
 							<Type>
-								<v8:Type>xs:string</v8:Type>
-								<v8:StringQualifiers>
-									<v8:Length>50</v8:Length>
-								</v8:StringQualifiers>
-							</Type>
+							<v8:Type>xs:string</v8:Type>
+							<v8:StringQualifiers>
+								<v8:Length>30</v8:Length>
+								<v8:AllowedLength>Variable</v8:AllowedLength>
+							</v8:StringQualifiers>
+						</Type>
 						</Properties>
 					</Attribute>
 				</ChildObjects>

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
-	<CommonForm uuid="12345678-1234-1234-1234-123456789012">
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="2.20">
+	<CommonForm uuid="7e1c0040-3a5b-4c6d-8e7f-5a0000000040">
 		<Properties>
 			<Name>ТестоваяФорма</Name>
 			<FormType>Ordinary</FormType>

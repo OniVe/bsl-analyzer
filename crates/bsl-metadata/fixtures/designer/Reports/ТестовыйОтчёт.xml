@@ -1,21 +1,22 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" version="2.10">
-	<Report uuid="44444444-4444-4444-4444-444444444444">
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="2.20">
+	<Report uuid="7e1c003c-3a5b-4c6d-8e7f-5a000000003c">
 		<Properties>
 			<Name>ТестовыйОтчёт</Name>
 		</Properties>
 		<ChildObjects>
-			<Attribute uuid="55555555-5555-5555-5555-555555555555">
+			<Attribute uuid="7e1c003b-3a5b-4c6d-8e7f-5a000000003b">
 				<Properties>
 					<Name>ПериодОтчёта</Name>
 					<Type>
-						<v8:Type>xs:dateTime</v8:Type>
-						<v8:DateQualifiers>
-							<v8:DateFractions>Date</v8:DateFractions>
-						</v8:DateQualifiers>
-					</Type>
+					<v8:Type>xs:dateTime</v8:Type>
+					<v8:DateQualifiers>
+						<v8:DateFractions>DateTime</v8:DateFractions>
+					</v8:DateQualifiers>
+				</Type>
 				</Properties>
 			</Attribute>
+			<Form>Форма</Form>
 		</ChildObjects>
 	</Report>
 </MetaDataObject>

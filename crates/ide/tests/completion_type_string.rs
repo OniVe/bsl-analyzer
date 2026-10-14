@@ -56,8 +56,12 @@ fn extract_cursor(fixture_text: &str) -> (String, String, u32) {
 }
 
 fn complete(fixture: &str) -> Vec<CompletionItem> {
+    complete_in(fixture, ide::Locale::Ru)
+}
+
+fn complete_in(fixture: &str, locale: ide::Locale) -> Vec<CompletionItem> {
     let (analysis, file_id, offset) = setup_with_config(fixture);
-    analysis.completions(file_id, offset, None, ide::Locale::Ru)
+    analysis.completions(file_id, offset, None, locale)
 }
 
 fn labels(items: &[CompletionItem]) -> Vec<&str> {
@@ -259,4 +263,123 @@ EndProcedure
     );
 
     assert!(has_label(&items, "Документ1"), "got {:?}", labels(&items));
+}
+
+#[test]
+fn english_ref_prefix_offers_configuration_objects_in_english_locale() {
+    let items = complete_in(
+        r#"//- /test.bsl
+Procedure Check(Value)
+    If TypeOf(Value) = Type("DocumentRef.$0") Then
+        Return;
+    EndIf;
+EndProcedure
+"#,
+        ide::Locale::En,
+    );
+
+    let item = items.iter().find(|i| i.label == "Документ1").unwrap_or_else(|| {
+        panic!("got {:?}", labels(&items));
+    });
+    assert_eq!(item.detail.as_deref(), Some("DocumentRef.Документ1"));
+}
+
+#[test]
+fn english_ref_prefix_is_recognised_in_russian_locale() {
+    let items = complete(
+        r#"//- /test.bsl
+Процедура ОбработатьЗначение(Значение)
+    Если ТипЗнч(Значение) = Тип("DocumentRef.$0") Тогда
+        Возврат;
+    КонецЕсли;
+КонецПроцедуры
+"#,
+    );
+
+    assert!(has_label(&items, "Документ1"), "got {:?}", labels(&items));
+}
+
+#[test]
+fn type_string_without_prefix_offers_english_names_in_english_locale() {
+    let items = complete_in(
+        r#"//- /test.bsl
+Procedure Check(Value)
+    If TypeOf(Value) = Type("$0") Then
+        Return;
+    EndIf;
+EndProcedure
+"#,
+        ide::Locale::En,
+    );
+
+    assert!(has_label(&items, "DocumentRef.Документ1"), "got {:?}", labels(&items));
+    assert!(has_label(&items, "Number"), "got {:?}", labels(&items));
+    assert!(!has_label(&items, "ДокументСсылка.Документ1"), "got {:?}", labels(&items));
+}
+
+#[test]
+fn string_concatenated_inside_type_call_gets_no_type_names() {
+    let items = complete(
+        r#"//- /test.bsl
+Процедура ОбработатьЗначение(Значение)
+    Если ТипЗнч(Значение) = Тип("СправочникСсылка.$0" + "x") Тогда
+        Возврат;
+    КонецЕсли;
+КонецПроцедуры
+"#,
+    );
+
+    assert!(!has_label(&items, "Справочник1"), "got {:?}", labels(&items));
+}
+
+#[test]
+fn index_key_inside_type_call_gets_no_type_names() {
+    let items = complete(
+        r#"//- /test.bsl
+Процедура ОбработатьЗначение(Значение)
+    Словарь = Новый Соответствие;
+    Если ТипЗнч(Значение) = Тип(Словарь["ДокументСсылка.$0"]) Тогда
+        Возврат;
+    КонецЕсли;
+КонецПроцедуры
+"#,
+    );
+
+    assert!(!has_label(&items, "Документ1"), "got {:?}", labels(&items));
+}
+
+#[test]
+fn continuation_line_of_multiline_type_string_offers_nothing() {
+    let items = complete(
+        r#"//- /test.bsl
+Процедура ОбработатьЗначение(Значение)
+    Если ТипЗнч(Значение) = Тип("СправочникСсылка.
+    |Спр$0") Тогда
+        Возврат;
+    КонецЕсли;
+КонецПроцедуры
+"#,
+    );
+
+    assert!(
+        !items.iter().any(|i| i.insert_text.contains("СправочникСсылка.")),
+        "got {:?}",
+        labels(&items)
+    );
+}
+
+#[test]
+fn first_line_of_multiline_type_string_keeps_completion() {
+    let items = complete(
+        r#"//- /test.bsl
+Процедура ОбработатьЗначение(Значение)
+    Если ТипЗнч(Значение) = Тип("СправочникСсылка.$0
+    |") Тогда
+        Возврат;
+    КонецЕсли;
+КонецПроцедуры
+"#,
+    );
+
+    assert!(has_label(&items, "Справочник1"), "got {:?}", labels(&items));
 }

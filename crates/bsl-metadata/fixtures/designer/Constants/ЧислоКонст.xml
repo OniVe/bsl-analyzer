@@ -1,18 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema">
-	<Constant uuid="0c000001-0000-0000-0000-000000000002">
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="2.20">
+	<Constant uuid="7e1c0030-3a5b-4c6d-8e7f-5a0000000030">
 		<Properties>
 			<Name>ЧислоКонст</Name>
-			<Synonym/>
-			<Comment/>
 			<Type>
-				<v8:Type>xs:decimal</v8:Type>
-				<NumberQualifiers>
-					<Digits>10</Digits>
-					<FractionDigits>2</FractionDigits>
-					<AllowedSign>Any</AllowedSign>
-				</NumberQualifiers>
-			</Type>
+					<v8:Type>xs:decimal</v8:Type>
+					<v8:NumberQualifiers>
+						<v8:Digits>10</v8:Digits>
+						<v8:FractionDigits>2</v8:FractionDigits>
+						<v8:AllowedSign>Any</v8:AllowedSign>
+					</v8:NumberQualifiers>
+				</Type>
 		</Properties>
 	</Constant>
 </MetaDataObject>
