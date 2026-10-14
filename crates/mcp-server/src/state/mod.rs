@@ -243,11 +243,21 @@ impl OwnerStop {
 
     /// Wait for every admitted owner to leave before releasing shared derived files.
     pub(crate) fn wait_empty(&self, timeout: std::time::Duration) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
+        // A budget too large to place on the clock waits in hour-long slices instead: it is
+        // bounded by the owners leaving, which is the point of the wait.
+        let deadline = std::time::Instant::now().checked_add(timeout);
         let mut stopped = self.0.stopped.lock().unwrap_or_else(|poison| poison.into_inner());
         while self.0.live.load(Ordering::SeqCst) != 0 {
-            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
-                return false;
+            let remaining = match deadline {
+                Some(deadline) => {
+                    let Some(remaining) =
+                        deadline.checked_duration_since(std::time::Instant::now())
+                    else {
+                        return false;
+                    };
+                    remaining
+                }
+                None => std::time::Duration::from_secs(60 * 60),
             };
             let (guard, result) = self
                 .0

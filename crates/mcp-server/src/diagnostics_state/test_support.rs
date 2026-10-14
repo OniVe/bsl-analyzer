@@ -195,18 +195,23 @@ pub(crate) fn wait_until<T, S: std::fmt::Debug>(
         Ok(value) => return value,
         Err(observation) => observation,
     };
+    let mut spent = 0;
     for _ in 0..polls {
         if started.elapsed() > Duration::from_secs(20 * 60) {
-            break;
+            panic!(
+                "{what}: not satisfied in {:?}, past the wall-clock backstop; last observation {observation:?}",
+                started.elapsed()
+            );
         }
         std::thread::sleep(Duration::from_millis(10));
+        spent += 1;
         observation = match probe() {
             Ok(value) => return value,
             Err(observation) => observation,
         };
     }
     panic!(
-        "{what}: not satisfied after {polls} polls in {:?}, last observation {observation:?}",
+        "{what}: not satisfied after {spent} polls in {:?}, last observation {observation:?}",
         started.elapsed()
     );
 }

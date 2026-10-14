@@ -2803,9 +2803,9 @@ mod tests {
             shutdown_service.shutdown();
             let _ = shut_tx.send(());
         });
-        // The gate proves shutdown does not wait for the blocked resolve. The bound proves it
-        // gives up after its acknowledgement timeout: ten times that is far above the timeout
-        // itself, and far below the resolve's own wait, which a regression would sit out.
+        // The gate proves shutdown does not wait for the blocked resolve. The bound is the
+        // latency contract the test always carried: shutdown gives up after its acknowledgement
+        // timeout (100 ms here), inside 200 ms, far below the resolve's own wait.
         assert!(
             shut_rx.recv_timeout(Duration::from_millis(200)).is_ok(),
             "shutdown waited for a resolve that was still blocked"
