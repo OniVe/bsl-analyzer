@@ -100,8 +100,10 @@ fn codes(envelope: &Value) -> Vec<String> {
 /// Keeps asking until the answer stops being parse-only. Written as a poll rather than a
 /// single call because the tool deliberately never waits for the resident.
 async fn validate_until_semantic(client: &Client, query: &str) -> Value {
-    let mut deadline =
-        common::Patience::new(common::STATE_CEILING, std::time::Duration::from_millis(200));
+    let mut deadline = common::Patience::new(
+        std::time::Duration::from_secs(90),
+        std::time::Duration::from_millis(200),
+    );
     loop {
         let envelope = validate(client, args(query)).await;
         if local(&envelope)["backend"] == "workspace_semantics" {

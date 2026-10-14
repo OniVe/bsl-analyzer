@@ -99,8 +99,10 @@ async fn resolve(client: &Client, query: &str) -> Value {
 }
 
 async fn wait_until_resident_is_ready(client: &Client) {
-    let mut deadline =
-        common::Patience::new(common::STATE_CEILING, std::time::Duration::from_millis(100));
+    let mut deadline = common::Patience::new(
+        std::time::Duration::from_secs(180),
+        std::time::Duration::from_millis(100),
+    );
     loop {
         let status = call(client, "diagnostics", args(&[("action", Value::from("status"))])).await;
         if status["state"] == "ready" {
@@ -112,8 +114,10 @@ async fn wait_until_resident_is_ready(client: &Client) {
 }
 
 async fn wait_until_graph_is_ready(client: &Client) {
-    let mut deadline =
-        common::Patience::new(common::STATE_CEILING, std::time::Duration::from_millis(100));
+    let mut deadline = common::Patience::new(
+        std::time::Duration::from_secs(180),
+        std::time::Duration::from_millis(100),
+    );
     loop {
         let status = call(client, "graph", args(&[("action", Value::from("status"))])).await;
         if status["state"] == "ready" {

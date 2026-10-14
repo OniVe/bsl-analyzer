@@ -74,9 +74,8 @@ async fn connect(key: &BackendKey) -> std::io::Result<TokioStream> {
 }
 
 #[cfg(any(unix, windows))]
-async fn connect_within(key: &BackendKey, _budget: Duration) -> TokioStream {
-    let mut deadline =
-        common::Patience::new(common::STATE_CEILING, std::time::Duration::from_millis(20));
+async fn connect_within(key: &BackendKey, budget: Duration) -> TokioStream {
+    let mut deadline = common::Patience::new(budget, std::time::Duration::from_millis(20));
     loop {
         if let Ok(s) = connect(key).await {
             return s;

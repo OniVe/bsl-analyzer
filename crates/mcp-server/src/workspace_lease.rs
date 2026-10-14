@@ -1551,7 +1551,7 @@ mod tests {
         );
         while !lease.lifecycle_is_busy() {
             assert!(deadline.allows(), "the check never reached the lifecycle lock");
-            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
         let asking = Instant::now();

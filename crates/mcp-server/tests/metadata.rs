@@ -444,7 +444,7 @@ async fn a_cold_info_call_is_classifiable_by_status_alone() {
     let client = workspace_client(ws.path()).await;
 
     let mut deadline =
-        common::Patience::new(common::STATE_CEILING, std::time::Duration::from_millis(10));
+        common::Patience::new(common::STATE_CEILING, std::time::Duration::from_millis(100));
     loop {
         let result = call(&client, &[("action", json!("info"))]).await;
         let loading =

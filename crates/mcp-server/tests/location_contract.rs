@@ -82,8 +82,10 @@ fn args(pairs: &[(&str, Value)]) -> Map<String, Value> {
 /// its `status: "loading"` field — how a consumer is meant to read it — never by matching
 /// the human sentence beside it.
 async fn poll(client: &Client, tool: &'static str, call_args: Map<String, Value>) -> Value {
-    let mut deadline =
-        common::Patience::new(common::STATE_CEILING, std::time::Duration::from_millis(100));
+    let mut deadline = common::Patience::new(
+        std::time::Duration::from_secs(120),
+        std::time::Duration::from_millis(100),
+    );
     loop {
         let call = CallToolRequestParams::new(tool).with_arguments(call_args.clone());
         let result = client.call_tool(call).await.expect("transport ok");
